@@ -12,3 +12,4 @@ secrets/
 *.anki2
 *.anki2-*
 collection.media/
+.worktrees/
