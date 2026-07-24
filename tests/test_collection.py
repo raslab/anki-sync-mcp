@@ -264,6 +264,43 @@ async def test_create_card_cleans_up_when_postcheck_raises(
 
 
 @pytest.mark.anyio
+async def test_update_card_rolls_back_when_postcheck_raises(
+    populated_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    collection = Collection(populated_collection)
+    try:
+        card_id = int(collection.find_cards("deck:Languages::Spanish")[0])
+        note_id = int(collection.get_card(card_id).nid)
+    finally:
+        collection.close()
+    original_find_cards = Collection.find_cards
+    note_search_calls = 0
+
+    def fail_second_note_search(
+        self: Collection, query: str, *args: object, **kwargs: object
+    ) -> list[int]:
+        nonlocal note_search_calls
+        if query == f"nid:{note_id}":
+            note_search_calls += 1
+            if note_search_calls == 2:
+                raise RuntimeError("post-update check failed")
+        return [int(card_id) for card_id in original_find_cards(self, query, *args, **kwargs)]
+
+    monkeypatch.setattr(Collection, "find_cards", fail_second_note_search)
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        with pytest.raises(RuntimeError, match="post-update check failed"):
+            await service.update_card(card_id, "must roll back", "must roll back", None)
+
+    collection = Collection(populated_collection)
+    try:
+        note = collection.get_note(note_id)
+        assert note["Front"] == "hola"
+        assert note["Back"] == "hello"
+    finally:
+        collection.close()
+
+
+@pytest.mark.anyio
 async def test_card_field_update_rejects_basic_copy_with_front_and_back(
     populated_collection: str,
 ) -> None:

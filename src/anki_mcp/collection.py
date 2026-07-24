@@ -283,12 +283,15 @@ class CollectionAdapter:
                 note["Front"] = front
             if back is not None:
                 note["Back"] = back
-            self.collection.update_note(note)
-            if len(self.collection.find_cards(f"nid:{int(note.id)}")) != 1:
+            try:
+                self.collection.update_note(note)
+                if len(self.collection.find_cards(f"nid:{int(note.id)}")) != 1:
+                    raise ValueError("Basic note update must retain exactly one card")
+            except Exception:
                 note["Front"] = previous_front
                 note["Back"] = previous_back
                 self.collection.update_note(note)
-                raise ValueError("Basic note update must retain exactly one card")
+                raise
         try:
             if deck_id is not None:
                 self.collection.set_deck([cast("CardId", card_id)], deck_id)
