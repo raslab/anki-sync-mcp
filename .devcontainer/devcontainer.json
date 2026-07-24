@@ -1,0 +1,11 @@
+{
+  "name": "learn-devcontainer",
+  "image": "mcr.microsoft.com/devcontainers/typescript-node:1-22-bookworm",
+  "postCreateCommand": "npm i -g @openai/codex",
+  "mounts": [
+    "source=${localEnv:HOME}/.codex,target=/home/node/.codex,type=bind"
+  ],
+  "remoteEnv": {
+    "CODEX_HOME": "/home/node/.codex"
+  }
+}
