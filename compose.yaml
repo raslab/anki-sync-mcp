@@ -2,13 +2,16 @@ services:
   anki-mcp:
     build:
       context: .
-    image: anki-mcp:0.1.0
+    image: anki-mcp:0.2.0
     restart: unless-stopped
     environment:
       MCP_HOST: "0.0.0.0"
       MCP_PORT: "8000"
       MCP_AUTH_TOKEN_FILE: "/run/secrets/anki_mcp_token"
       ANKI_COLLECTION_PATH: "/data/collection.anki2"
+      ANKI_SYNC_USERNAME: "${ANKI_SYNC_USERNAME:?ANKI_SYNC_USERNAME is required}"
+      ANKI_SYNC_PASSWORD: "${ANKI_SYNC_PASSWORD:?ANKI_SYNC_PASSWORD is required}"
+      ANKI_SYNC_HOST: "${ANKI_SYNC_HOST:-}"
       MCP_MAX_PAGE_SIZE: "100"
     secrets:
       - anki_mcp_token

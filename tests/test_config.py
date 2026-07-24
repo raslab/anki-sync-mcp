@@ -9,7 +9,13 @@ from anki_mcp.config import Settings
 
 
 def env(tmp_path: Path, **values: str) -> dict[str, str]:
-    base = {"MCP_AUTH_TOKEN": "test-secret", "ANKI_COLLECTION_PATH": str(tmp_path / "c.anki2")}
+    base = {
+        "MCP_AUTH_TOKEN": "test-secret",
+        "ANKI_COLLECTION_PATH": str(tmp_path / "c.anki2"),
+        "ANKI_SYNC_USERNAME": "sync-user",
+        "ANKI_SYNC_PASSWORD": "sync-password",
+        "ANKI_SYNC_HOST": "https://sync.example.test/",
+    }
     base.update(values)
     return base
 
@@ -23,6 +29,28 @@ def test_direct_token_and_defaults(tmp_path: Path) -> None:
     assert settings.max_page_size == 100
     assert settings.max_search_scan == 10_000
     assert settings.max_rendered_field_bytes == 262_144
+    assert settings.sync_username == "sync-user"
+    assert settings.sync_password.get_secret_value() == "sync-password"
+    assert settings.sync_host == "https://sync.example.test/"
+
+
+@pytest.mark.parametrize("missing", ["ANKI_SYNC_USERNAME", "ANKI_SYNC_PASSWORD"])
+def test_sync_credentials_are_required_from_environment(tmp_path: Path, missing: str) -> None:
+    values = env(tmp_path)
+    del values[missing]
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **values)
+
+
+def test_empty_sync_host_selects_ankiweb(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, **env(tmp_path, ANKI_SYNC_HOST=""))
+    assert settings.sync_endpoint is None
+
+
+@pytest.mark.parametrize("host", ["sync.example.test", "ftp://sync.example.test", "https://"])
+def test_nonempty_sync_host_must_be_an_http_url(tmp_path: Path, host: str) -> None:
+    with pytest.raises(ValidationError, match="ANKI_SYNC_HOST"):
+        Settings(_env_file=None, **env(tmp_path, ANKI_SYNC_HOST=host))
 
 
 def test_token_file_strips_one_trailing_newline(tmp_path: Path) -> None:

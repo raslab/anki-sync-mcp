@@ -1,12 +1,12 @@
 # Anki MCP
 
-A small, production-shaped MVP of the sidecar described in
+A small, production-shaped sidecar based on
 [`docs/anki_mcp_system_design.md`](docs/anki_mcp_system_design.md). It exposes one local Anki
-collection through authenticated Streamable HTTP MCP.
+collection through authenticated Streamable HTTP MCP and synchronizes it through Anki's official
+sync client API.
 
-This iteration is intentionally read-only. It proves the package, container, authentication,
-health checks, MCP transport, official Anki library integration, and single-owner collection
-execution model before sync or mutation behavior is added.
+The service exposes explicit remote login/sync operations and CRUD tools for decks and Basic
+cards. All collection and sync calls run on one dedicated owner thread.
 
 ## Included surface
 
@@ -14,24 +14,34 @@ Endpoint: `http://<host>:8000/mcp`
 
 | Tool | Purpose |
 | --- | --- |
+| `anki_sync_login` | Authenticate with configured sync credentials and retain the host key in memory. |
+| `anki_sync` | Synchronize collection changes and optionally media. |
 | `anki_decks_list` | List deck IDs, names, and hierarchy with bounded pagination. |
 | `anki_decks_get` | Read one deck by stable ID. |
-| `anki_cards_search` | Search cards with Anki search syntax and bounded pagination. |
+| `anki_decks_create` | Create a deck by name. |
+| `anki_decks_update` | Rename a deck by stable ID. |
+| `anki_decks_delete` | Delete a deck and its contained cards with `confirm=true`. |
+| `anki_cards_search` | Search cards with Anki search syntax and bounded offset pagination. |
 | `anki_cards_get` | Read rendered card content, deck identity, flags, and scheduling state. |
+| `anki_cards_create` | Create a Basic Front/Back note and its card in a deck. |
+| `anki_cards_update` | Update Front/Back and/or move a Basic card to another deck. |
+| `anki_cards_delete` | Delete a card and its orphaned note with `confirm=true`. |
 
 Public, content-free probes:
 
 - `GET /health/live`
 - `GET /health/ready`
 
-Not included: sync, writes, media, notes, destructive operations, Basic auth, or multi-user
-support. The server never opens Anki Desktop and never writes directly to SQLite.
+Not included: arbitrary note types/fields, automatic sync around each mutation, persisted sync host
+keys, full-sync direction selection, Basic HTTP auth, or multi-user support. The server never opens
+Anki Desktop and never writes directly to SQLite.
 
 ## Requirements
 
 - Python 3.12
 - [`uv`](https://docs.astral.sh/uv/), or Docker for container-only use
 - A high-entropy MCP bearer token
+- An AnkiWeb or self-hosted sync account
 
 ## Develop and verify
 
@@ -46,8 +56,8 @@ uv build
 
 The tests create disposable collections through the official `anki` Python API. They cover
 configuration and secret-file behavior, bearer rejection without secret leakage, MCP
-initialization and exact tool inventory, all four tool calls through JSON-RPC, pagination,
-not-found behavior, and real deck/card reads.
+initialization and exact tool inventory, deck/card CRUD through JSON-RPC, mocked remote login/sync
+without credential leakage, pagination, not-found behavior, and real collection mutations.
 
 ## Run locally
 
@@ -55,6 +65,9 @@ not-found behavior, and real deck/card reads.
 mkdir -p .local-data
 export MCP_AUTH_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 export ANKI_COLLECTION_PATH="$PWD/.local-data/collection.anki2"
+export ANKI_SYNC_USERNAME="your-sync-username"
+export ANKI_SYNC_PASSWORD="your-sync-password"
+export ANKI_SYNC_HOST="" # empty selects AnkiWeb; otherwise use the custom sync base URL
 uv run anki-mcp
 ```
 
@@ -62,8 +75,11 @@ Configure the MCP client for Streamable HTTP at `http://127.0.0.1:8000/mcp` with
 
 Supply an `Authorization` header using the Bearer scheme and the configured token.
 
-Do not use an AnkiWeb password as this token. The MVP reads the current local collection
-snapshot; it does not synchronize that snapshot with AnkiWeb.
+Do not use an AnkiWeb password as the MCP token. MCP authentication and remote Anki sync
+authentication are separate. Call `anki_sync_login` after each service restart, then call
+`anki_sync` explicitly before reading remote changes or after local mutations. The returned sync
+payload never contains the configured password or Anki host key. A full-sync requirement is
+reported to the caller; this service never chooses upload or download direction automatically.
 
 ## Run as the OpenClaw sidecar
 
@@ -73,6 +89,9 @@ Create the Compose secret and build the image:
 mkdir -p secrets
 python -c 'import secrets; print(secrets.token_urlsafe(32))' > secrets/anki_mcp_token
 chmod 600 secrets/anki_mcp_token
+export ANKI_SYNC_USERNAME="your-sync-username"
+export ANKI_SYNC_PASSWORD="your-sync-password"
+export ANKI_SYNC_HOST="" # AnkiWeb
 docker compose build
 docker compose up -d
 docker compose exec anki-mcp anki-mcp-healthcheck
@@ -95,6 +114,9 @@ Exactly one token source is required. Setting both is a startup error.
 | --- | --- | --- |
 | `MCP_AUTH_TOKEN` | — | Bearer token supplied directly. |
 | `MCP_AUTH_TOKEN_FILE` | — | File containing the bearer token; preferred in containers. |
+| `ANKI_SYNC_USERNAME` | — | Required remote sync account username. |
+| `ANKI_SYNC_PASSWORD` | — | Required remote sync account password. |
+| `ANKI_SYNC_HOST` | empty | Empty selects AnkiWeb; otherwise the self-hosted sync base URL. |
 | `MCP_HOST` | `0.0.0.0` | Bind address. |
 | `MCP_PORT` | `8000` | Bind port. |
 | `MCP_PATH` | `/mcp` | Absolute, non-root MCP path. |
@@ -106,9 +128,10 @@ Exactly one token source is required. Setting both is a startup error.
 | `MCP_ALLOWED_ORIGINS` | local HTTP origins | Comma-separated exact origins or `origin:*` patterns; browser requests with other origins are rejected. |
 | `LOG_LEVEL` | `INFO` | Uvicorn log level. |
 
-`MCP_AUTH_TOKEN_FILE` is read once during startup. Routine health and authentication errors do not
-return the token or collection path. Every HTTP method under the MCP path is authenticated with a
-constant-time token comparison.
+`MCP_AUTH_TOKEN_FILE` and sync credentials are read at startup. Routine health, authentication, and
+tool errors do not return credentials or the collection path. Every HTTP method under the MCP path
+is authenticated with a constant-time token comparison. The sync host key is retained only in
+process memory, so `anki_sync_login` must be called after a restart before `anki_sync`.
 
 Missing IDs and invalid pagination return MCP tool errors whose text ends with a compact JSON
 object containing a stable `code` (`NOT_FOUND` or `INVALID_ARGUMENT`), a safe message, and a
@@ -119,9 +142,9 @@ error response.
 
 ```text
 src/anki_mcp/
-  app.py          ASGI composition and four FastMCP tools
+  app.py          ASGI composition and twelve FastMCP tools
   auth.py         bearer authentication middleware
-  collection.py   official Anki adapter and dedicated single-thread executor
+  collection.py   official Anki CRUD/sync adapter and dedicated single-thread executor
   config.py       strict environment and secret-file settings
   healthcheck.py  container readiness command
   __main__.py     one-worker Uvicorn entry point
@@ -135,6 +158,8 @@ uv.lock            reproducible dependency lock
 ## Current safety boundary
 
 The collection executor owns the `anki.collection.Collection` object on exactly one dedicated
-worker thread. All tool calls are serialized through that thread. This is the required foundation
-for a future `sync down -> mutate -> sync up` coordinator, but this MVP performs none of those
-steps and must not be represented as remotely synchronized.
+worker thread. All tool calls, including remote login and sync, are serialized through that thread.
+Sync is explicit rather than automatic: callers should use `sync -> mutate -> sync`. Delete tools
+require `confirm=true`; deck deletion removes contained cards. Card creation uses Anki's built-in Basic note type;
+card field updates therefore support `Front` and `Back` only. Back up the persistent volume before
+destructive operations, and do not mount one collection into multiple live Anki processes.

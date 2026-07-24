@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,6 +24,9 @@ class Settings(BaseSettings):
     auth_token_input: SecretStr | None = Field(None, alias="MCP_AUTH_TOKEN")
     auth_token_file: Path | None = Field(None, alias="MCP_AUTH_TOKEN_FILE")
     collection_path: Path = Field(Path("/data/collection.anki2"), alias="ANKI_COLLECTION_PATH")
+    sync_username: str = Field(min_length=1, alias="ANKI_SYNC_USERNAME")
+    sync_password: SecretStr = Field(alias="ANKI_SYNC_PASSWORD")
+    sync_host: str = Field("", alias="ANKI_SYNC_HOST")
     max_page_size: int = Field(100, ge=1, le=1000, alias="MCP_MAX_PAGE_SIZE")
     max_search_scan: int = Field(10_000, ge=1, le=1_000_000, alias="MCP_MAX_SEARCH_SCAN")
     max_rendered_field_bytes: int = Field(
@@ -37,6 +41,36 @@ class Settings(BaseSettings):
         "http://localhost:*,http://127.0.0.1:*", alias="MCP_ALLOWED_ORIGINS"
     )
     auth_token: SecretStr = Field(default=SecretStr(""), exclude=True)
+
+    @field_validator("sync_username")
+    @classmethod
+    def valid_sync_username(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("ANKI_SYNC_USERNAME must not be blank")
+        return value
+
+    @field_validator("sync_password")
+    @classmethod
+    def valid_sync_password(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value():
+            raise ValueError("ANKI_SYNC_PASSWORD must not be empty")
+        return value
+
+    @property
+    def sync_endpoint(self) -> str | None:
+        endpoint = self.sync_host.strip()
+        return endpoint or None
+
+    @field_validator("sync_host")
+    @classmethod
+    def valid_sync_host(cls, value: str) -> str:
+        endpoint = value.strip()
+        if not endpoint:
+            return ""
+        parsed = urlsplit(endpoint)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("ANKI_SYNC_HOST must be empty or an HTTP(S) base URL")
+        return endpoint
 
     @field_validator("mcp_path")
     @classmethod
