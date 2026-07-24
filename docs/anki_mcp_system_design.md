@@ -75,13 +75,26 @@ Typical flow:
 - **Sync coordinator:** Handles authentication, pre-operation sync, post-write sync, media completion, and full-sync detection.
 - **Persistent state:** Stores the client collection, media, sync state, idempotency records, and explicit backups.
 
+### Technology stack
+
+- **Runtime:** Python 3.12 with dependencies managed and locked by `uv`.
+- **Anki:** Official `anki==26.5` package, accessed only through a dedicated adapter.
+- **MCP:** `FastMCP` from the official Python `mcp` SDK for typed tools, schemas, lifecycle, and Streamable HTTP protocol handling.
+- **HTTP:** Starlette and Uvicorn provide the minimal ASGI host needed to mount FastMCP, authentication middleware, and health routes.
+- **Validation/configuration:** Pydantic v2 and `pydantic-settings`, including strict inputs and explicit environment-versus-`_FILE` secret handling.
+- **State:** The standard-library `sqlite3` module stores idempotency records, while operation status uses a JSON state file; no ORM is required initially.
+- **Testing:** `pytest`, AnyIO's pytest support, HTTPX, and `pytest-cov`, using disposable collections and a disposable instance of the official self-hosted Anki sync server.
+- **Quality:** Ruff for formatting/linting and Pyright for static type checking.
+
+The ASGI layer remains asynchronous, while a dedicated single worker thread owns the Anki collection and serializes all collection and sync operations. The deployment runs one Uvicorn worker and one container replica.
+
 ## 5. Deployment Model
 
 The sidecar is a single-user, single-collection service. It should run as one replica because Anki collection access is not designed for concurrent writers.
 
 Recommended image properties:
 
-- Python 3.10+ on a glibc-based Debian/Ubuntu image; do not use Alpine by default.
+- Python 3.12 on a glibc-based Debian/Ubuntu image; do not use Alpine by default.
 - Pin the official Anki package version, initially `anki==26.5`.
 - Run as a non-root user.
 - Use a read/write persistent volume mounted at `/data`.
@@ -453,6 +466,7 @@ Before production use, perform an end-to-end test with a disposable sync account
 ## 17. Key Decisions
 
 - Use the official `anki` Python package, not AnkiConnect or direct SQLite writes.
+- Use the official Python MCP SDK's `FastMCP`, mounted in Starlette and served by Uvicorn.
 - Use Streamable HTTP MCP at `/mcp`.
 - Prefer bearer authentication; optionally support HTTP Basic with a generated token as password.
 - Keep MCP authentication separate from Anki sync authentication.
