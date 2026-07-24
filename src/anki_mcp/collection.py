@@ -11,6 +11,8 @@ from anki.collection import Collection
 from anki.errors import NotFoundError
 from anki.sync import SyncAuth
 
+from anki_mcp.config import validate_sync_endpoint
+
 if TYPE_CHECKING:
     from anki.cards import CardId
     from anki.decks import DeckId
@@ -45,7 +47,9 @@ class CollectionAdapter:
         self.max_search_scan = max_search_scan
         self.max_rendered_field_bytes = max_rendered_field_bytes
         self.max_card_fields = max_card_fields
+        self._backup_folder = Path(path).parent / "backups"
         self._sync_auth: SyncAuth | None = None
+        self._pending_full_sync: tuple[int, int] | None = None
 
     def close(self) -> None:
         self.collection.close()
@@ -254,25 +258,70 @@ class CollectionAdapter:
 
     def sync_login(self, username: str, password: str, endpoint: str | None) -> dict[str, Any]:
         self._sync_auth = None
+        self._pending_full_sync = None
         self._sync_auth = self.collection.sync_login(username, password, endpoint)
-        return {"authenticated": True, "endpoint": endpoint or self._sync_auth.endpoint}
+        return {"authenticated": True, "endpoint_kind": "custom" if endpoint else "ankiweb"}
 
     def sync(self, sync_media: bool) -> dict[str, Any]:
         if self._sync_auth is None:
             raise SyncLoginRequiredError("sync login is required before synchronization")
         try:
             output = self.collection.sync_collection(self._sync_auth, sync_media)
+            endpoint_changed = bool(output.new_endpoint)
+            if endpoint_changed:
+                self._sync_auth.endpoint = validate_sync_endpoint(output.new_endpoint)
+            if output.required in {2, 3, 4}:
+                self._pending_full_sync = (output.required, output.server_media_usn)
+            else:
+                self._pending_full_sync = None
+            required = SYNC_REQUIRED_NAMES[output.required]
+            server_message, server_message_truncated = self._truncate_rendered(
+                output.server_message
+            )
+            return {
+                "required": required,
+                "server_message": server_message,
+                "server_message_truncated": server_message_truncated,
+                "host_number": output.host_number,
+                "media_sync_requested": sync_media,
+                "endpoint_changed": endpoint_changed,
+            }
         except Exception:
             self._sync_auth = None
+            self._pending_full_sync = None
             raise
-        required = SYNC_REQUIRED_NAMES[output.required]
-        server_message, server_message_truncated = self._truncate_rendered(output.server_message)
+
+    def full_sync(self, upload: bool) -> dict[str, Any]:
+        if self._sync_auth is None:
+            raise SyncLoginRequiredError("sync login is required before full synchronization")
+        if self._pending_full_sync is None:
+            raise ValueError("a full sync was not requested by the remote server")
+        required, server_usn = self._pending_full_sync
+        if required == 3 and upload:
+            raise ValueError("the remote server requires a full download")
+        if required == 4 and not upload:
+            raise ValueError("the remote server requires a full upload")
+        try:
+            self._backup_folder.mkdir(parents=True, exist_ok=True)
+            backup_created = self.collection.create_backup(
+                backup_folder=str(self._backup_folder),
+                force=True,
+                wait_for_completion=True,
+            )
+            self.collection.full_upload_or_download(
+                auth=self._sync_auth,
+                server_usn=server_usn,
+                upload=upload,
+            )
+        except Exception:
+            self._sync_auth = None
+            self._pending_full_sync = None
+            raise
+        self._pending_full_sync = None
         return {
-            "required": required,
-            "server_message": server_message,
-            "server_message_truncated": server_message_truncated,
-            "host_number": output.host_number,
-            "media_sync_requested": sync_media,
+            "completed": True,
+            "direction": "upload" if upload else "download",
+            "backup_created": backup_created,
         }
 
     def _truncate_rendered(self, value: str) -> tuple[str, bool]:
@@ -406,6 +455,9 @@ class AnkiCollectionService:
 
     async def sync(self, sync_media: bool) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.sync(sync_media))
+
+    async def full_sync(self, upload: bool) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.full_sync(upload))
 
     async def check_ready(self) -> bool:
         return await self.executor.run(lambda adapter: adapter.check_ready())

@@ -8,6 +8,26 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def validate_sync_endpoint(value: str) -> str:
+    """Validate a custom sync endpoint without exposing embedded credentials."""
+    endpoint = value.strip()
+    if not endpoint:
+        return ""
+    parsed = urlsplit(endpoint)
+    if len(endpoint.encode("utf-8")) > 2048:
+        raise ValueError("ANKI_SYNC_HOST must not exceed 2048 UTF-8 bytes")
+    if not parsed.netloc or parsed.scheme not in {"http", "https"}:
+        raise ValueError("ANKI_SYNC_HOST must be empty or an HTTP(S) base URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("ANKI_SYNC_HOST must not contain user information")
+    if parsed.query or parsed.fragment:
+        raise ValueError("ANKI_SYNC_HOST must not contain a query or fragment")
+    loopback_hosts = {"localhost", "127.0.0.1", "::1"}
+    if parsed.scheme == "http" and parsed.hostname not in loopback_hosts:
+        raise ValueError("ANKI_SYNC_HOST requires HTTPS except for loopback development")
+    return endpoint
+
+
 class Settings(BaseSettings):
     """Validated process configuration.
 
@@ -36,6 +56,7 @@ class Settings(BaseSettings):
     max_response_bytes: int = Field(
         1_048_576, ge=1024, le=16_777_216, alias="MCP_MAX_RESPONSE_BYTES"
     )
+    max_request_bytes: int = Field(1_048_576, ge=1024, le=16_777_216, alias="MCP_MAX_REQUEST_BYTES")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     allowed_hosts_csv: str = Field(
         "testserver,localhost,localhost:*,127.0.0.1,127.0.0.1:*,anki-mcp,anki-mcp:*",
@@ -68,22 +89,7 @@ class Settings(BaseSettings):
     @field_validator("sync_host")
     @classmethod
     def valid_sync_host(cls, value: str) -> str:
-        endpoint = value.strip()
-        if not endpoint:
-            return ""
-        parsed = urlsplit(endpoint)
-        if len(endpoint.encode("utf-8")) > 2048:
-            raise ValueError("ANKI_SYNC_HOST must not exceed 2048 UTF-8 bytes")
-        if not parsed.netloc or parsed.scheme not in {"http", "https"}:
-            raise ValueError("ANKI_SYNC_HOST must be empty or an HTTP(S) base URL")
-        if parsed.username is not None or parsed.password is not None:
-            raise ValueError("ANKI_SYNC_HOST must not contain user information")
-        if parsed.query or parsed.fragment:
-            raise ValueError("ANKI_SYNC_HOST must not contain a query or fragment")
-        loopback_hosts = {"localhost", "127.0.0.1", "::1"}
-        if parsed.scheme == "http" and parsed.hostname not in loopback_hosts:
-            raise ValueError("ANKI_SYNC_HOST requires HTTPS except for loopback development")
-        return endpoint
+        return validate_sync_endpoint(value)
 
     @field_validator("mcp_path")
     @classmethod

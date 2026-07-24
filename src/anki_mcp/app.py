@@ -3,29 +3,33 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncGenerator, Awaitable
 from contextlib import asynccontextmanager
-from typing import Any, NoReturn, TypeVar
+from typing import Annotated, Any, NoReturn, TypeVar
 from uuid import uuid4
 
+from anki.errors import NetworkError, SyncError, SyncErrorKind
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import StrictBool, StrictInt
+from pydantic import Field, StrictBool, StrictInt, StrictStr
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.types import ASGIApp
 
-from anki_mcp.auth import BearerAuthMiddleware
+from anki_mcp.auth import BearerAuthMiddleware, RequestBodyLimitMiddleware
 from anki_mcp.collection import AnkiCollectionService, SyncLoginRequiredError
 from anki_mcp.config import Settings
 
 T = TypeVar("T")
 Offset = StrictInt
 PageLimit = StrictInt
-StableId = StrictInt
+StableId = Annotated[StrictInt, Field(gt=0)]
 Confirmation = StrictBool
 SyncMedia = StrictBool
+DeckName = Annotated[StrictStr, Field(min_length=1, max_length=512)]
+SearchQuery = Annotated[StrictStr, Field(max_length=4096)]
+CardText = Annotated[StrictStr, Field(max_length=262_144)]
 
 
 class ResponseTooLargeError(RuntimeError):
@@ -77,6 +81,11 @@ def create_app(settings: Settings) -> ASGIApp:
             raise_tool_error("AUTHENTICATION_FAILED", str(exc), exc)
         except ResponseTooLargeError as exc:
             raise_tool_error("RESPONSE_TOO_LARGE", str(exc), exc)
+        except NetworkError as exc:
+            raise_tool_error("NETWORK_ERROR", "remote sync network request failed", exc)
+        except SyncError as exc:
+            code = "AUTHENTICATION_FAILED" if exc.kind == SyncErrorKind.AUTH else "SYNC_ERROR"
+            raise_tool_error(code, "remote sync operation failed", exc)
         except Exception as exc:
             raise_tool_error("INTERNAL_ERROR", "internal collection operation failed", exc)
 
@@ -96,6 +105,22 @@ def create_app(settings: Settings) -> ASGIApp:
         """Synchronize the collection with the authenticated remote server."""
         return await execute(service.sync(sync_media))
 
+    @mcp.tool(name="anki_sync_full_download")
+    async def sync_full_download(confirm: Confirmation = False) -> dict[str, Any]:
+        """Replace local data after the server requires a full download and confirmation is true."""
+        if not confirm:
+            cause = ValueError("confirm must be true for full download")
+            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+        return await execute(service.full_sync(upload=False))
+
+    @mcp.tool(name="anki_sync_full_upload")
+    async def sync_full_upload(confirm: Confirmation = False) -> dict[str, Any]:
+        """Replace remote data after the server requires a full upload and confirmation is true."""
+        if not confirm:
+            cause = ValueError("confirm must be true for full upload")
+            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+        return await execute(service.full_sync(upload=True))
+
     @mcp.tool(name="anki_decks_list")
     async def decks_list(
         offset: Offset = 0, limit: PageLimit = settings.max_page_size
@@ -109,12 +134,12 @@ def create_app(settings: Settings) -> ASGIApp:
         return await execute(service.get_deck(deck_id))
 
     @mcp.tool(name="anki_decks_create")
-    async def decks_create(name: str) -> dict[str, Any]:
+    async def decks_create(name: DeckName) -> dict[str, Any]:
         """Create a deck by name, or return the existing deck with that name."""
         return await execute(service.create_deck(name))
 
     @mcp.tool(name="anki_decks_update")
-    async def decks_update(deck_id: StableId, name: str) -> dict[str, Any]:
+    async def decks_update(deck_id: StableId, name: DeckName) -> dict[str, Any]:
         """Rename a deck by stable Anki deck ID."""
         return await execute(service.update_deck(deck_id, name))
 
@@ -128,7 +153,7 @@ def create_app(settings: Settings) -> ASGIApp:
 
     @mcp.tool(name="anki_cards_search")
     async def cards_search(
-        query: str = "", offset: Offset = 0, limit: PageLimit = settings.max_page_size
+        query: SearchQuery = "", offset: Offset = 0, limit: PageLimit = settings.max_page_size
     ) -> dict[str, Any]:
         """Search cards with Anki search syntax and bounded offset pagination."""
         return await execute(service.search_cards(query=query, offset=offset, limit=limit))
@@ -139,15 +164,15 @@ def create_app(settings: Settings) -> ASGIApp:
         return await execute(service.get_card(card_id))
 
     @mcp.tool(name="anki_cards_create")
-    async def cards_create(deck_id: StableId, front: str, back: str) -> dict[str, Any]:
+    async def cards_create(deck_id: StableId, front: CardText, back: CardText) -> dict[str, Any]:
         """Create one Basic note/card in a deck."""
         return await execute(service.create_card(deck_id, front, back))
 
     @mcp.tool(name="anki_cards_update")
     async def cards_update(
         card_id: StableId,
-        front: str | None = None,
-        back: str | None = None,
+        front: CardText | None = None,
+        back: CardText | None = None,
         deck_id: StableId | None = None,
     ) -> dict[str, Any]:
         """Update a Basic card's Front/Back fields and/or move it to another deck."""
@@ -166,6 +191,8 @@ def create_app(settings: Settings) -> ASGIApp:
     for tool_name in (
         "anki_sync_login",
         "anki_sync",
+        "anki_sync_full_download",
+        "anki_sync_full_upload",
         "anki_decks_list",
         "anki_decks_get",
         "anki_decks_create",
@@ -225,7 +252,7 @@ def create_app(settings: Settings) -> ASGIApp:
     app.state.settings = settings
     app.state.collection_service = service
     return BearerAuthMiddleware(
-        app,
+        RequestBodyLimitMiddleware(app, settings.max_request_bytes, settings.mcp_path),
         settings.auth_token.get_secret_value(),
         settings.mcp_path,
     )

@@ -15,12 +15,14 @@ services:
       MCP_MAX_PAGE_SIZE: "100"
       MCP_MAX_CARD_FIELDS: "100"
       MCP_MAX_RESPONSE_BYTES: "1048576"
+      MCP_MAX_REQUEST_BYTES: "1048576"
     secrets:
       - anki_mcp_token
     volumes:
       - anki_data:/data
     networks:
       - assistant
+      - egress
     expose:
       - "8000"
 
@@ -34,3 +36,4 @@ volumes:
 networks:
   assistant:
     internal: true
+  egress: {}

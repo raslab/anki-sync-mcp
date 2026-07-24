@@ -16,6 +16,8 @@ Endpoint: `http://<host>:8000/mcp`
 | --- | --- |
 | `anki_sync_login` | Authenticate with configured sync credentials and retain the host key in memory. |
 | `anki_sync` | Synchronize collection changes and optionally media. |
+| `anki_sync_full_download` | After `anki_sync` reports `FULL_SYNC`/`FULL_DOWNLOAD`, back up and replace local data with `confirm=true`. |
+| `anki_sync_full_upload` | After `anki_sync` reports `FULL_SYNC`/`FULL_UPLOAD`, back up and replace remote data with `confirm=true`. |
 | `anki_decks_list` | List deck IDs, names, and hierarchy with bounded pagination. |
 | `anki_decks_get` | Read one deck by stable ID. |
 | `anki_decks_create` | Create a deck by name. |
@@ -33,7 +35,7 @@ Public, content-free probes:
 - `GET /health/ready`
 
 Not included: arbitrary note types/fields, automatic sync around each mutation, persisted sync host
-keys, full-sync direction selection, Basic HTTP auth, or multi-user support. The server never opens
+keys, automatic full-sync direction selection, Basic HTTP auth, or multi-user support. The server never opens
 Anki Desktop and never writes directly to SQLite.
 
 ## Requirements
@@ -67,7 +69,7 @@ export MCP_AUTH_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(
 export ANKI_COLLECTION_PATH="$PWD/.local-data/collection.anki2"
 export ANKI_SYNC_USERNAME="your-sync-username"
 export ANKI_SYNC_PASSWORD="your-sync-password"
-export ANKI_SYNC_HOST="" # empty selects AnkiWeb; otherwise use the custom sync base URL
+export ANKI_SYNC_HOST="" # empty selects AnkiWeb; otherwise use an HTTPS custom sync base URL
 uv run anki-mcp
 ```
 
@@ -78,8 +80,9 @@ Supply an `Authorization` header using the Bearer scheme and the configured toke
 Do not use an AnkiWeb password as the MCP token. MCP authentication and remote Anki sync
 authentication are separate. Call `anki_sync_login` after each service restart, then call
 `anki_sync` explicitly before reading remote changes or after local mutations. The returned sync
-payload never contains the configured password or Anki host key. A full-sync requirement is
-reported to the caller; this service never chooses upload or download direction automatically.
+payload never contains the configured password, Anki host key, or endpoint. When it reports
+`FULL_SYNC`, `FULL_DOWNLOAD`, or `FULL_UPLOAD`, call the matching confirmed full-sync tool. Both
+directions create a local backup first; the service never chooses a destructive direction itself.
 
 ## Run as the OpenClaw sidecar
 
@@ -97,10 +100,10 @@ docker compose up -d
 docker compose exec anki-mcp anki-mcp-healthcheck
 ```
 
-The checked-in Compose file keeps the service on the private `assistant` network and exposes no
-host port. A container on that network connects to `http://anki-mcp:8000/mcp` and reads the bearer
-token from the same secret source. Add a temporary `ports: ["127.0.0.1:8000:8000"]` mapping only
-for host-side development.
+The checked-in Compose file keeps MCP traffic on the private `assistant` network, adds a separate
+egress-capable network for AnkiWeb/self-hosted sync, and exposes no host port. A container on the
+private network connects to `http://anki-mcp:8000/mcp` and reads the bearer token from the same
+secret source. Add a temporary `ports: ["127.0.0.1:8000:8000"]` mapping only for host-side development.
 
 The image runs as UID/GID `10001`, owns `/data`, uses one Uvicorn worker, and stores the collection
 on the `anki_data` volume. Never mount the same collection read/write into two running sidecars,
@@ -126,6 +129,7 @@ Exactly one token source is required. Setting both is a startup error.
 | `MCP_MAX_RENDERED_FIELD_BYTES` | `262144` | UTF-8 byte cap for each rendered card question/answer; responses include truncation flags. |
 | `MCP_MAX_CARD_FIELDS` | `100` | Maximum number of note fields returned with one card. |
 | `MCP_MAX_RESPONSE_BYTES` | `1048576` | Aggregate UTF-8 JSON budget for one tool result; oversized responses fail with `RESPONSE_TOO_LARGE`. |
+| `MCP_MAX_REQUEST_BYTES` | `1048576` | Aggregate byte budget for one MCP HTTP request body; oversized requests receive HTTP 413. |
 | `MCP_ALLOWED_HOSTS` | local and `anki-mcp` hosts | Comma-separated exact hosts or `host:*` patterns accepted by Streamable HTTP. |
 | `MCP_ALLOWED_ORIGINS` | local HTTP origins | Comma-separated exact origins or `origin:*` patterns; browser requests with other origins are rejected. |
 | `LOG_LEVEL` | `INFO` | Uvicorn log level. |
@@ -145,7 +149,7 @@ error response.
 
 ```text
 src/anki_mcp/
-  app.py          ASGI composition and twelve FastMCP tools
+  app.py          ASGI composition and fourteen FastMCP tools
   auth.py         bearer authentication middleware
   collection.py   official Anki CRUD/sync adapter and dedicated single-thread executor
   config.py       strict environment and secret-file settings
@@ -153,7 +157,7 @@ src/anki_mcp/
   __main__.py     one-worker Uvicorn entry point
 tests/             config, collection, auth, health, and MCP integration tests
 Dockerfile         multi-stage, non-root production image
-compose.yaml       private-network sidecar deployment
+compose.yaml       private MCP network plus controlled sync-egress sidecar deployment
 pyproject.toml     package, test, lint, format, and type-check configuration
 uv.lock            reproducible dependency lock
 ```
@@ -162,7 +166,9 @@ uv.lock            reproducible dependency lock
 
 The collection executor owns the `anki.collection.Collection` object on exactly one dedicated
 worker thread. All tool calls, including remote login and sync, are serialized through that thread.
-Sync is explicit rather than automatic: callers should use `sync -> mutate -> sync`. Delete tools
+Sync is explicit rather than automatic: callers should use `sync -> mutate -> sync`. Full sync
+requires a preceding server requirement, a direction-compatible tool, strict confirmation, and a
+local backup under the collection's `backups/` directory. Delete tools
 require a strict JSON boolean `confirm=true`; the Default deck cannot be deleted, and deleting any
 other deck removes its contained cards. Card creation and field updates support only Anki's built-in
 single-card Basic note type (`Front` and `Back`). Back up the persistent volume before destructive

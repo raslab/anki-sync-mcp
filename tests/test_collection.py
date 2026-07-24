@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from anki.collection import Collection
@@ -240,7 +241,7 @@ async def test_sync_login_uses_configured_credentials_and_sync_reuses_host_key(
         synced = await service.sync(sync_media=True)
 
     assert login_calls == [("sync-user", "sync-password", "https://sync.example.test/")]
-    assert logged_in == {"authenticated": True, "endpoint": "https://sync.example.test/"}
+    assert logged_in == {"authenticated": True, "endpoint_kind": "custom"}
     assert "host-key-secret" not in repr(logged_in)
     assert sync_auth[0].hkey == "host-key-secret"
     assert synced == {
@@ -249,7 +250,62 @@ async def test_sync_login_uses_configured_credentials_and_sync_reuses_host_key(
         "server_message_truncated": False,
         "host_number": 3,
         "media_sync_requested": True,
+        "endpoint_changed": False,
     }
+
+
+@pytest.mark.anyio
+async def test_sync_applies_valid_endpoint_migration_without_exposing_it(
+    populated_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    endpoints: list[str] = []
+
+    def login(_: Collection, username: str, password: str, endpoint: str | None) -> SyncAuth:
+        return SyncAuth(hkey="host-key", endpoint=endpoint)
+
+    def sync(_: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        endpoints.append(auth.endpoint)
+        if len(endpoints) == 1:
+            return SyncOutput(required=0, new_endpoint="https://migrated.example.test/sync/")
+        return SyncOutput(required=0)
+
+    monkeypatch.setattr(Collection, "sync_login", login)
+    monkeypatch.setattr(Collection, "sync_collection", sync)
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://original.example.test/")
+        migrated = await service.sync(sync_media=False)
+        await service.sync(sync_media=False)
+
+    assert migrated["endpoint_changed"] is True
+    assert "migrated.example" not in repr(migrated)
+    assert endpoints == [
+        "https://original.example.test/",
+        "https://migrated.example.test/sync/",
+    ]
+
+
+@pytest.mark.anyio
+async def test_insecure_endpoint_migration_is_rejected_and_invalidates_auth(
+    populated_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        Collection,
+        "sync_login",
+        lambda self, username, password, endpoint: SyncAuth(hkey="host-key", endpoint=endpoint),
+    )
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: SyncOutput(
+            required=0, new_endpoint="http://attacker.example.test/"
+        ),
+    )
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://original.example.test/")
+        with pytest.raises(ValueError, match="HTTPS"):
+            await service.sync(sync_media=False)
+        with pytest.raises(RuntimeError, match="login"):
+            await service.sync(sync_media=False)
 
 
 @pytest.mark.anyio
@@ -287,6 +343,80 @@ async def test_full_sync_requirements_are_reported_without_choosing_direction(
         result = await service.sync(sync_media=False)
     assert result["required"] == expected
     assert calls == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("required", "upload", "direction"),
+    [(2, False, "download"), (2, True, "upload"), (3, False, "download"), (4, True, "upload")],
+)
+async def test_confirmed_full_sync_uses_required_direction_and_creates_backup(
+    populated_collection: str,
+    monkeypatch: pytest.MonkeyPatch,
+    required: int,
+    upload: bool,
+    direction: str,
+) -> None:
+    full_calls: list[tuple[str, int | None, bool]] = []
+    backups: list[str] = []
+
+    monkeypatch.setattr(
+        Collection,
+        "sync_login",
+        lambda self, username, password, endpoint: SyncAuth(hkey="host-key", endpoint=endpoint),
+    )
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: SyncOutput(required=required, server_media_usn=42),
+    )
+
+    def full_sync(
+        self: Collection, *, auth: SyncAuth, server_usn: int | None, upload: bool
+    ) -> None:
+        full_calls.append((auth.hkey, server_usn, upload))
+
+    def backup(
+        self: Collection, *, backup_folder: str, force: bool, wait_for_completion: bool
+    ) -> bool:
+        assert force is True
+        assert wait_for_completion is True
+        backups.append(backup_folder)
+        return True
+
+    monkeypatch.setattr(Collection, "full_upload_or_download", full_sync)
+    monkeypatch.setattr(Collection, "create_backup", backup)
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        await service.sync(sync_media=False)
+        result = await service.full_sync(upload=upload)
+
+    assert result == {"completed": True, "direction": direction, "backup_created": True}
+    assert full_calls == [("host-key", 42, upload)]
+    assert backups == [str(Path(populated_collection).parent / "backups")]
+
+
+@pytest.mark.anyio
+async def test_full_sync_rejects_missing_requirement_and_wrong_direction(
+    populated_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        Collection,
+        "sync_login",
+        lambda self, username, password, endpoint: SyncAuth(hkey="host-key", endpoint=endpoint),
+    )
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: SyncOutput(required=3, server_media_usn=42),
+    )
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        with pytest.raises(ValueError, match="requested"):
+            await service.full_sync(upload=False)
+        await service.sync(sync_media=False)
+        with pytest.raises(ValueError, match="download"):
+            await service.full_sync(upload=True)
 
 
 @pytest.mark.anyio
