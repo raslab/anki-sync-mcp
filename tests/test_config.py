@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from anki_mcp.config import Settings
+from anki_mcp.config import Settings, validate_sync_migration_endpoint
 
 
 def env(tmp_path: Path, **values: str) -> dict[str, str]:
@@ -98,6 +98,25 @@ def test_sync_host_rejects_insecure_or_credential_bearing_urls(tmp_path: Path, h
 )
 def test_sync_host_allows_http_only_for_loopback_development(tmp_path: Path, host: str) -> None:
     assert Settings(_env_file=None, **env(tmp_path, ANKI_SYNC_HOST=host)).sync_host == host
+
+
+def test_sync_migrations_remain_within_the_login_trust_boundary() -> None:
+    assert (
+        validate_sync_migration_endpoint(
+            "https://self.example.test/new-path", "https://self.example.test/base-path"
+        )
+        == "https://self.example.test/new-path"
+    )
+    assert (
+        validate_sync_migration_endpoint("https://sync17.ankiweb.net/sync/", None)
+        == "https://sync17.ankiweb.net/sync/"
+    )
+    with pytest.raises(ValueError, match="trusted origin"):
+        validate_sync_migration_endpoint(
+            "https://other.example.test/", "https://self.example.test/"
+        )
+    with pytest.raises(ValueError, match="untrusted origin"):
+        validate_sync_migration_endpoint("https://127.0.0.1/", None)
 
 
 def test_token_file_strips_one_trailing_newline(tmp_path: Path) -> None:

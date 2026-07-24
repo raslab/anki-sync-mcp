@@ -69,6 +69,24 @@ def test_mcp_rejects_missing_or_invalid_bearer_token(client: TestClient) -> None
         assert "wrong-token" not in invalid.text
 
 
+def test_bearer_token_comparison_runs_for_missing_and_malformed_headers(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[bytes, bytes]] = []
+
+    def compare(supplied: bytes, expected: bytes) -> bool:
+        calls.append((supplied, expected))
+        return False
+
+    monkeypatch.setattr("anki_mcp.auth.hmac.compare_digest", compare)
+    assert client.post("/mcp", json={}).status_code == 401
+    assert (
+        client.post("/mcp", headers={"Authorization": "Basic malformed"}, json={}).status_code
+        == 401
+    )
+    assert calls == [(b"", b"correct-token"), (b"malformed", b"correct-token")]
+
+
 def test_mcp_accepts_valid_bearer_token(client: TestClient) -> None:
     response = client.post(
         "/mcp",
@@ -253,9 +271,9 @@ def test_deck_and_card_crud_tools_work_through_json_rpc(client: TestClient) -> N
     card_deleted = call("anki_cards_delete", {"card_id": card["id"], "confirm": True})
     deck_deleted = call("anki_decks_delete", {"deck_id": deck["id"], "confirm": True})
 
-    assert renamed["name"] == "CRUD Updated"
+    assert renamed == {"id": deck["id"], "updated": True}
     assert deck["created"] is True
-    assert existing_deck == {"id": deck["id"], "name": "CRUD", "created": False}
+    assert existing_deck == {"id": deck["id"], "created": False}
     assert changed["updated"] is True
     assert card_deleted["deleted"] is True
     assert deck_deleted["deleted"] is True

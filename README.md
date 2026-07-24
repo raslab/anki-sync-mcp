@@ -145,6 +145,8 @@ tool errors do not return credentials or the collection path. Every HTTP method 
 is authenticated with a constant-time token comparison. The sync host key is retained only in
 process memory and is cleared before re-login or after a failed sync, so `anki_sync_login` must be
 called after a restart or sync authentication/network failure before `anki_sync`.
+Server-directed migrations are accepted only within the configured custom origin, or to an HTTPS
+`ankiweb.net` host when using AnkiWeb.
 
 Missing IDs and invalid pagination return MCP tool errors whose text ends with a compact JSON
 object containing a stable `code` (`NOT_FOUND` or `INVALID_ARGUMENT`), a safe message, and a
@@ -184,3 +186,5 @@ Mutation tools return concise receipts so a successful side effect cannot be hid
 rendered response. Card reads represent note fields as bounded `{name, value, ...truncated}` items
 instead of using unbounded field names as JSON object keys.
 Deck creation is idempotent and reports `created=false` when the exact deck name already exists.
+Deck mutation receipts are ID-only; use `anki_decks_get` to read Anki's canonicalized or
+conflict-suffixed name.

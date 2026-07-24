@@ -130,15 +130,31 @@ async def test_deck_crud_cycle(populated_collection: str) -> None:
         created = await service.create_deck("Projects::Anki MCP")
         existing = await service.create_deck("Projects::Anki MCP")
         updated = await service.update_deck(created["id"], "Projects::Anki Server")
+        persisted = await service.get_deck(created["id"])
         deleted = await service.delete_deck(created["id"])
         with pytest.raises(LookupError, match="deck"):
             await service.get_deck(created["id"])
 
-    assert created["name"] == "Projects::Anki MCP"
     assert created["created"] is True
-    assert existing == {"id": created["id"], "name": "Projects::Anki MCP", "created": False}
-    assert updated["name"] == "Projects::Anki Server"
+    assert existing == {"id": created["id"], "created": False}
+    assert updated == {"id": created["id"], "updated": True}
+    assert persisted["name"] == "Projects::Anki Server"
     assert deleted == {"id": created["id"], "deleted": True}
+
+
+@pytest.mark.anyio
+async def test_deck_receipts_do_not_guess_anki_canonical_names(populated_collection: str) -> None:
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        normalized = await service.create_deck("Canonical::")
+        existing = await service.create_deck("Collision")
+        renamed = await service.update_deck(normalized["id"], "Collision")
+        normalized_deck = await service.get_deck(normalized["id"])
+        existing_deck = await service.get_deck(existing["id"])
+
+    assert normalized == {"id": normalized["id"], "created": True}
+    assert renamed == {"id": normalized["id"], "updated": True}
+    assert normalized_deck["name"] == "Collision+"
+    assert existing_deck["name"] == "Collision"
 
 
 @pytest.mark.anyio
@@ -470,7 +486,7 @@ async def test_sync_login_uses_configured_credentials_and_sync_reuses_host_key(
 async def test_sync_applies_valid_endpoint_migration_without_exposing_it(
     populated_collection: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    endpoints: list[str] = []
+    endpoints: list[str | None] = []
 
     def login(_: Collection, username: str, password: str, endpoint: str | None) -> SyncAuth:
         return SyncAuth(hkey="host-key", endpoint=endpoint)
@@ -478,27 +494,34 @@ async def test_sync_applies_valid_endpoint_migration_without_exposing_it(
     def sync(_: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
         endpoints.append(auth.endpoint)
         if len(endpoints) == 1:
-            return SyncOutput(required=0, new_endpoint="https://migrated.example.test/sync/")
+            return SyncOutput(required=0, new_endpoint="https://sync17.ankiweb.net/sync/")
         return SyncOutput(required=0)
 
     monkeypatch.setattr(Collection, "sync_login", login)
     monkeypatch.setattr(Collection, "sync_collection", sync)
     async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
-        await service.sync_login("user", "password", "https://original.example.test/")
+        await service.sync_login("user", "password", None)
         migrated = await service.sync(sync_media=False)
         await service.sync(sync_media=False)
 
     assert migrated["endpoint_changed"] is True
-    assert "migrated.example" not in repr(migrated)
+    assert "sync17.ankiweb.net" not in repr(migrated)
     assert endpoints == [
-        "https://original.example.test/",
-        "https://migrated.example.test/sync/",
+        "",
+        "https://sync17.ankiweb.net/sync/",
     ]
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    "new_endpoint", ["http://attacker.example.test/", "https://:443", "https:// /"]
+    "new_endpoint",
+    [
+        "http://attacker.example.test/",
+        "https://:443",
+        "https:// /",
+        "https://127.0.0.1/",
+        "https://evil.example.test/",
+    ],
 )
 async def test_insecure_endpoint_migration_is_rejected_and_invalidates_auth(
     populated_collection: str, monkeypatch: pytest.MonkeyPatch, new_endpoint: str

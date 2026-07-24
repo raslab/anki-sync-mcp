@@ -11,7 +11,7 @@ from anki.collection import Collection
 from anki.errors import NotFoundError
 from anki.sync import SyncAuth
 
-from anki_mcp.config import validate_sync_endpoint
+from anki_mcp.config import validate_sync_migration_endpoint
 
 if TYPE_CHECKING:
     from anki.cards import CardId
@@ -49,6 +49,7 @@ class CollectionAdapter:
         self.max_card_fields = max_card_fields
         self._backup_folder = Path(path).parent / "backups"
         self._sync_auth: SyncAuth | None = None
+        self._configured_sync_endpoint: str | None = None
         self._pending_full_sync: tuple[int, int | None] | None = None
 
     def close(self) -> None:
@@ -128,18 +129,18 @@ class CollectionAdapter:
             raise ValueError("deck name must not be blank")
         existing = self.collection.decks.id_for_name(name)
         if existing is not None:
-            return {"id": int(existing), "name": name, "created": False}
+            return {"id": int(existing), "created": False}
         deck_id = self.collection.decks.id(name)
         if deck_id is None:  # pragma: no cover - creation returns an ID
             raise RuntimeError("Anki did not return a deck ID")
-        return {"id": int(deck_id), "name": name, "created": True}
+        return {"id": int(deck_id), "created": True}
 
     def update_deck(self, deck_id: int, name: str) -> dict[str, Any]:
         self.get_deck(deck_id)
         if not name.strip():
             raise ValueError("deck name must not be blank")
         self.collection.decks.rename(cast("DeckId", deck_id), name)
-        return {"id": deck_id, "name": name, "updated": True}
+        return {"id": deck_id, "updated": True}
 
     def delete_deck(self, deck_id: int) -> dict[str, Any]:
         self.get_deck(deck_id)
@@ -333,8 +334,10 @@ class CollectionAdapter:
 
     def sync_login(self, username: str, password: str, endpoint: str | None) -> dict[str, Any]:
         self._sync_auth = None
+        self._configured_sync_endpoint = None
         self._pending_full_sync = None
         self._sync_auth = self.collection.sync_login(username, password, endpoint)
+        self._configured_sync_endpoint = endpoint or None
         return {"authenticated": True, "endpoint_kind": "custom" if endpoint else "ankiweb"}
 
     def sync(self, sync_media: bool) -> dict[str, Any]:
@@ -344,7 +347,9 @@ class CollectionAdapter:
             output = self.collection.sync_collection(self._sync_auth, sync_media)
             endpoint_changed = bool(output.new_endpoint)
             if endpoint_changed:
-                self._sync_auth.endpoint = validate_sync_endpoint(output.new_endpoint)
+                self._sync_auth.endpoint = validate_sync_migration_endpoint(
+                    output.new_endpoint, self._configured_sync_endpoint
+                )
             if output.required in {2, 3, 4}:
                 self._pending_full_sync = (
                     output.required,
@@ -366,6 +371,7 @@ class CollectionAdapter:
             }
         except Exception:
             self._sync_auth = None
+            self._configured_sync_endpoint = None
             self._pending_full_sync = None
             raise
 
@@ -393,6 +399,7 @@ class CollectionAdapter:
             )
         except Exception:
             self._sync_auth = None
+            self._configured_sync_endpoint = None
             self._pending_full_sync = None
             raise
         self._pending_full_sync = None

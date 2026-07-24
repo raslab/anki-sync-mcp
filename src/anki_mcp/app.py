@@ -143,7 +143,6 @@ def create_app(settings: Settings) -> ASGIApp:
             service.create_deck(name),
             lambda result: {
                 "id": result["id"],
-                "name": result["name"],
                 "created": result["created"],
             },
         )
@@ -153,7 +152,7 @@ def create_app(settings: Settings) -> ASGIApp:
         """Rename a deck by stable Anki deck ID."""
         return await execute(
             service.update_deck(deck_id, name),
-            lambda result: {"id": result["id"], "name": result["name"], "updated": True},
+            lambda result: {"id": result["id"], "updated": True},
         )
 
     @mcp.tool(name="anki_decks_delete")

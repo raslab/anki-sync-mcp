@@ -38,6 +38,29 @@ def validate_sync_endpoint(value: str) -> str:
     return endpoint
 
 
+def validate_sync_migration_endpoint(value: str, configured_endpoint: str | None) -> str:
+    """Restrict server-directed migrations to an explicitly trusted origin."""
+    endpoint = validate_sync_endpoint(value)
+    parsed = urlsplit(endpoint)
+    hostname = (parsed.hostname or "").casefold().rstrip(".")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if configured_endpoint:
+        configured = urlsplit(configured_endpoint)
+        configured_hostname = (configured.hostname or "").casefold().rstrip(".")
+        configured_port = configured.port or (443 if configured.scheme == "https" else 80)
+        if (parsed.scheme, hostname, port) != (
+            configured.scheme,
+            configured_hostname,
+            configured_port,
+        ):
+            raise ValueError("sync endpoint migration left the configured trusted origin")
+    elif parsed.scheme != "https" or not (
+        hostname == "ankiweb.net" or hostname.endswith(".ankiweb.net")
+    ):
+        raise ValueError("AnkiWeb endpoint migration targeted an untrusted origin")
+    return endpoint
+
+
 class Settings(BaseSettings):
     """Validated process configuration.
 

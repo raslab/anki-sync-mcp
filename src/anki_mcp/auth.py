@@ -71,7 +71,8 @@ class BearerAuthMiddleware:
             scheme, separator, supplied = authorization.partition(b" ")
             has_bearer_scheme = separator == b" " and scheme.lower() == b"bearer"
             # Always execute compare_digest, including malformed/missing credentials.
-            valid = has_bearer_scheme and hmac.compare_digest(supplied, self._expected)
+            token_matches = hmac.compare_digest(supplied, self._expected)
+            valid = has_bearer_scheme and token_matches
             if not valid:
                 response = JSONResponse(
                     {"error": "authentication_failed"},
