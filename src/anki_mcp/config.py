@@ -45,7 +45,11 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=None, case_sensitive=True, extra="forbid", populate_by_name=True
+        env_file=None,
+        case_sensitive=True,
+        extra="forbid",
+        hide_input_in_errors=True,
+        populate_by_name=True,
     )
 
     host: str = Field("0.0.0.0", alias="MCP_HOST")

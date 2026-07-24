@@ -301,6 +301,45 @@ async def test_update_card_rolls_back_when_postcheck_raises(
 
 
 @pytest.mark.anyio
+async def test_update_card_restores_deck_and_fields_when_move_applies_then_raises(
+    populated_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    collection = Collection(populated_collection)
+    try:
+        card_id = int(collection.find_cards("deck:Languages::Spanish")[0])
+        card = collection.get_card(card_id)
+        note_id = int(card.nid)
+        original_deck_id = int(card.did)
+        target_deck_id = int(collection.decks.id("Rollback Target"))
+    finally:
+        collection.close()
+    original_set_deck = Collection.set_deck
+    failed = False
+
+    def apply_then_raise(self: Collection, card_ids: list[int], deck_id: int) -> None:
+        nonlocal failed
+        original_set_deck(self, card_ids, deck_id)
+        if deck_id == target_deck_id and not failed:
+            failed = True
+            raise RuntimeError("move failed after apply")
+
+    monkeypatch.setattr(Collection, "set_deck", apply_then_raise)
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        with pytest.raises(RuntimeError, match="move failed after apply"):
+            await service.update_card(card_id, "changed", "changed", target_deck_id)
+
+    collection = Collection(populated_collection)
+    try:
+        restored_card = collection.get_card(card_id)
+        restored_note = collection.get_note(note_id)
+        assert int(restored_card.did) == original_deck_id
+        assert restored_note["Front"] == "hola"
+        assert restored_note["Back"] == "hello"
+    finally:
+        collection.close()
+
+
+@pytest.mark.anyio
 async def test_card_field_update_rejects_basic_copy_with_front_and_back(
     populated_collection: str,
 ) -> None:

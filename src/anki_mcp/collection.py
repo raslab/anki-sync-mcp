@@ -264,9 +264,10 @@ class CollectionAdapter:
         except NotFoundError as exc:
             raise LookupError(f"card {card_id} not found") from exc
         if front is None and back is None and deck_id is None:
-            raise ValueError("at least one card field or deck_id must be supplied")
+            raise ValueError("at least one card update must be provided")
         if front is not None and not front.strip():
             raise ValueError("front must not be blank")
+        original_deck_id = int(card.did)
         if deck_id is not None:
             self.get_deck(deck_id)
         note = card.note()
@@ -287,20 +288,37 @@ class CollectionAdapter:
                 self.collection.update_note(note)
                 if len(self.collection.find_cards(f"nid:{int(note.id)}")) != 1:
                     raise ValueError("Basic note update must retain exactly one card")
-            except Exception:
+            except Exception as operation_error:
                 note["Front"] = previous_front
                 note["Back"] = previous_back
-                self.collection.update_note(note)
-                raise
+                try:
+                    self.collection.update_note(note)
+                except Exception:
+                    raise RuntimeError(
+                        "card update failed and field rollback was incomplete"
+                    ) from operation_error
+                raise operation_error
         try:
             if deck_id is not None:
                 self.collection.set_deck([cast("CardId", card_id)], deck_id)
-        except Exception:
+        except Exception as operation_error:
+            rollback_failed = False
+            try:
+                self.collection.set_deck([cast("CardId", card_id)], original_deck_id)
+            except Exception:
+                rollback_failed = True
             if note_changed:
                 note["Front"] = previous_front
                 note["Back"] = previous_back
-                self.collection.update_note(note)
-            raise
+                try:
+                    self.collection.update_note(note)
+                except Exception:
+                    rollback_failed = True
+            if rollback_failed:
+                raise RuntimeError(
+                    "card update failed and rollback was incomplete"
+                ) from operation_error
+            raise operation_error
         return {
             "id": card_id,
             "note_id": int(note.id),

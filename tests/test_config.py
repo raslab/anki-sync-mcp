@@ -158,6 +158,28 @@ def test_limits_and_paths_are_validated(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("secret_key", "file_key", "marker"),
+    [
+        ("MCP_AUTH_TOKEN", "MCP_AUTH_TOKEN_FILE", "BEARER-PLAINTEXT-MARKER"),
+        ("ANKI_SYNC_PASSWORD", "ANKI_SYNC_PASSWORD_FILE", "SYNC-PLAINTEXT-MARKER"),
+    ],
+)
+def test_secret_markers_are_hidden_from_validation_errors(
+    tmp_path: Path, secret_key: str, file_key: str, marker: str
+) -> None:
+    secret_file = tmp_path / "conflicting-secret"
+    secret_file.write_text("file-secret", encoding="utf-8")
+    values = env(tmp_path)
+    values[secret_key] = marker
+    values[file_key] = str(secret_file)
+
+    with pytest.raises(ValidationError) as captured:
+        Settings(_env_file=None, **values)
+
+    assert marker not in str(captured.value)
+
+
+@pytest.mark.parametrize(
     "mcp_path", ["/{path}", "/api/{rest:path}", "/mcp?debug=1", "/mcp#fragment", "/mcp path"]
 )
 def test_mcp_path_must_be_a_static_url_path(tmp_path: Path, mcp_path: str) -> None:
