@@ -91,9 +91,13 @@ Create the Compose secret and build the image:
 ```sh
 mkdir -p secrets
 python -c 'import secrets; print(secrets.token_urlsafe(32))' > secrets/anki_mcp_token
+read -rsp "Anki sync password: " ANKI_PASSWORD
+printf '%s' "$ANKI_PASSWORD" > secrets/anki_sync_password
+unset ANKI_PASSWORD
+printf '\n'
 chmod 600 secrets/anki_mcp_token
+chmod 600 secrets/anki_sync_password
 export ANKI_SYNC_USERNAME="your-sync-username"
-export ANKI_SYNC_PASSWORD="your-sync-password"
 export ANKI_SYNC_HOST="" # AnkiWeb
 docker compose build
 docker compose up -d
@@ -118,7 +122,8 @@ Exactly one token source is required. Setting both is a startup error.
 | `MCP_AUTH_TOKEN` | — | Bearer token supplied directly. |
 | `MCP_AUTH_TOKEN_FILE` | — | File containing the bearer token; preferred in containers. |
 | `ANKI_SYNC_USERNAME` | — | Required remote sync account username. |
-| `ANKI_SYNC_PASSWORD` | — | Required remote sync account password. |
+| `ANKI_SYNC_PASSWORD` | — | Remote sync password supplied directly; intended for local development only. |
+| `ANKI_SYNC_PASSWORD_FILE` | — | File containing the remote sync password; used by Compose and preferred in containers. |
 | `ANKI_SYNC_HOST` | empty | Empty selects AnkiWeb; otherwise an HTTPS self-hosted sync base URL. HTTP is accepted only for loopback development. User-info, query strings, and fragments are rejected. |
 | `MCP_HOST` | `0.0.0.0` | Bind address. |
 | `MCP_PORT` | `8000` | Bind port. |
@@ -134,7 +139,8 @@ Exactly one token source is required. Setting both is a startup error.
 | `MCP_ALLOWED_ORIGINS` | local HTTP origins | Comma-separated exact origins or `origin:*` patterns; browser requests with other origins are rejected. |
 | `LOG_LEVEL` | `INFO` | Uvicorn log level. |
 
-`MCP_AUTH_TOKEN_FILE` and sync credentials are read at startup. Routine health, authentication, and
+Exactly one of `ANKI_SYNC_PASSWORD` and `ANKI_SYNC_PASSWORD_FILE` is also required. Secret files and
+sync credentials are read at startup. Routine health, authentication, and
 tool errors do not return credentials or the collection path. Every HTTP method under the MCP path
 is authenticated with a constant-time token comparison. The sync host key is retained only in
 process memory and is cleared before re-login or after a failed sync, so `anki_sync_login` must be
@@ -173,3 +179,7 @@ require a strict JSON boolean `confirm=true`; the Default deck cannot be deleted
 other deck removes its contained cards. Card creation and field updates support only Anki's built-in
 single-card Basic note type (`Front` and `Back`). Back up the persistent volume before destructive
 operations, and do not mount one collection into multiple live Anki processes.
+
+Mutation tools return concise receipts so a successful side effect cannot be hidden by a large
+rendered response. Card reads represent note fields as bounded `{name, value, ...truncated}` items
+instead of using unbounded field names as JSON object keys.

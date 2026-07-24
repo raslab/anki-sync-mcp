@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncGenerator, Awaitable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, NoReturn, TypeVar
 from uuid import uuid4
@@ -66,9 +66,12 @@ def create_app(settings: Settings) -> ASGIApp:
         }
         raise ToolError(json.dumps(payload, separators=(",", ":"))) from cause
 
-    async def execute(operation: Awaitable[T]) -> T:
+    async def execute(
+        operation: Awaitable[T], receipt: Callable[[T], dict[str, Any]] | None = None
+    ) -> T | dict[str, Any]:
         try:
-            result = await operation
+            raw_result = await operation
+            result = receipt(raw_result) if receipt is not None else raw_result
             encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             if len(encoded) > settings.max_response_bytes:
                 raise ResponseTooLargeError("tool response exceeds MCP_MAX_RESPONSE_BYTES")
@@ -136,12 +139,18 @@ def create_app(settings: Settings) -> ASGIApp:
     @mcp.tool(name="anki_decks_create")
     async def decks_create(name: DeckName) -> dict[str, Any]:
         """Create a deck by name, or return the existing deck with that name."""
-        return await execute(service.create_deck(name))
+        return await execute(
+            service.create_deck(name),
+            lambda result: {"id": result["id"], "name": result["name"], "created": True},
+        )
 
     @mcp.tool(name="anki_decks_update")
     async def decks_update(deck_id: StableId, name: DeckName) -> dict[str, Any]:
         """Rename a deck by stable Anki deck ID."""
-        return await execute(service.update_deck(deck_id, name))
+        return await execute(
+            service.update_deck(deck_id, name),
+            lambda result: {"id": result["id"], "name": result["name"], "updated": True},
+        )
 
     @mcp.tool(name="anki_decks_delete")
     async def decks_delete(deck_id: StableId, confirm: Confirmation = False) -> dict[str, Any]:
@@ -166,7 +175,15 @@ def create_app(settings: Settings) -> ASGIApp:
     @mcp.tool(name="anki_cards_create")
     async def cards_create(deck_id: StableId, front: CardText, back: CardText) -> dict[str, Any]:
         """Create one Basic note/card in a deck."""
-        return await execute(service.create_card(deck_id, front, back))
+        return await execute(
+            service.create_card(deck_id, front, back),
+            lambda result: {
+                "id": result["id"],
+                "note_id": result["note_id"],
+                "deck_id": result["deck_id"],
+                "created": True,
+            },
+        )
 
     @mcp.tool(name="anki_cards_update")
     async def cards_update(
@@ -176,7 +193,14 @@ def create_app(settings: Settings) -> ASGIApp:
         deck_id: StableId | None = None,
     ) -> dict[str, Any]:
         """Update a Basic card's Front/Back fields and/or move it to another deck."""
-        return await execute(service.update_card(card_id, front, back, deck_id))
+        return await execute(
+            service.update_card(card_id, front, back, deck_id),
+            lambda result: {
+                "id": result["id"],
+                "deck_id": result["deck_id"],
+                "updated": True,
+            },
+        )
 
     @mcp.tool(name="anki_cards_delete")
     async def cards_delete(card_id: StableId, confirm: Confirmation = False) -> dict[str, Any]:

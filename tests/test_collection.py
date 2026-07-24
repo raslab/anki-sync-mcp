@@ -100,10 +100,10 @@ async def test_rendered_card_fields_are_bounded(populated_collection: str) -> No
     assert len(card["answer"].encode("utf-8")) <= 64
     assert card["question_truncated"] is True
     assert card["answer_truncated"] is True
-    assert all(len(value.encode("utf-8")) <= 64 for value in created["fields"].values())
+    assert all(len(field["value"].encode("utf-8")) <= 64 for field in created["fields"])
     assert len(created["fields"]) == 1
     assert created["fields_omitted"] == 1
-    assert all(created["fields_truncated"].values())
+    assert all(field["value_truncated"] for field in created["fields"])
 
 
 @pytest.mark.anyio
@@ -153,8 +153,14 @@ async def test_card_crud_cycle(populated_collection: str) -> None:
         with pytest.raises(LookupError, match="card"):
             await service.get_card(created["id"])
 
-    assert created["fields"] == {"Front": "adiós", "Back": "goodbye"}
-    assert updated["fields"] == {"Front": "hasta luego", "Back": "see you"}
+    assert {field["name"]: field["value"] for field in created["fields"]} == {
+        "Front": "adiós",
+        "Back": "goodbye",
+    }
+    assert {field["name"]: field["value"] for field in updated["fields"]} == {
+        "Front": "hasta luego",
+        "Back": "see you",
+    }
     assert deleted == {"id": created["id"], "deleted": True}
 
 
@@ -214,6 +220,71 @@ async def test_card_field_update_rejects_basic_copy_with_front_and_back(
     async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
         with pytest.raises(ValueError, match="built-in Basic"):
             await service.update_card(card_id, "changed", None, None)
+
+
+@pytest.mark.anyio
+async def test_create_and_update_reject_modified_basic_with_multiple_templates(
+    populated_collection: str,
+) -> None:
+    collection = Collection(populated_collection)
+    try:
+        basic = collection.models.by_name("Basic")
+        assert basic is not None
+        template = collection.models.new_template("Card 2")
+        template["qfmt"] = "{{Back}}"
+        template["afmt"] = "{{Front}}"
+        collection.models.add_template(basic, template)
+        collection.models.update_dict(basic)
+        deck_id = collection.decks.id_for_name("Languages::Spanish")
+        assert deck_id is not None
+        existing_card_id = int(collection.find_cards("deck:Languages::Spanish")[0])
+        note_count = len(collection.find_notes(""))
+    finally:
+        collection.close()
+
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        with pytest.raises(ValueError, match="single-card"):
+            await service.create_card(deck_id, "front", "back")
+        with pytest.raises(ValueError, match="single-card"):
+            await service.update_card(existing_card_id, "changed", None, None)
+
+    collection = Collection(populated_collection)
+    try:
+        assert len(collection.find_notes("")) == note_count
+    finally:
+        collection.close()
+
+
+@pytest.mark.anyio
+async def test_card_deck_and_field_names_are_bounded(populated_collection: str) -> None:
+    long_name = "x" * 1000
+    collection = Collection(populated_collection)
+    try:
+        model = collection.models.new("Long metadata")
+        field = collection.models.new_field(long_name)
+        collection.models.add_field(model, field)
+        template = collection.models.new_template("Card 1")
+        template["qfmt"] = "{{" + long_name + "}}"
+        template["afmt"] = "{{FrontSide}}"
+        collection.models.add_template(model, template)
+        collection.models.add(model)
+        deck_id = collection.decks.id(long_name)
+        note = collection.new_note(model)
+        note[long_name] = "value"
+        collection.add_note(note, deck_id)
+        card_id = int(collection.find_cards(f"nid:{int(note.id)}")[0])
+    finally:
+        collection.close()
+
+    async with AnkiCollectionService(
+        populated_collection, max_page_size=100, max_rendered_field_bytes=64
+    ) as service:
+        card = await service.get_card(card_id)
+
+    assert len(card["deck_name"].encode()) <= 64
+    assert card["deck_name_truncated"] is True
+    assert len(card["fields"][0]["name"].encode()) <= 64
+    assert card["fields"][0]["name_truncated"] is True
 
 
 @pytest.mark.anyio

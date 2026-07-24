@@ -45,6 +45,27 @@ def test_sync_credentials_are_required_from_environment(tmp_path: Path, missing:
         Settings(_env_file=None, **values)
 
 
+def test_sync_password_can_be_loaded_from_secret_file(tmp_path: Path) -> None:
+    secret = tmp_path / "sync-password"
+    secret.write_text("file-sync-password\n", encoding="utf-8")
+    values = env(tmp_path, ANKI_SYNC_PASSWORD_FILE=str(secret))
+    del values["ANKI_SYNC_PASSWORD"]
+
+    settings = Settings(_env_file=None, **values)
+
+    assert settings.sync_password.get_secret_value() == "file-sync-password"
+
+
+def test_exactly_one_sync_password_source_is_required(tmp_path: Path) -> None:
+    secret = tmp_path / "sync-password"
+    secret.write_text("file-sync-password", encoding="utf-8")
+    with pytest.raises(ValidationError, match="exactly one"):
+        Settings(
+            _env_file=None,
+            **env(tmp_path, ANKI_SYNC_PASSWORD_FILE=str(secret)),
+        )
+
+
 def test_empty_sync_host_selects_ankiweb(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, **env(tmp_path, ANKI_SYNC_HOST=""))
     assert settings.sync_endpoint is None
@@ -60,6 +81,8 @@ def test_empty_sync_host_selects_ankiweb(tmp_path: Path) -> None:
         "https://user:secret@sync.example.test",
         "https://sync.example.test?token=secret",
         "https://sync.example.test/#fragment",
+        "https://sync.example.test:invalid/",
+        "https://sync.example.test/\nheader",
     ],
 )
 def test_sync_host_rejects_insecure_or_credential_bearing_urls(tmp_path: Path, host: str) -> None:
@@ -67,7 +90,9 @@ def test_sync_host_rejects_insecure_or_credential_bearing_urls(tmp_path: Path, h
         Settings(_env_file=None, **env(tmp_path, ANKI_SYNC_HOST=host))
 
 
-@pytest.mark.parametrize("host", ["http://localhost:8080", "http://127.0.0.1:8080"])
+@pytest.mark.parametrize(
+    "host", ["http://localhost:8080", "http://127.0.0.1:8080", "http://[::1]:8080"]
+)
 def test_sync_host_allows_http_only_for_loopback_development(tmp_path: Path, host: str) -> None:
     assert Settings(_env_file=None, **env(tmp_path, ANKI_SYNC_HOST=host)).sync_host == host
 
@@ -114,6 +139,15 @@ def test_limits_and_paths_are_validated(tmp_path: Path) -> None:
         Settings(_env_file=None, **env(tmp_path, MCP_MAX_RESPONSE_BYTES="1023"))
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **env(tmp_path, MCP_MAX_REQUEST_BYTES="1023"))
+    with pytest.raises(ValidationError, match="MCP_MAX_RESPONSE_BYTES"):
+        Settings(
+            _env_file=None,
+            **env(
+                tmp_path,
+                MCP_MAX_RENDERED_FIELD_BYTES="4096",
+                MCP_MAX_RESPONSE_BYTES="4096",
+            ),
+        )
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **env(tmp_path, MCP_PATH="mcp"))
     with pytest.raises(ValidationError, match="health"):

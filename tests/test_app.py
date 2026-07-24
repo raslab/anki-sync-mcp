@@ -186,6 +186,15 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     paginated = [tool for tool in tools if "limit" in tool["inputSchema"]["properties"]]
     assert all(tool["inputSchema"]["properties"]["limit"]["minimum"] == 1 for tool in paginated)
     assert all(tool["inputSchema"]["properties"]["limit"]["maximum"] == 100 for tool in paginated)
+    by_name = {tool["name"]: tool for tool in tools}
+    assert by_name["anki_sync"]["inputSchema"]["properties"]["sync_media"]["type"] == "boolean"
+    for name in (
+        "anki_sync_full_download",
+        "anki_sync_full_upload",
+        "anki_decks_delete",
+        "anki_cards_delete",
+    ):
+        assert by_name[name]["inputSchema"]["properties"]["confirm"]["type"] == "boolean"
 
 
 def test_deck_and_card_crud_tools_work_through_json_rpc(client: TestClient) -> None:
@@ -244,7 +253,7 @@ def test_deck_and_card_crud_tools_work_through_json_rpc(client: TestClient) -> N
     deck_deleted = call("anki_decks_delete", {"deck_id": deck["id"], "confirm": True})
 
     assert renamed["name"] == "CRUD Updated"
-    assert changed["fields"] == {"Front": "new question", "Back": "new answer"}
+    assert changed["updated"] is True
     assert card_deleted["deleted"] is True
     assert deck_deleted["deleted"] is True
 
@@ -526,6 +535,49 @@ def test_aggregate_tool_response_budget_is_enforced(settings: Settings) -> None:
     text = result["content"][0]["text"]
     payload = json.loads(text[text.index("{") :])
     assert payload["code"] == "RESPONSE_TOO_LARGE"
+
+
+def test_mutation_returns_concise_receipt_before_response_budget_check(settings: Settings) -> None:
+    custom = settings.model_copy(update={"max_response_bytes": 128})
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(create_app(custom)) as custom_client:
+        initialized = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                },
+            },
+        )
+        headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+        response = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "anki_decks_create", "arguments": {"name": "Receipt"}},
+            },
+        )
+    result = response.json()["result"]
+    assert result.get("isError") is not True
+    receipt = json.loads(result["content"][0]["text"])
+    assert receipt["created"] is True
+    collection = Collection(str(settings.collection_path))
+    try:
+        assert collection.decks.id_for_name("Receipt") == receipt["id"]
+    finally:
+        collection.close()
 
 
 def test_configured_page_max_is_the_tool_default(settings: Settings) -> None:

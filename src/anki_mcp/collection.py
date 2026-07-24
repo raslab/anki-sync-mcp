@@ -171,17 +171,27 @@ class CollectionAdapter:
             raise LookupError(f"deck for card {card_id} not found")
         question, question_truncated = self._truncate_rendered(card.question())
         answer, answer_truncated = self._truncate_rendered(card.answer())
+        deck_name, deck_name_truncated = self._truncate_rendered(str(deck["name"]))
         note = card.note()
-        fields: dict[str, str] = {}
-        fields_truncated: dict[str, bool] = {}
+        fields: list[dict[str, Any]] = []
         note_items = note.items()
         for name, value in note_items[: self.max_card_fields]:
-            fields[name], fields_truncated[name] = self._truncate_rendered(value)
+            bounded_name, name_truncated = self._truncate_rendered(name)
+            bounded_value, value_truncated = self._truncate_rendered(value)
+            fields.append(
+                {
+                    "name": bounded_name,
+                    "name_truncated": name_truncated,
+                    "value": bounded_value,
+                    "value_truncated": value_truncated,
+                }
+            )
         return {
             "id": int(card.id),
             "note_id": int(card.nid),
             "deck_id": int(card.did),
-            "deck_name": str(deck["name"]),
+            "deck_name": deck_name,
+            "deck_name_truncated": deck_name_truncated,
             "template_ordinal": int(card.ord),
             "flags": int(card.flags),
             "modified": int(card.mod),
@@ -190,7 +200,6 @@ class CollectionAdapter:
             "answer": answer,
             "answer_truncated": answer_truncated,
             "fields": fields,
-            "fields_truncated": fields_truncated,
             "fields_omitted": max(0, len(note_items) - self.max_card_fields),
             "scheduling": {
                 "type": int(card.type),
@@ -204,20 +213,36 @@ class CollectionAdapter:
             },
         }
 
+    def _basic_model(self) -> dict[str, Any]:
+        model = self.collection.models.by_name("Basic")
+        if model is None:
+            raise RuntimeError("Basic note type is unavailable")
+        fields = model.get("flds", [])
+        templates = model.get("tmpls", [])
+        supported = (
+            int(model.get("type", -1)) == 0
+            and [(field.get("name"), field.get("ord")) for field in fields]
+            == [("Front", 0), ("Back", 1)]
+            and len(templates) == 1
+            and int(templates[0].get("ord", -1)) == 0
+        )
+        if not supported:
+            raise ValueError("card operations require the built-in Basic single-card note type")
+        return model
+
     def create_card(self, deck_id: int, front: str, back: str) -> dict[str, Any]:
         self.get_deck(deck_id)
         if not front.strip():
             raise ValueError("front must not be blank")
-        model = self.collection.models.by_name("Basic")
-        if model is None:
-            raise RuntimeError("Basic note type is unavailable")
+        model = self._basic_model()
         note = self.collection.new_note(model)
         note["Front"] = front
         note["Back"] = back
         self.collection.add_note(note, cast("DeckId", deck_id))
         card_ids = self.collection.find_cards(f"nid:{int(note.id)}")
-        if not card_ids:  # pragma: no cover - Basic always generates one card
-            raise RuntimeError("note did not generate a card")
+        if len(card_ids) != 1:
+            self.collection.remove_notes([note.id])
+            raise ValueError("Basic note must generate exactly one card")
         return self.get_card(int(card_ids[0]))
 
     def update_card(
@@ -235,18 +260,25 @@ class CollectionAdapter:
             self.get_deck(deck_id)
         note = card.note() if front is not None or back is not None else None
         if note is not None:
-            basic = self.collection.models.by_name("Basic")
-            basic_id = int(basic["id"]) if basic is not None else None
+            basic = self._basic_model()
+            basic_id = int(basic["id"])
             sibling_cards = self.collection.find_cards(f"nid:{int(note.id)}")
             if int(note.mid) != basic_id or len(sibling_cards) != 1:
                 raise ValueError(
                     "card field updates require the built-in Basic single-card note type"
                 )
+            previous_front = note["Front"]
+            previous_back = note["Back"]
             if front is not None:
                 note["Front"] = front
             if back is not None:
                 note["Back"] = back
             self.collection.update_note(note)
+            if len(self.collection.find_cards(f"nid:{int(note.id)}")) != 1:
+                note["Front"] = previous_front
+                note["Back"] = previous_back
+                self.collection.update_note(note)
+                raise ValueError("Basic note update must retain exactly one card")
         if deck_id is not None:
             self.collection.set_deck([cast("CardId", card_id)], deck_id)
         return self.get_card(card_id)
