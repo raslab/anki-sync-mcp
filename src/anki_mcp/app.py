@@ -17,7 +17,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp
 
 from anki_mcp.auth import BearerAuthMiddleware
-from anki_mcp.collection import AnkiCollectionService
+from anki_mcp.collection import AnkiCollectionService, SyncLoginRequiredError
 from anki_mcp.config import Settings
 
 T = TypeVar("T")
@@ -27,7 +27,7 @@ StableId = StrictInt
 
 
 def create_app(settings: Settings) -> ASGIApp:
-    """Create the complete ASGI application and read-only MCP registry."""
+    """Create the complete ASGI application and MCP registry."""
 
     service = AnkiCollectionService(
         settings.collection_path,
@@ -37,7 +37,7 @@ def create_app(settings: Settings) -> ASGIApp:
     )
     mcp = FastMCP(
         "anki-mcp",
-        instructions="Read-only access to one local Anki collection.",
+        instructions="Authenticated sync and deck/card CRUD for one Anki collection.",
         streamable_http_path=settings.mcp_path,
         json_response=True,
         transport_security=TransportSecuritySettings(
@@ -62,8 +62,26 @@ def create_app(settings: Settings) -> ASGIApp:
             raise_tool_error("NOT_FOUND", str(exc), exc)
         except ValueError as exc:
             raise_tool_error("INVALID_ARGUMENT", str(exc), exc)
+        except SyncLoginRequiredError as exc:
+            raise_tool_error("AUTHENTICATION_FAILED", str(exc), exc)
         except Exception as exc:
             raise_tool_error("INTERNAL_ERROR", "internal collection operation failed", exc)
+
+    @mcp.tool(name="anki_sync_login")
+    async def sync_login() -> dict[str, Any]:
+        """Authenticate to the configured AnkiWeb or self-hosted sync endpoint."""
+        return await execute(
+            service.sync_login(
+                settings.sync_username,
+                settings.sync_password.get_secret_value(),
+                settings.sync_endpoint,
+            )
+        )
+
+    @mcp.tool(name="anki_sync")
+    async def sync(sync_media: bool = True) -> dict[str, Any]:
+        """Synchronize the collection with the authenticated remote server."""
+        return await execute(service.sync(sync_media))
 
     @mcp.tool(name="anki_decks_list")
     async def decks_list(
@@ -77,6 +95,24 @@ def create_app(settings: Settings) -> ASGIApp:
         """Get metadata for one deck by stable Anki deck ID."""
         return await execute(service.get_deck(deck_id))
 
+    @mcp.tool(name="anki_decks_create")
+    async def decks_create(name: str) -> dict[str, Any]:
+        """Create a deck by name, or return the existing deck with that name."""
+        return await execute(service.create_deck(name))
+
+    @mcp.tool(name="anki_decks_update")
+    async def decks_update(deck_id: StableId, name: str) -> dict[str, Any]:
+        """Rename a deck by stable Anki deck ID."""
+        return await execute(service.update_deck(deck_id, name))
+
+    @mcp.tool(name="anki_decks_delete")
+    async def decks_delete(deck_id: StableId, confirm: bool = False) -> dict[str, Any]:
+        """Delete a deck and its cards when confirm is explicitly true."""
+        if not confirm:
+            cause = ValueError("confirm must be true for deck deletion")
+            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+        return await execute(service.delete_deck(deck_id))
+
     @mcp.tool(name="anki_cards_search")
     async def cards_search(
         query: str = "", offset: Offset = 0, limit: PageLimit = settings.max_page_size
@@ -89,13 +125,44 @@ def create_app(settings: Settings) -> ASGIApp:
         """Get card content, deck identity, and scheduling state by stable card ID."""
         return await execute(service.get_card(card_id))
 
+    @mcp.tool(name="anki_cards_create")
+    async def cards_create(deck_id: StableId, front: str, back: str) -> dict[str, Any]:
+        """Create one Basic note/card in a deck."""
+        return await execute(service.create_card(deck_id, front, back))
+
+    @mcp.tool(name="anki_cards_update")
+    async def cards_update(
+        card_id: StableId,
+        front: str | None = None,
+        back: str | None = None,
+        deck_id: StableId | None = None,
+    ) -> dict[str, Any]:
+        """Update a Basic card's Front/Back fields and/or move it to another deck."""
+        return await execute(service.update_card(card_id, front, back, deck_id))
+
+    @mcp.tool(name="anki_cards_delete")
+    async def cards_delete(card_id: StableId, confirm: bool = False) -> dict[str, Any]:
+        """Delete one card and any orphaned note when confirm is explicitly true."""
+        if not confirm:
+            cause = ValueError("confirm must be true for card deletion")
+            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+        return await execute(service.delete_card(card_id))
+
     # FastMCP currently generates argument models with Pydantic's extra="ignore".
     # Tighten both runtime validation and the JSON schemas advertised to clients.
     for tool_name in (
+        "anki_sync_login",
+        "anki_sync",
         "anki_decks_list",
         "anki_decks_get",
+        "anki_decks_create",
+        "anki_decks_update",
+        "anki_decks_delete",
         "anki_cards_search",
         "anki_cards_get",
+        "anki_cards_create",
+        "anki_cards_update",
+        "anki_cards_delete",
     ):
         registered = mcp._tool_manager.get_tool(tool_name)  # pyright: ignore[reportPrivateUsage]
         if registered is None:  # pragma: no cover
