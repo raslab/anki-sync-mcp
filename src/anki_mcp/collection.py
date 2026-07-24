@@ -126,17 +126,20 @@ class CollectionAdapter:
     def create_deck(self, name: str) -> dict[str, Any]:
         if not name.strip():
             raise ValueError("deck name must not be blank")
+        existing = self.collection.decks.id_for_name(name)
+        if existing is not None:
+            return {"id": int(existing), "name": name, "created": False}
         deck_id = self.collection.decks.id(name)
         if deck_id is None:  # pragma: no cover - creation returns an ID
             raise RuntimeError("Anki did not return a deck ID")
-        return self.get_deck(int(deck_id))
+        return {"id": int(deck_id), "name": name, "created": True}
 
     def update_deck(self, deck_id: int, name: str) -> dict[str, Any]:
         self.get_deck(deck_id)
         if not name.strip():
             raise ValueError("deck name must not be blank")
         self.collection.decks.rename(cast("DeckId", deck_id), name)
-        return self.get_deck(deck_id)
+        return {"id": deck_id, "name": name, "updated": True}
 
     def delete_deck(self, deck_id: int) -> dict[str, Any]:
         self.get_deck(deck_id)
@@ -239,11 +242,19 @@ class CollectionAdapter:
         note["Front"] = front
         note["Back"] = back
         self.collection.add_note(note, cast("DeckId", deck_id))
-        card_ids = self.collection.find_cards(f"nid:{int(note.id)}")
-        if len(card_ids) != 1:
+        try:
+            card_ids = self.collection.find_cards(f"nid:{int(note.id)}")
+            if len(card_ids) != 1:
+                raise ValueError("Basic note must generate exactly one card")
+        except Exception:
             self.collection.remove_notes([note.id])
-            raise ValueError("Basic note must generate exactly one card")
-        return self.get_card(int(card_ids[0]))
+            raise
+        return {
+            "id": int(card_ids[0]),
+            "note_id": int(note.id),
+            "deck_id": deck_id,
+            "created": True,
+        }
 
     def update_card(
         self, card_id: int, front: str | None, back: str | None, deck_id: int | None
@@ -258,17 +269,16 @@ class CollectionAdapter:
             raise ValueError("front must not be blank")
         if deck_id is not None:
             self.get_deck(deck_id)
-        note = card.note() if front is not None or back is not None else None
-        if note is not None:
-            basic = self._basic_model()
-            basic_id = int(basic["id"])
-            sibling_cards = self.collection.find_cards(f"nid:{int(note.id)}")
-            if int(note.mid) != basic_id or len(sibling_cards) != 1:
-                raise ValueError(
-                    "card field updates require the built-in Basic single-card note type"
-                )
-            previous_front = note["Front"]
-            previous_back = note["Back"]
+        note = card.note()
+        basic = self._basic_model()
+        basic_id = int(basic["id"])
+        sibling_cards = self.collection.find_cards(f"nid:{int(note.id)}")
+        if int(note.mid) != basic_id or len(sibling_cards) != 1:
+            raise ValueError("card updates require the built-in Basic single-card note type")
+        previous_front = note["Front"]
+        previous_back = note["Back"]
+        note_changed = front is not None or back is not None
+        if note_changed:
             if front is not None:
                 note["Front"] = front
             if back is not None:
@@ -279,9 +289,21 @@ class CollectionAdapter:
                 note["Back"] = previous_back
                 self.collection.update_note(note)
                 raise ValueError("Basic note update must retain exactly one card")
-        if deck_id is not None:
-            self.collection.set_deck([cast("CardId", card_id)], deck_id)
-        return self.get_card(card_id)
+        try:
+            if deck_id is not None:
+                self.collection.set_deck([cast("CardId", card_id)], deck_id)
+        except Exception:
+            if note_changed:
+                note["Front"] = previous_front
+                note["Back"] = previous_back
+                self.collection.update_note(note)
+            raise
+        return {
+            "id": card_id,
+            "note_id": int(note.id),
+            "deck_id": deck_id if deck_id is not None else int(card.did),
+            "updated": True,
+        }
 
     def delete_card(self, card_id: int) -> dict[str, Any]:
         self.get_card(card_id)

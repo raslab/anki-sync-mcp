@@ -9,7 +9,7 @@ import pytest
 from anki.collection import Collection
 from anki.sync import SyncAuth, SyncOutput
 
-from anki_mcp.collection import AnkiCollectionService
+from anki_mcp.collection import AnkiCollectionService, CollectionAdapter
 
 
 @pytest.fixture
@@ -96,14 +96,15 @@ async def test_rendered_card_fields_are_bounded(populated_collection: str) -> No
         search = await service.search_cards(query="hola", offset=0, limit=10)
         card = await service.get_card(search["items"][0]["id"])
         created = await service.create_card(card["deck_id"], "x" * 1000, "y" * 1000)
+        created_card = await service.get_card(created["id"])
     assert len(card["question"].encode("utf-8")) <= 64
     assert len(card["answer"].encode("utf-8")) <= 64
     assert card["question_truncated"] is True
     assert card["answer_truncated"] is True
-    assert all(len(field["value"].encode("utf-8")) <= 64 for field in created["fields"])
-    assert len(created["fields"]) == 1
-    assert created["fields_omitted"] == 1
-    assert all(field["value_truncated"] for field in created["fields"])
+    assert all(len(field["value"].encode("utf-8")) <= 64 for field in created_card["fields"])
+    assert len(created_card["fields"]) == 1
+    assert created_card["fields_omitted"] == 1
+    assert all(field["value_truncated"] for field in created_card["fields"])
 
 
 @pytest.mark.anyio
@@ -127,12 +128,15 @@ async def test_default_deck_cannot_be_deleted(populated_collection: str) -> None
 async def test_deck_crud_cycle(populated_collection: str) -> None:
     async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
         created = await service.create_deck("Projects::Anki MCP")
+        existing = await service.create_deck("Projects::Anki MCP")
         updated = await service.update_deck(created["id"], "Projects::Anki Server")
         deleted = await service.delete_deck(created["id"])
         with pytest.raises(LookupError, match="deck"):
             await service.get_deck(created["id"])
 
     assert created["name"] == "Projects::Anki MCP"
+    assert created["created"] is True
+    assert existing == {"id": created["id"], "name": "Projects::Anki MCP", "created": False}
     assert updated["name"] == "Projects::Anki Server"
     assert deleted == {"id": created["id"], "deleted": True}
 
@@ -148,18 +152,26 @@ async def test_card_crud_cycle(populated_collection: str) -> None:
 
     async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
         created = await service.create_card(deck_id, "adiós", "goodbye")
+        created_card = await service.get_card(created["id"])
         updated = await service.update_card(created["id"], "hasta luego", "see you", None)
+        updated_card = await service.get_card(created["id"])
         deleted = await service.delete_card(created["id"])
         with pytest.raises(LookupError, match="card"):
             await service.get_card(created["id"])
 
-    assert {field["name"]: field["value"] for field in created["fields"]} == {
+    assert {field["name"]: field["value"] for field in created_card["fields"]} == {
         "Front": "adiós",
         "Back": "goodbye",
     }
-    assert {field["name"]: field["value"] for field in updated["fields"]} == {
+    assert {field["name"]: field["value"] for field in updated_card["fields"]} == {
         "Front": "hasta luego",
         "Back": "see you",
+    }
+    assert updated == {
+        "id": created["id"],
+        "note_id": created["note_id"],
+        "deck_id": deck_id,
+        "updated": True,
     }
     assert deleted == {"id": created["id"], "deleted": True}
 
@@ -194,8 +206,61 @@ async def test_card_field_update_rejects_non_basic_note_type(populated_collectio
         target = await service.create_deck("Must Not Move")
         with pytest.raises(ValueError, match="Basic"):
             await service.update_card(card_id, "changed", None, target["id"])
+        with pytest.raises(ValueError, match="Basic"):
+            await service.update_card(card_id, None, None, target["id"])
         unchanged = await service.get_card(card_id)
     assert unchanged["deck_id"] == deck_id
+
+
+@pytest.mark.anyio
+async def test_create_card_does_not_render_after_committing(
+    populated_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    collection = Collection(populated_collection)
+    try:
+        deck_id = collection.decks.id_for_name("Languages::Spanish")
+        assert deck_id is not None
+    finally:
+        collection.close()
+
+    def fail_rich_read(self: CollectionAdapter, card_id: int) -> dict[str, object]:
+        raise RuntimeError("render failed")
+
+    monkeypatch.setattr(CollectionAdapter, "get_card", fail_rich_read)
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        receipt = await service.create_card(deck_id, "receipt", "safe")
+
+    assert receipt["created"] is True
+
+
+@pytest.mark.anyio
+async def test_create_card_cleans_up_when_postcheck_raises(
+    populated_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    collection = Collection(populated_collection)
+    try:
+        deck_id = collection.decks.id_for_name("Languages::Spanish")
+        assert deck_id is not None
+        note_count = len(collection.find_notes(""))
+    finally:
+        collection.close()
+    original_find_cards = Collection.find_cards
+
+    def fail_postcheck(self: Collection, query: str, *args: object, **kwargs: object) -> list[int]:
+        if query.startswith("nid:"):
+            raise RuntimeError("postcheck failed")
+        return [int(card_id) for card_id in original_find_cards(self, query, *args, **kwargs)]
+
+    monkeypatch.setattr(Collection, "find_cards", fail_postcheck)
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        with pytest.raises(RuntimeError, match="postcheck failed"):
+            await service.create_card(deck_id, "cleanup", "required")
+
+    collection = Collection(populated_collection)
+    try:
+        assert len(collection.find_notes("")) == note_count
+    finally:
+        collection.close()
 
 
 @pytest.mark.anyio
@@ -356,8 +421,11 @@ async def test_sync_applies_valid_endpoint_migration_without_exposing_it(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "new_endpoint", ["http://attacker.example.test/", "https://:443", "https:// /"]
+)
 async def test_insecure_endpoint_migration_is_rejected_and_invalidates_auth(
-    populated_collection: str, monkeypatch: pytest.MonkeyPatch
+    populated_collection: str, monkeypatch: pytest.MonkeyPatch, new_endpoint: str
 ) -> None:
     monkeypatch.setattr(
         Collection,
@@ -367,13 +435,11 @@ async def test_insecure_endpoint_migration_is_rejected_and_invalidates_auth(
     monkeypatch.setattr(
         Collection,
         "sync_collection",
-        lambda self, auth, sync_media: SyncOutput(
-            required=0, new_endpoint="http://attacker.example.test/"
-        ),
+        lambda self, auth, sync_media: SyncOutput(required=0, new_endpoint=new_endpoint),
     )
     async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
         await service.sync_login("user", "password", "https://original.example.test/")
-        with pytest.raises(ValueError, match="HTTPS"):
+        with pytest.raises(ValueError):
             await service.sync(sync_media=False)
         with pytest.raises(RuntimeError, match="login"):
             await service.sync(sync_media=False)

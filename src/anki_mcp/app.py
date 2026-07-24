@@ -141,7 +141,11 @@ def create_app(settings: Settings) -> ASGIApp:
         """Create a deck by name, or return the existing deck with that name."""
         return await execute(
             service.create_deck(name),
-            lambda result: {"id": result["id"], "name": result["name"], "created": True},
+            lambda result: {
+                "id": result["id"],
+                "name": result["name"],
+                "created": result["created"],
+            },
         )
 
     @mcp.tool(name="anki_decks_update")

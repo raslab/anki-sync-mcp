@@ -176,10 +176,11 @@ Sync is explicit rather than automatic: callers should use `sync -> mutate -> sy
 requires a preceding server requirement, a direction-compatible tool, strict confirmation, and a
 local backup under the collection's `backups/` directory. Delete tools
 require a strict JSON boolean `confirm=true`; the Default deck cannot be deleted, and deleting any
-other deck removes its contained cards. Card creation and field updates support only Anki's built-in
-single-card Basic note type (`Front` and `Back`). Back up the persistent volume before destructive
-operations, and do not mount one collection into multiple live Anki processes.
+other deck removes its contained cards. Card creation, field updates, and moves support only Anki's
+built-in single-card Basic note type (`Front` and `Back`). Back up the persistent volume before
+destructive operations, and do not mount one collection into multiple live Anki processes.
 
 Mutation tools return concise receipts so a successful side effect cannot be hidden by a large
 rendered response. Card reads represent note fields as bounded `{name, value, ...truncated}` items
 instead of using unbounded field names as JSON object keys.
+Deck creation is idempotent and reports `created=false` when the exact deck name already exists.

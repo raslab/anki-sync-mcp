@@ -83,6 +83,9 @@ def test_empty_sync_host_selects_ankiweb(tmp_path: Path) -> None:
         "https://sync.example.test/#fragment",
         "https://sync.example.test:invalid/",
         "https://sync.example.test/\nheader",
+        "https://:443",
+        "https:// /",
+        "https://sync example.test/",
     ],
 )
 def test_sync_host_rejects_insecure_or_credential_bearing_urls(tmp_path: Path, host: str) -> None:

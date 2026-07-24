@@ -240,6 +240,7 @@ def test_deck_and_card_crud_tools_work_through_json_rpc(client: TestClient) -> N
         return parsed
 
     deck = call("anki_decks_create", {"name": "CRUD"})
+    existing_deck = call("anki_decks_create", {"name": "CRUD"})
     renamed = call("anki_decks_update", {"deck_id": deck["id"], "name": "CRUD Updated"})
     card = call(
         "anki_cards_create",
@@ -253,6 +254,8 @@ def test_deck_and_card_crud_tools_work_through_json_rpc(client: TestClient) -> N
     deck_deleted = call("anki_decks_delete", {"deck_id": deck["id"], "confirm": True})
 
     assert renamed["name"] == "CRUD Updated"
+    assert deck["created"] is True
+    assert existing_deck == {"id": deck["id"], "name": "CRUD", "created": False}
     assert changed["updated"] is True
     assert card_deleted["deleted"] is True
     assert deck_deleted["deleted"] is True

@@ -10,15 +10,19 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 def validate_sync_endpoint(value: str) -> str:
     """Validate a custom sync endpoint without exposing embedded credentials."""
-    if any(ord(character) < 32 or ord(character) == 127 for character in value):
-        raise ValueError("ANKI_SYNC_HOST must not contain control characters")
+    if any(character.isspace() for character in value):
+        raise ValueError("ANKI_SYNC_HOST must not contain whitespace")
     endpoint = value.strip()
     if not endpoint:
         return ""
     parsed = urlsplit(endpoint)
     if len(endpoint.encode("utf-8")) > 2048:
         raise ValueError("ANKI_SYNC_HOST must not exceed 2048 UTF-8 bytes")
-    if not parsed.netloc or parsed.scheme not in {"http", "https"}:
+    try:
+        hostname = parsed.hostname
+    except ValueError as exc:
+        raise ValueError("ANKI_SYNC_HOST contains an invalid hostname") from exc
+    if not parsed.netloc or not hostname or parsed.scheme not in {"http", "https"}:
         raise ValueError("ANKI_SYNC_HOST must be empty or an HTTP(S) base URL")
     try:
         _ = parsed.port
