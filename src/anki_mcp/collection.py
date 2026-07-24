@@ -49,7 +49,7 @@ class CollectionAdapter:
         self.max_card_fields = max_card_fields
         self._backup_folder = Path(path).parent / "backups"
         self._sync_auth: SyncAuth | None = None
-        self._pending_full_sync: tuple[int, int] | None = None
+        self._pending_full_sync: tuple[int, int | None] | None = None
 
     def close(self) -> None:
         self.collection.close()
@@ -303,7 +303,10 @@ class CollectionAdapter:
             if endpoint_changed:
                 self._sync_auth.endpoint = validate_sync_endpoint(output.new_endpoint)
             if output.required in {2, 3, 4}:
-                self._pending_full_sync = (output.required, output.server_media_usn)
+                self._pending_full_sync = (
+                    output.required,
+                    output.server_media_usn if sync_media else None,
+                )
             else:
                 self._pending_full_sync = None
             required = SYNC_REQUIRED_NAMES[output.required]

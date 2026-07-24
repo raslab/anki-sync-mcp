@@ -328,7 +328,7 @@ def test_sync_tools_use_server_configuration_without_exposing_credentials(
     assert "secret-host-key" not in repr(logged_in)
     assert synced["required"] == "FULL_DOWNLOAD"
     assert downloaded == {"completed": True, "direction": "download", "backup_created": True}
-    assert full_sync_calls == [(7, False)]
+    assert full_sync_calls == [(None, False)]
 
 
 @pytest.mark.parametrize(

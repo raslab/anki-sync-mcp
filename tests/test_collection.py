@@ -418,8 +418,13 @@ async def test_full_sync_requirements_are_reported_without_choosing_direction(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("required", "upload", "direction"),
-    [(2, False, "download"), (2, True, "upload"), (3, False, "download"), (4, True, "upload")],
+    ("required", "upload", "direction", "sync_media", "expected_server_usn"),
+    [
+        (2, False, "download", False, None),
+        (2, True, "upload", True, 42),
+        (3, False, "download", False, None),
+        (4, True, "upload", True, 42),
+    ],
 )
 async def test_confirmed_full_sync_uses_required_direction_and_creates_backup(
     populated_collection: str,
@@ -427,6 +432,8 @@ async def test_confirmed_full_sync_uses_required_direction_and_creates_backup(
     required: int,
     upload: bool,
     direction: str,
+    sync_media: bool,
+    expected_server_usn: int | None,
 ) -> None:
     full_calls: list[tuple[str, int | None, bool]] = []
     backups: list[str] = []
@@ -459,11 +466,11 @@ async def test_confirmed_full_sync_uses_required_direction_and_creates_backup(
     monkeypatch.setattr(Collection, "create_backup", backup)
     async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
         await service.sync_login("user", "password", "https://sync.example.test/")
-        await service.sync(sync_media=False)
+        await service.sync(sync_media=sync_media)
         result = await service.full_sync(upload=upload)
 
     assert result == {"completed": True, "direction": direction, "backup_created": True}
-    assert full_calls == [("host-key", 42, upload)]
+    assert full_calls == [("host-key", expected_server_usn, upload)]
     assert backups == [str(Path(populated_collection).parent / "backups")]
 
 
