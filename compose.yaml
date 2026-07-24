@@ -13,6 +13,8 @@ services:
       ANKI_SYNC_PASSWORD: "${ANKI_SYNC_PASSWORD:-}"
       ANKI_SYNC_HOST: "${ANKI_SYNC_HOST:-}"
       MCP_MAX_PAGE_SIZE: "100"
+      MCP_MAX_CARD_FIELDS: "100"
+      MCP_MAX_RESPONSE_BYTES: "1048576"
     secrets:
       - anki_mcp_token
     volumes:

@@ -29,6 +29,8 @@ def test_direct_token_and_defaults(tmp_path: Path) -> None:
     assert settings.max_page_size == 100
     assert settings.max_search_scan == 10_000
     assert settings.max_rendered_field_bytes == 262_144
+    assert settings.max_card_fields == 100
+    assert settings.max_response_bytes == 1_048_576
     assert settings.sync_username == "sync-user"
     assert settings.sync_password.get_secret_value() == "sync-password"
     assert settings.sync_host == "https://sync.example.test/"
@@ -47,10 +49,26 @@ def test_empty_sync_host_selects_ankiweb(tmp_path: Path) -> None:
     assert settings.sync_endpoint is None
 
 
-@pytest.mark.parametrize("host", ["sync.example.test", "ftp://sync.example.test", "https://"])
-def test_nonempty_sync_host_must_be_an_http_url(tmp_path: Path, host: str) -> None:
+@pytest.mark.parametrize(
+    "host",
+    [
+        "sync.example.test",
+        "ftp://sync.example.test",
+        "https://",
+        "http://sync.example.test",
+        "https://user:secret@sync.example.test",
+        "https://sync.example.test?token=secret",
+        "https://sync.example.test/#fragment",
+    ],
+)
+def test_sync_host_rejects_insecure_or_credential_bearing_urls(tmp_path: Path, host: str) -> None:
     with pytest.raises(ValidationError, match="ANKI_SYNC_HOST"):
         Settings(_env_file=None, **env(tmp_path, ANKI_SYNC_HOST=host))
+
+
+@pytest.mark.parametrize("host", ["http://localhost:8080", "http://127.0.0.1:8080"])
+def test_sync_host_allows_http_only_for_loopback_development(tmp_path: Path, host: str) -> None:
+    assert Settings(_env_file=None, **env(tmp_path, ANKI_SYNC_HOST=host)).sync_host == host
 
 
 def test_token_file_strips_one_trailing_newline(tmp_path: Path) -> None:
@@ -89,6 +107,10 @@ def test_missing_or_empty_token_file_fails(tmp_path: Path) -> None:
 def test_limits_and_paths_are_validated(tmp_path: Path) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **env(tmp_path, MCP_MAX_PAGE_SIZE="0"))
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **env(tmp_path, MCP_MAX_CARD_FIELDS="0"))
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **env(tmp_path, MCP_MAX_RESPONSE_BYTES="1023"))
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **env(tmp_path, MCP_PATH="mcp"))
     with pytest.raises(ValidationError, match="health"):

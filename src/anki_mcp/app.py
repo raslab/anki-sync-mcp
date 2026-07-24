@@ -9,7 +9,7 @@ from uuid import uuid4
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import StrictInt
+from pydantic import StrictBool, StrictInt
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -24,6 +24,12 @@ T = TypeVar("T")
 Offset = StrictInt
 PageLimit = StrictInt
 StableId = StrictInt
+Confirmation = StrictBool
+SyncMedia = StrictBool
+
+
+class ResponseTooLargeError(RuntimeError):
+    """Raised when a tool result exceeds the configured serialized response budget."""
 
 
 def create_app(settings: Settings) -> ASGIApp:
@@ -34,6 +40,7 @@ def create_app(settings: Settings) -> ASGIApp:
         settings.max_page_size,
         settings.max_search_scan,
         settings.max_rendered_field_bytes,
+        settings.max_card_fields,
     )
     mcp = FastMCP(
         "anki-mcp",
@@ -57,13 +64,19 @@ def create_app(settings: Settings) -> ASGIApp:
 
     async def execute(operation: Awaitable[T]) -> T:
         try:
-            return await operation
+            result = await operation
+            encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            if len(encoded) > settings.max_response_bytes:
+                raise ResponseTooLargeError("tool response exceeds MCP_MAX_RESPONSE_BYTES")
+            return result
         except LookupError as exc:
             raise_tool_error("NOT_FOUND", str(exc), exc)
         except ValueError as exc:
             raise_tool_error("INVALID_ARGUMENT", str(exc), exc)
         except SyncLoginRequiredError as exc:
             raise_tool_error("AUTHENTICATION_FAILED", str(exc), exc)
+        except ResponseTooLargeError as exc:
+            raise_tool_error("RESPONSE_TOO_LARGE", str(exc), exc)
         except Exception as exc:
             raise_tool_error("INTERNAL_ERROR", "internal collection operation failed", exc)
 
@@ -79,7 +92,7 @@ def create_app(settings: Settings) -> ASGIApp:
         )
 
     @mcp.tool(name="anki_sync")
-    async def sync(sync_media: bool = True) -> dict[str, Any]:
+    async def sync(sync_media: SyncMedia = True) -> dict[str, Any]:
         """Synchronize the collection with the authenticated remote server."""
         return await execute(service.sync(sync_media))
 
@@ -106,7 +119,7 @@ def create_app(settings: Settings) -> ASGIApp:
         return await execute(service.update_deck(deck_id, name))
 
     @mcp.tool(name="anki_decks_delete")
-    async def decks_delete(deck_id: StableId, confirm: bool = False) -> dict[str, Any]:
+    async def decks_delete(deck_id: StableId, confirm: Confirmation = False) -> dict[str, Any]:
         """Delete a deck and its cards when confirm is explicitly true."""
         if not confirm:
             cause = ValueError("confirm must be true for deck deletion")
@@ -141,7 +154,7 @@ def create_app(settings: Settings) -> ASGIApp:
         return await execute(service.update_card(card_id, front, back, deck_id))
 
     @mcp.tool(name="anki_cards_delete")
-    async def cards_delete(card_id: StableId, confirm: bool = False) -> dict[str, Any]:
+    async def cards_delete(card_id: StableId, confirm: Confirmation = False) -> dict[str, Any]:
         """Delete one card and any orphaned note when confirm is explicitly true."""
         if not confirm:
             cause = ValueError("confirm must be true for card deletion")

@@ -87,7 +87,10 @@ async def test_search_scan_is_bounded_before_query(populated_collection: str) ->
 @pytest.mark.anyio
 async def test_rendered_card_fields_are_bounded(populated_collection: str) -> None:
     async with AnkiCollectionService(
-        populated_collection, max_page_size=100, max_rendered_field_bytes=64
+        populated_collection,
+        max_page_size=100,
+        max_rendered_field_bytes=64,
+        max_card_fields=1,
     ) as service:
         search = await service.search_cards(query="hola", offset=0, limit=10)
         card = await service.get_card(search["items"][0]["id"])
@@ -97,7 +100,9 @@ async def test_rendered_card_fields_are_bounded(populated_collection: str) -> No
     assert card["question_truncated"] is True
     assert card["answer_truncated"] is True
     assert all(len(value.encode("utf-8")) <= 64 for value in created["fields"].values())
-    assert created["fields_truncated"] == {"Front": True, "Back": True}
+    assert len(created["fields"]) == 1
+    assert created["fields_omitted"] == 1
+    assert all(created["fields_truncated"].values())
 
 
 @pytest.mark.anyio
@@ -107,6 +112,14 @@ async def test_unknown_card_and_deck_are_not_found(populated_collection: str) ->
             await service.get_deck(999_999_999)
         with pytest.raises(LookupError, match="card"):
             await service.get_card(999_999_999)
+
+
+@pytest.mark.anyio
+async def test_default_deck_cannot_be_deleted(populated_collection: str) -> None:
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        with pytest.raises(ValueError, match="Default"):
+            await service.delete_deck(1)
+        assert (await service.get_deck(1))["name"] == "Default"
 
 
 @pytest.mark.anyio
@@ -179,6 +192,30 @@ async def test_card_field_update_rejects_non_basic_note_type(populated_collectio
 
 
 @pytest.mark.anyio
+async def test_card_field_update_rejects_basic_copy_with_front_and_back(
+    populated_collection: str,
+) -> None:
+    collection = Collection(populated_collection)
+    try:
+        basic = collection.models.by_name("Basic")
+        assert basic is not None
+        copied = collection.models.copy(basic)
+        deck_id = collection.decks.id_for_name("Languages::Spanish")
+        assert deck_id is not None
+        note = collection.new_note(copied)
+        note["Front"] = "copy front"
+        note["Back"] = "copy back"
+        collection.add_note(note, deck_id)
+        card_id = int(collection.find_cards(f"nid:{int(note.id)}")[0])
+    finally:
+        collection.close()
+
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        with pytest.raises(ValueError, match="built-in Basic"):
+            await service.update_card(card_id, "changed", None, None)
+
+
+@pytest.mark.anyio
 async def test_sync_login_uses_configured_credentials_and_sync_reuses_host_key(
     populated_collection: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -209,6 +246,7 @@ async def test_sync_login_uses_configured_credentials_and_sync_reuses_host_key(
     assert synced == {
         "required": "NORMAL_SYNC",
         "server_message": "complete",
+        "server_message_truncated": False,
         "host_number": 3,
         "media_sync_requested": True,
     }
@@ -217,6 +255,89 @@ async def test_sync_login_uses_configured_credentials_and_sync_reuses_host_key(
 @pytest.mark.anyio
 async def test_sync_requires_login(populated_collection: str) -> None:
     async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        with pytest.raises(RuntimeError, match="login"):
+            await service.sync(sync_media=False)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("required", "expected"),
+    [(2, "FULL_SYNC"), (3, "FULL_DOWNLOAD"), (4, "FULL_UPLOAD")],
+)
+async def test_full_sync_requirements_are_reported_without_choosing_direction(
+    populated_collection: str,
+    monkeypatch: pytest.MonkeyPatch,
+    required: int,
+    expected: str,
+) -> None:
+    calls = 0
+
+    def login(_: Collection, username: str, password: str, endpoint: str | None) -> SyncAuth:
+        return SyncAuth(hkey="host-key", endpoint=endpoint)
+
+    def sync(_: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        nonlocal calls
+        calls += 1
+        return SyncOutput(required=required)
+
+    monkeypatch.setattr(Collection, "sync_login", login)
+    monkeypatch.setattr(Collection, "sync_collection", sync)
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://sync.example.test")
+        result = await service.sync(sync_media=False)
+    assert result["required"] == expected
+    assert calls == 1
+
+
+@pytest.mark.anyio
+async def test_failed_relogin_clears_previous_sync_auth(
+    populated_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts = 0
+
+    def login(_: Collection, username: str, password: str, endpoint: str | None) -> SyncAuth:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            raise RuntimeError("remote login rejected")
+        return SyncAuth(hkey="first-host-key", endpoint=endpoint)
+
+    monkeypatch.setattr(Collection, "sync_login", login)
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://sync.example.test")
+        with pytest.raises(RuntimeError, match="rejected"):
+            await service.sync_login("user", "wrong", "https://sync.example.test")
+        with pytest.raises(RuntimeError, match="login"):
+            await service.sync(sync_media=False)
+
+
+@pytest.mark.anyio
+async def test_failed_sync_invalidates_auth_and_bounds_remote_message(
+    populated_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync_attempts = 0
+
+    def login(_: Collection, username: str, password: str, endpoint: str | None) -> SyncAuth:
+        return SyncAuth(hkey="host-key", endpoint=endpoint)
+
+    def sync(_: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        nonlocal sync_attempts
+        sync_attempts += 1
+        if sync_attempts == 1:
+            return SyncOutput(required=0, server_message="x" * 1000)
+        raise RuntimeError("remote sync failed")
+
+    monkeypatch.setattr(Collection, "sync_login", login)
+    monkeypatch.setattr(Collection, "sync_collection", sync)
+    async with AnkiCollectionService(
+        populated_collection, max_page_size=100, max_rendered_field_bytes=64
+    ) as service:
+        await service.sync_login("user", "password", "https://sync.example.test")
+        result = await service.sync(sync_media=False)
+        assert len(result["server_message"].encode()) <= 64
+        assert result["server_message_truncated"] is True
+        with pytest.raises(RuntimeError, match="failed"):
+            await service.sync(sync_media=False)
         with pytest.raises(RuntimeError, match="login"):
             await service.sync(sync_media=False)
 

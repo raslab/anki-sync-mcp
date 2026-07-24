@@ -116,7 +116,7 @@ Exactly one token source is required. Setting both is a startup error.
 | `MCP_AUTH_TOKEN_FILE` | — | File containing the bearer token; preferred in containers. |
 | `ANKI_SYNC_USERNAME` | — | Required remote sync account username. |
 | `ANKI_SYNC_PASSWORD` | — | Required remote sync account password. |
-| `ANKI_SYNC_HOST` | empty | Empty selects AnkiWeb; otherwise the self-hosted sync base URL. |
+| `ANKI_SYNC_HOST` | empty | Empty selects AnkiWeb; otherwise an HTTPS self-hosted sync base URL. HTTP is accepted only for loopback development. User-info, query strings, and fragments are rejected. |
 | `MCP_HOST` | `0.0.0.0` | Bind address. |
 | `MCP_PORT` | `8000` | Bind port. |
 | `MCP_PATH` | `/mcp` | Absolute, non-root MCP path. |
@@ -124,6 +124,8 @@ Exactly one token source is required. Setting both is a startup error.
 | `MCP_MAX_PAGE_SIZE` | `100` | Server-side maximum, from 1 through 1000. |
 | `MCP_MAX_SEARCH_SCAN` | `10000` | Refuse deck/card searches when the collection could require scanning more items. |
 | `MCP_MAX_RENDERED_FIELD_BYTES` | `262144` | UTF-8 byte cap for each rendered card question/answer; responses include truncation flags. |
+| `MCP_MAX_CARD_FIELDS` | `100` | Maximum number of note fields returned with one card. |
+| `MCP_MAX_RESPONSE_BYTES` | `1048576` | Aggregate UTF-8 JSON budget for one tool result; oversized responses fail with `RESPONSE_TOO_LARGE`. |
 | `MCP_ALLOWED_HOSTS` | local and `anki-mcp` hosts | Comma-separated exact hosts or `host:*` patterns accepted by Streamable HTTP. |
 | `MCP_ALLOWED_ORIGINS` | local HTTP origins | Comma-separated exact origins or `origin:*` patterns; browser requests with other origins are rejected. |
 | `LOG_LEVEL` | `INFO` | Uvicorn log level. |
@@ -131,7 +133,8 @@ Exactly one token source is required. Setting both is a startup error.
 `MCP_AUTH_TOKEN_FILE` and sync credentials are read at startup. Routine health, authentication, and
 tool errors do not return credentials or the collection path. Every HTTP method under the MCP path
 is authenticated with a constant-time token comparison. The sync host key is retained only in
-process memory, so `anki_sync_login` must be called after a restart before `anki_sync`.
+process memory and is cleared before re-login or after a failed sync, so `anki_sync_login` must be
+called after a restart or sync authentication/network failure before `anki_sync`.
 
 Missing IDs and invalid pagination return MCP tool errors whose text ends with a compact JSON
 object containing a stable `code` (`NOT_FOUND` or `INVALID_ARGUMENT`), a safe message, and a
@@ -160,6 +163,7 @@ uv.lock            reproducible dependency lock
 The collection executor owns the `anki.collection.Collection` object on exactly one dedicated
 worker thread. All tool calls, including remote login and sync, are serialized through that thread.
 Sync is explicit rather than automatic: callers should use `sync -> mutate -> sync`. Delete tools
-require `confirm=true`; deck deletion removes contained cards. Card creation uses Anki's built-in Basic note type;
-card field updates therefore support `Front` and `Back` only. Back up the persistent volume before
-destructive operations, and do not mount one collection into multiple live Anki processes.
+require a strict JSON boolean `confirm=true`; the Default deck cannot be deleted, and deleting any
+other deck removes its contained cards. Card creation and field updates support only Anki's built-in
+single-card Basic note type (`Front` and `Back`). Back up the persistent volume before destructive
+operations, and do not mount one collection into multiple live Anki processes.

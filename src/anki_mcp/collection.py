@@ -38,11 +38,13 @@ class CollectionAdapter:
         max_page_size: int,
         max_search_scan: int = 10_000,
         max_rendered_field_bytes: int = 262_144,
+        max_card_fields: int = 100,
     ) -> None:
         self.collection = Collection(str(path))
         self.max_page_size = max_page_size
         self.max_search_scan = max_search_scan
         self.max_rendered_field_bytes = max_rendered_field_bytes
+        self.max_card_fields = max_card_fields
         self._sync_auth: SyncAuth | None = None
 
     def close(self) -> None:
@@ -74,11 +76,13 @@ class CollectionAdapter:
             )
         decks = []
         for item in sorted(self.collection.decks.all_names_and_ids(), key=lambda d: d.name):
+            name, name_truncated = self._truncate_rendered(item.name)
             decks.append(
                 {
                     "id": int(item.id),
-                    "name": item.name,
-                    "hierarchy": item.name.split("::"),
+                    "name": name,
+                    "name_truncated": name_truncated,
+                    "hierarchy": name.split("::"),
                 }
             )
         return self._page(decks, offset, limit)
@@ -87,20 +91,27 @@ class CollectionAdapter:
         deck = self.collection.decks.get(cast("DeckId", deck_id), default=False)
         if deck is None:
             raise LookupError(f"deck {deck_id} not found")
-        name = str(deck["name"])
+        name, name_truncated = self._truncate_rendered(str(deck["name"]))
+        description, description_truncated = self._truncate_rendered(str(deck.get("desc", "")))
         result: dict[str, Any] = {
             "id": int(deck["id"]),
             "name": name,
+            "name_truncated": name_truncated,
             "hierarchy": name.split("::"),
             "modified": int(deck.get("mod", 0)),
-            "description": str(deck.get("desc", "")),
+            "description": description,
+            "description_truncated": description_truncated,
             "dynamic": bool(deck.get("dyn", 0)),
         }
         if not result["dynamic"]:
             result["config_id"] = int(deck.get("conf", 1))
             config = self.collection.decks.config_dict_for_deck_id(cast("DeckId", deck_id))
+            config_name, config_name_truncated = self._truncate_rendered(
+                str(config.get("name", ""))
+            )
             result["config"] = {
-                "name": str(config.get("name", "")),
+                "name": config_name,
+                "name_truncated": config_name_truncated,
                 "new_cards_per_day": int(config.get("new", {}).get("perDay", 0)),
                 "reviews_per_day": int(config.get("rev", {}).get("perDay", 0)),
                 "max_answer_seconds": int(config.get("maxTaken", 0)),
@@ -125,6 +136,8 @@ class CollectionAdapter:
 
     def delete_deck(self, deck_id: int) -> dict[str, Any]:
         self.get_deck(deck_id)
+        if deck_id == 1:
+            raise ValueError("the Default deck cannot be deleted")
         self.collection.decks.remove([cast("DeckId", deck_id)])
         return {"id": deck_id, "deleted": True}
 
@@ -157,7 +170,8 @@ class CollectionAdapter:
         note = card.note()
         fields: dict[str, str] = {}
         fields_truncated: dict[str, bool] = {}
-        for name, value in note.items():
+        note_items = note.items()
+        for name, value in note_items[: self.max_card_fields]:
             fields[name], fields_truncated[name] = self._truncate_rendered(value)
         return {
             "id": int(card.id),
@@ -173,6 +187,7 @@ class CollectionAdapter:
             "answer_truncated": answer_truncated,
             "fields": fields,
             "fields_truncated": fields_truncated,
+            "fields_omitted": max(0, len(note_items) - self.max_card_fields),
             "scheduling": {
                 "type": int(card.type),
                 "queue": int(card.queue),
@@ -215,9 +230,14 @@ class CollectionAdapter:
         if deck_id is not None:
             self.get_deck(deck_id)
         note = card.note() if front is not None or back is not None else None
-        if note is not None and not {"Front", "Back"}.issubset(note.keys()):
-            raise ValueError("card field updates require the Basic note type")
         if note is not None:
+            basic = self.collection.models.by_name("Basic")
+            basic_id = int(basic["id"]) if basic is not None else None
+            sibling_cards = self.collection.find_cards(f"nid:{int(note.id)}")
+            if int(note.mid) != basic_id or len(sibling_cards) != 1:
+                raise ValueError(
+                    "card field updates require the built-in Basic single-card note type"
+                )
             if front is not None:
                 note["Front"] = front
             if back is not None:
@@ -233,17 +253,24 @@ class CollectionAdapter:
         return {"id": card_id, "deleted": True}
 
     def sync_login(self, username: str, password: str, endpoint: str | None) -> dict[str, Any]:
+        self._sync_auth = None
         self._sync_auth = self.collection.sync_login(username, password, endpoint)
         return {"authenticated": True, "endpoint": endpoint or self._sync_auth.endpoint}
 
     def sync(self, sync_media: bool) -> dict[str, Any]:
         if self._sync_auth is None:
             raise SyncLoginRequiredError("sync login is required before synchronization")
-        output = self.collection.sync_collection(self._sync_auth, sync_media)
+        try:
+            output = self.collection.sync_collection(self._sync_auth, sync_media)
+        except Exception:
+            self._sync_auth = None
+            raise
         required = SYNC_REQUIRED_NAMES[output.required]
+        server_message, server_message_truncated = self._truncate_rendered(output.server_message)
         return {
             "required": required,
-            "server_message": output.server_message,
+            "server_message": server_message,
+            "server_message_truncated": server_message_truncated,
             "host_number": output.host_number,
             "media_sync_requested": sync_media,
         }
@@ -265,11 +292,13 @@ class CollectionExecutor:
         max_page_size: int,
         max_search_scan: int = 10_000,
         max_rendered_field_bytes: int = 262_144,
+        max_card_fields: int = 100,
     ) -> None:
         self._path = path
         self._max_page_size = max_page_size
         self._max_search_scan = max_search_scan
         self._max_rendered_field_bytes = max_rendered_field_bytes
+        self._max_card_fields = max_card_fields
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anki-collection")
         self._adapter: CollectionAdapter | None = None
         self._worker_id: int | None = None
@@ -287,6 +316,7 @@ class CollectionExecutor:
                 self._max_page_size,
                 self._max_search_scan,
                 self._max_rendered_field_bytes,
+                self._max_card_fields,
             )
 
         self._pool.submit(open_collection).result()
@@ -320,9 +350,10 @@ class AnkiCollectionService:
         max_page_size: int,
         max_search_scan: int = 10_000,
         max_rendered_field_bytes: int = 262_144,
+        max_card_fields: int = 100,
     ) -> None:
         self.executor = CollectionExecutor(
-            path, max_page_size, max_search_scan, max_rendered_field_bytes
+            path, max_page_size, max_search_scan, max_rendered_field_bytes, max_card_fields
         )
 
     async def __aenter__(self) -> AnkiCollectionService:

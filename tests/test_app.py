@@ -307,6 +307,91 @@ def test_sync_tools_use_server_configuration_without_exposing_credentials(
     assert synced["required"] == "NO_CHANGES"
 
 
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("anki_decks_delete", {"deck_id": 1, "confirm": 1}),
+        ("anki_decks_delete", {"deck_id": 1, "confirm": "true"}),
+        ("anki_cards_delete", {"card_id": 1, "confirm": 1}),
+        ("anki_sync", {"sync_media": 1}),
+    ],
+)
+def test_boolean_tool_inputs_are_strict(
+    client: TestClient, tool: str, arguments: dict[str, object]
+) -> None:
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    initialized = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1"},
+            },
+        },
+    )
+    headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+    response = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments},
+        },
+    )
+    result = response.json()["result"]
+    assert result["isError"] is True
+    assert "validation error" in result["content"][0]["text"].lower()
+
+
+def test_aggregate_tool_response_budget_is_enforced(settings: Settings) -> None:
+    custom = settings.model_copy(update={"max_response_bytes": 128})
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(create_app(custom)) as custom_client:
+        initialized = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                },
+            },
+        )
+        headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+        response = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "anki_decks_list", "arguments": {"limit": 100}},
+            },
+        )
+    result = response.json()["result"]
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    payload = json.loads(text[text.index("{") :])
+    assert payload["code"] == "RESPONSE_TOO_LARGE"
+
+
 def test_configured_page_max_is_the_tool_default(settings: Settings) -> None:
     custom = settings.model_copy(update={"max_page_size": 20})
     headers = {

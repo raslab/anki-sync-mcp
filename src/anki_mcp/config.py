@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     max_rendered_field_bytes: int = Field(
         262_144, ge=1, le=4_194_304, alias="MCP_MAX_RENDERED_FIELD_BYTES"
     )
+    max_card_fields: int = Field(100, ge=1, le=1000, alias="MCP_MAX_CARD_FIELDS")
+    max_response_bytes: int = Field(
+        1_048_576, ge=1024, le=16_777_216, alias="MCP_MAX_RESPONSE_BYTES"
+    )
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     allowed_hosts_csv: str = Field(
         "testserver,localhost,localhost:*,127.0.0.1,127.0.0.1:*,anki-mcp,anki-mcp:*",
@@ -68,8 +72,17 @@ class Settings(BaseSettings):
         if not endpoint:
             return ""
         parsed = urlsplit(endpoint)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        if len(endpoint.encode("utf-8")) > 2048:
+            raise ValueError("ANKI_SYNC_HOST must not exceed 2048 UTF-8 bytes")
+        if not parsed.netloc or parsed.scheme not in {"http", "https"}:
             raise ValueError("ANKI_SYNC_HOST must be empty or an HTTP(S) base URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("ANKI_SYNC_HOST must not contain user information")
+        if parsed.query or parsed.fragment:
+            raise ValueError("ANKI_SYNC_HOST must not contain a query or fragment")
+        loopback_hosts = {"localhost", "127.0.0.1", "::1"}
+        if parsed.scheme == "http" and parsed.hostname not in loopback_hosts:
+            raise ValueError("ANKI_SYNC_HOST requires HTTPS except for loopback development")
         return endpoint
 
     @field_validator("mcp_path")
