@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "anki-mcp"
+version = "0.1.0"
+description = "Read-only Anki MCP sidecar MVP"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "anki==26.5",
+  "mcp==1.28.1",
+  "pydantic-settings>=2.7,<3",
+  "starlette>=0.46,<1",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.scripts]
+anki-mcp = "anki_mcp.__main__:main"
+anki-mcp-healthcheck = "anki_mcp.healthcheck:main"
+
+[dependency-groups]
+dev = [
+  "build>=1.2,<2",
+  "httpx>=0.28,<1",
+  "pyright>=1.1.400,<2",
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+  "ruff>=0.11,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/anki_mcp"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers --cov=anki_mcp --cov-report=term-missing"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+include = ["src"]
