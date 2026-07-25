@@ -594,6 +594,10 @@ async def test_insecure_endpoint_migration_is_rejected_and_invalidates_auth(
         with pytest.raises(RuntimeError, match="login"):
             await service.sync(sync_media=False)
 
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as restarted:
+        status = await restarted.status()
+    assert status["authenticated"] is False
+
 
 @pytest.mark.anyio
 async def test_sync_requires_login(populated_collection: str) -> None:

@@ -70,9 +70,18 @@ class PersistentState:
         )
         self.connection.commit()
 
+    def delete_receipt(self, key: str) -> None:
+        self.connection.execute("delete from mutation_receipts where idempotency_key = ?", (key,))
+        self.connection.commit()
+
     def pending_receipt_count(self) -> int:
         rows = self.connection.execute("select receipt_json from mutation_receipts").fetchall()
-        return sum(not bool(json.loads(row[0]).get("remote_synced")) for row in rows)
+        return sum(
+            not bool(receipt.get("remote_synced"))
+            and receipt.get("state") != "discarded_by_full_download"
+            for row in rows
+            if isinstance((receipt := json.loads(row[0])), dict)
+        )
 
     def mark_all_remote_synced(self) -> None:
         """Reconcile locally committed receipts after an operator-selected full upload."""
@@ -84,6 +93,35 @@ class PersistentState:
             if receipt.get("local_committed") and not receipt.get("remote_synced"):
                 receipt["remote_synced"] = True
                 receipt["retryable"] = False
+                receipt["state"] = "committed"
+                encoded = json.dumps(
+                    receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+                self.connection.execute(
+                    "update mutation_receipts set receipt_json = ? where idempotency_key = ?",
+                    (encoded, key),
+                )
+        self.connection.commit()
+
+    def mark_pending_discarded_by_full_download(self) -> None:
+        """Mark local-only mutation results as discarded by a full download."""
+        rows = self.connection.execute(
+            "select idempotency_key, receipt_json from mutation_receipts"
+        ).fetchall()
+        for key, receipt_json in rows:
+            receipt = json.loads(receipt_json)
+            if (
+                receipt.get("local_committed") or receipt.get("state") == "outcome_unknown"
+            ) and not receipt.get("remote_synced"):
+                receipt.update(
+                    {
+                        "state": "discarded_by_full_download",
+                        "local_committed": False,
+                        "remote_synced": False,
+                        "retryable": False,
+                        "result": None,
+                    }
+                )
                 encoded = json.dumps(
                     receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
                 )

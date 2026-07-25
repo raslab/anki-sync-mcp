@@ -312,7 +312,12 @@ If local commit succeeds but remote sync fails, the service must not repeat the 
 
 ### Idempotency
 
-Create and batch-create tools require or generate an `idempotency_key`. The service persists the key and resulting note IDs. Repeating the same key with the same normalized request returns the original result; repeating it with different content is rejected.
+Create and batch-create tools require or generate an `idempotency_key`. The service persists an
+intent before mutation and then replaces it with the result and stable IDs. Repeating the same key
+with the same normalized request returns the original result; repeating it with different content
+is rejected. If a crash occurs between the collection mutation and durable result receipt, the
+intent remains `outcome_unknown` and fails closed instead of replaying. The operator must inspect
+the collection before deciding whether to retry with a new key.
 
 ### Full-sync safety
 
@@ -335,7 +340,9 @@ Scopes:
 
 - `anki:read`: status, list, get, search, media checks.
 - `anki:write`: note/deck/tag/card mutations and normal sync.
-- `anki:admin`: deck configuration, backups, scheduling, note types, and templates.
+- `anki:admin`: deck configuration, backups, advanced scheduling such as reposition/review answers,
+  note types, and templates. Core suspend/unsuspend controls remain ordinary `anki:write` tools as
+  specified in the card tool table.
 - `anki:destructive`: deletions and other irreversible operations.
 
 With a single token, enabled scopes are configured at startup. Destructive and schema-changing tools are omitted from `tools/list` unless their feature flags are enabled.

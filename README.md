@@ -195,7 +195,12 @@ The collection executor owns `anki.collection.Collection` on exactly one dedicat
 Reads optionally synchronize first. Mutations use `sync → validate/idempotency check → local commit
 → durable receipt → sync`; a retry after a post-commit network failure performs only the sync step.
 Receipts report `local_committed`, `remote_synced`, `media_synced`, and `retryable` and retain stable
-result IDs across restart.
+result IDs across restart. The coordinator durably records intent before mutation; if the process
+dies in the narrow mutation-to-receipt window, the same key returns `state=outcome_unknown` and
+fails closed instead of replaying a potentially committed operation. An operator must inspect the
+collection and use a new key if the operation should be attempted again. A full download marks
+local-only or uncertain receipts `discarded_by_full_download` so they cannot report lost mutations
+as committed.
 
 Full-sync requirements persist, degrade readiness, and fail closed. Full-sync tools require the
 admin scope, an explicit safety flag, a preceding compatible server requirement, strict

@@ -9,9 +9,11 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
+import anki.lang
 from anki.collection import AddNoteRequest, Collection
-from anki.errors import NotFoundError
+from anki.errors import NetworkError, NotFoundError
 from anki.sync import SyncAuth
+from anki.utils import field_checksum
 
 from anki_mcp.config import validate_sync_migration_endpoint
 from anki_mcp.state import PersistentState
@@ -62,6 +64,8 @@ class CollectionAdapter:
         sync_on_read: bool = False,
         sync_on_write: bool = False,
     ) -> None:
+        if anki.lang.current_i18n is None:
+            anki.lang.set_lang("en_US")
         self.collection = Collection(str(path))
         self.max_page_size = max_page_size
         self.max_search_scan = max_search_scan
@@ -112,6 +116,13 @@ class CollectionAdapter:
                 "server_media_usn": self._pending_full_sync[1],
             }
         self._state.save_status({"last_sync_at": self._last_sync_at, "pending_full_sync": pending})
+
+    def _invalidate_sync_auth(self) -> None:
+        self._sync_auth = None
+        self._configured_sync_endpoint = None
+        self._pending_full_sync = None
+        self._state.clear_sync_auth()
+        self._save_operational_status()
 
     def status(self) -> dict[str, Any]:
         collection_ready = self.check_ready()
@@ -219,9 +230,24 @@ class CollectionAdapter:
 
         if self.sync_on_write:
             self._sync_or_raise_full_sync(sync_media=False)
-        result = mutate(self)
+        intent: dict[str, Any] = {
+            "idempotency_key": idempotency_key,
+            "state": "outcome_unknown",
+            "local_committed": None,
+            "remote_synced": False,
+            "media_synced": None,
+            "retryable": False,
+            "result": None,
+        }
+        self._state.put_receipt(idempotency_key, operation, request_hash, intent)
+        try:
+            result = mutate(self)
+        except (ValueError, LookupError):
+            self._state.delete_receipt(idempotency_key)
+            raise
         receipt: dict[str, Any] = {
             "idempotency_key": idempotency_key,
+            "state": "committed",
             "local_committed": True,
             "remote_synced": not self.sync_on_write,
             "media_synced": None,
@@ -475,7 +501,7 @@ class CollectionAdapter:
         if not requests or len(requests) > self.max_batch_size:
             raise ValueError(f"batch must contain between 1 and {self.max_batch_size} notes")
         prepared: list[tuple[Any, int]] = []
-        fingerprints: set[tuple[int, str]] = set()
+        fingerprints: set[tuple[int, int]] = set()
         for request in requests:
             note = self._prepare_note(
                 int(request["deck_id"]),
@@ -483,7 +509,7 @@ class CollectionAdapter:
                 dict(request["fields"]),
                 list(request.get("tags", [])),
             )
-            fingerprint = (int(note.mid), note.fields[0].strip())
+            fingerprint = (int(note.mid), field_checksum(note.fields[0]))
             if fingerprint in fingerprints:
                 raise DuplicateNoteError("batch contains duplicate first fields")
             fingerprints.add(fingerprint)
@@ -822,11 +848,9 @@ class CollectionAdapter:
                 "media_sync_requested": sync_media,
                 "endpoint_changed": endpoint_changed,
             }
-        except Exception:
-            self._sync_auth = None
-            self._configured_sync_endpoint = None
-            self._pending_full_sync = None
-            self._save_operational_status()
+        except Exception as exc:
+            if not isinstance(exc, NetworkError):
+                self._invalidate_sync_auth()
             raise
 
     def full_sync(self, upload: bool) -> dict[str, Any]:
@@ -851,16 +875,16 @@ class CollectionAdapter:
                 server_usn=server_usn,
                 upload=upload,
             )
-        except Exception:
-            self._sync_auth = None
-            self._configured_sync_endpoint = None
-            self._pending_full_sync = None
-            self._save_operational_status()
+        except Exception as exc:
+            if not isinstance(exc, NetworkError):
+                self._invalidate_sync_auth()
             raise
         self._pending_full_sync = None
         self._last_sync_at = datetime.now(UTC).isoformat()
         if upload:
             self._state.mark_all_remote_synced()
+        else:
+            self._state.mark_pending_discarded_by_full_download()
         self._save_operational_status()
         return {
             "completed": True,

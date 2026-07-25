@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from anki.collection import Collection
+from anki.errors import NetworkError
 from anki.sync import SyncAuth, SyncOutput
 
 from anki_mcp.collection import (
@@ -13,6 +14,7 @@ from anki_mcp.collection import (
     FullSyncRequiredError,
     IdempotencyConflictError,
 )
+from anki_mcp.state import PersistentState
 
 
 @pytest.fixture
@@ -139,6 +141,24 @@ async def test_batch_create_is_bounded_atomic_and_rejects_duplicates(collection_
                 ]
             )
 
+        with pytest.raises(DuplicateNoteError, match="batch"):
+            await service.create_notes_batch(
+                [
+                    {
+                        "deck_id": deck_id,
+                        "note_type_id": model_id,
+                        "fields": {"Front": "<b>same rendered value</b>", "Back": "x"},
+                        "tags": [],
+                    },
+                    {
+                        "deck_id": deck_id,
+                        "note_type_id": model_id,
+                        "fields": {"Front": "same rendered value", "Back": "y"},
+                        "tags": [],
+                    },
+                ]
+            )
+
     collection = Collection(collection_path)
     try:
         assert collection.note_count() == initial_count + 2
@@ -227,7 +247,7 @@ async def test_coordinator_retries_only_sync_after_local_commit(
         nonlocal sync_calls
         sync_calls += 1
         if sync_calls == 2:
-            raise RuntimeError("post-commit network failure")
+            raise NetworkError("post-commit network failure", None, None, None)
         return SyncOutput(required=0)
 
     monkeypatch.setattr(Collection, "sync_collection", sync)
@@ -393,3 +413,127 @@ async def test_controlled_bootstrap_refuses_a_nonempty_local_collection(
                 "download_if_empty", "bootstrap-user", "bootstrap-password", None
             )
     assert login_called is False
+
+
+@pytest.mark.anyio
+async def test_coordinator_fails_closed_when_receipt_persistence_fails_after_mutation(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_put_receipt = PersistentState.put_receipt
+
+    def fail_committed_receipt(
+        state: PersistentState,
+        key: str,
+        operation: str,
+        request_hash: str,
+        receipt: dict[str, object],
+    ) -> None:
+        if receipt.get("local_committed") is True:
+            raise OSError("simulated crash window")
+        original_put_receipt(state, key, operation, request_hash, receipt)
+
+    monkeypatch.setattr(PersistentState, "put_receipt", fail_committed_receipt)
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        with pytest.raises(OSError, match="crash window"):
+            await service.coordinated_mutation(
+                operation="anki_decks_create",
+                idempotency_key="crash-window-key",
+                request={"name": "Crash Window"},
+                mutate=lambda adapter: adapter.create_deck("Crash Window"),
+            )
+
+    replayed = False
+
+    def must_not_replay(_: object) -> dict[str, object]:
+        nonlocal replayed
+        replayed = True
+        return {"unexpected": True}
+
+    async with AnkiCollectionService(collection_path, max_page_size=100) as restarted:
+        recovered = await restarted.coordinated_mutation(
+            operation="anki_decks_create",
+            idempotency_key="crash-window-key",
+            request={"name": "Crash Window"},
+            mutate=must_not_replay,
+        )
+
+    assert replayed is False
+    assert recovered["state"] == "outcome_unknown"
+    assert recovered["local_committed"] is None
+    assert recovered["remote_synced"] is False
+    assert recovered["retryable"] is False
+
+
+@pytest.mark.anyio
+async def test_full_download_marks_post_commit_receipt_as_discarded(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync_results = iter([SyncOutput(required=0), SyncOutput(required=3, server_media_usn=8)])
+    monkeypatch.setattr(
+        Collection,
+        "sync_login",
+        lambda self, username, password, endpoint: SyncAuth(
+            hkey="persistent-key", endpoint=endpoint
+        ),
+    )
+    monkeypatch.setattr(
+        Collection, "sync_collection", lambda self, auth, sync_media: next(sync_results)
+    )
+    monkeypatch.setattr(Collection, "create_backup", lambda *args, **kwargs: True)
+    monkeypatch.setattr(Collection, "full_upload_or_download", lambda *args, **kwargs: None)
+
+    async with AnkiCollectionService(
+        collection_path, max_page_size=100, sync_on_write=True
+    ) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        with pytest.raises(FullSyncRequiredError, match="FULL_DOWNLOAD"):
+            await service.coordinated_mutation(
+                operation="anki_decks_create",
+                idempotency_key="discarded-key",
+                request={"name": "Discarded"},
+                mutate=lambda adapter: adapter.create_deck("Discarded"),
+            )
+        await service.full_sync(upload=False)
+        replayed = await service.coordinated_mutation(
+            operation="anki_decks_create",
+            idempotency_key="discarded-key",
+            request={"name": "Discarded"},
+            mutate=lambda adapter: (_ for _ in ()).throw(AssertionError("mutation replayed")),
+        )
+        status = await service.status()
+
+    assert replayed["state"] == "discarded_by_full_download"
+    assert replayed["local_committed"] is False
+    assert replayed["remote_synced"] is False
+    assert replayed["result"] is None
+    assert status["pending_mutations"] == 0
+
+
+@pytest.mark.anyio
+async def test_retryable_sync_failure_retains_authentication_across_restart(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        Collection,
+        "sync_login",
+        lambda self, username, password, endpoint: SyncAuth(
+            hkey="persistent-key", endpoint=endpoint
+        ),
+    )
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: (_ for _ in ()).throw(
+            NetworkError("sync failed", None, None, None)
+        ),
+    )
+
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        with pytest.raises(NetworkError, match="sync failed"):
+            await service.sync(sync_media=False)
+        assert (await service.status())["authenticated"] is True
+
+    async with AnkiCollectionService(collection_path, max_page_size=100) as restarted:
+        status = await restarted.status()
+    assert status["authenticated"] is True
