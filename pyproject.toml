@@ -5,8 +5,9 @@ build-backend = "hatchling.build"
 [project]
 name = "anki-mcp"
 version = "0.2.0"
-description = "Authenticated Anki sync and deck/card CRUD MCP sidecar"
+description = "Headless, sync-native Anki MCP sidecar for always-on AI agents"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "anki==26.5",
