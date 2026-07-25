@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from anki.collection import Collection
+from anki.media import MediaManager
 
 from anki_mcp.collection import AnkiCollectionService
 
@@ -119,6 +120,9 @@ async def test_media_crud_round_trip_is_bounded_and_uses_safe_filenames(
 ) -> None:
     async with AnkiCollectionService(resource_collection, max_page_size=100) as service:
         stored = await service.store_media("greeting.txt", base64.b64encode(b"hello").decode())
+        replaced = await service.store_media(
+            "greeting.txt", base64.b64encode(b"replacement").decode()
+        )
         listed = await service.list_media(offset=0, limit=20)
         fetched = await service.get_media("greeting.txt")
         renamed = await service.rename_media("greeting.txt", "renamed.txt")
@@ -130,9 +134,63 @@ async def test_media_crud_round_trip_is_bounded_and_uses_safe_filenames(
             await service.store_media("../escape.txt", base64.b64encode(b"bad").decode())
 
     assert stored == {"filename": "greeting.txt", "size_bytes": 5, "created": True}
-    assert listed["items"] == [{"filename": "greeting.txt", "size_bytes": 5}]
-    assert base64.b64decode(fetched["content_base64"]) == b"hello"
-    assert fetched["size_bytes"] == 5
+    assert replaced == {"filename": "greeting.txt", "size_bytes": 11, "created": False}
+    assert listed["items"] == [{"filename": "greeting.txt", "size_bytes": 11}]
+    assert base64.b64decode(fetched["content_base64"]) == b"replacement"
+    assert fetched["size_bytes"] == 11
     assert renamed == {"old_filename": "greeting.txt", "filename": "renamed.txt", "updated": True}
-    assert base64.b64decode(moved["content_base64"]) == b"hello"
+    assert base64.b64decode(moved["content_base64"]) == b"replacement"
     assert deleted == {"filename": "renamed.txt", "deleted": True}
+
+
+@pytest.mark.anyio
+async def test_media_store_rolls_back_apply_then_raise_failures(
+    resource_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_write = MediaManager.write_data
+
+    async with AnkiCollectionService(resource_collection, max_page_size=100) as service:
+        await service.store_media("existing.txt", base64.b64encode(b"original").decode())
+        await service.store_media(
+            "rename-source.txt", base64.b64encode(b"rename original").decode()
+        )
+        media_dir = Path(await service.executor.run(lambda adapter: adapter.collection.media.dir()))
+        outside = media_dir.parent / "outside.txt"
+        outside.write_bytes(b"outside")
+        (media_dir / "linked.txt").symlink_to(outside)
+        with pytest.raises(ValueError, match="symbolic link"):
+            await service.store_media("linked.txt", base64.b64encode(b"overwrite").decode())
+
+        def apply_then_raise(self: MediaManager, filename: str, data: bytes) -> str:
+            stored_name = original_write(self, filename, data)
+            if data.startswith(b"failing"):
+                raise OSError("write failed after applying")
+            return stored_name
+
+        monkeypatch.setattr(MediaManager, "write_data", apply_then_raise)
+        with pytest.raises(OSError, match="after applying"):
+            await service.store_media(
+                "existing.txt", base64.b64encode(b"failing replacement").decode()
+            )
+        restored = await service.get_media("existing.txt")
+        with pytest.raises(OSError, match="after applying"):
+            await service.store_media("new.txt", base64.b64encode(b"failing creation").decode())
+        with pytest.raises(LookupError, match="media"):
+            await service.get_media("new.txt")
+
+        original_trash = MediaManager.trash_files
+
+        def trash_then_raise(self: MediaManager, filenames: list[str]) -> None:
+            original_trash(self, filenames)
+            if filenames == ["rename-source.txt"]:
+                raise OSError("trash failed after applying")
+
+        monkeypatch.setattr(MediaManager, "trash_files", trash_then_raise)
+        with pytest.raises(OSError, match="after applying"):
+            await service.rename_media("rename-source.txt", "rename-target.txt")
+        rename_source = await service.get_media("rename-source.txt")
+        with pytest.raises(LookupError, match="media"):
+            await service.get_media("rename-target.txt")
+
+    assert base64.b64decode(restored["content_base64"]) == b"original"
+    assert base64.b64decode(rename_source["content_base64"]) == b"rename original"

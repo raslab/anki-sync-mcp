@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 from anki.collection import Collection
@@ -373,6 +374,28 @@ def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) 
         {"old_filename": "protocol.txt", "new_filename": "renamed.txt"},
     )
     call("anki_media_delete", {"filename": "renamed.txt", "confirm": True})
+
+    media_sync_calls: list[bool] = []
+    collection_service = client.app.app.state.collection_service
+
+    def enable_media_sync_probe(adapter: Any) -> None:
+        adapter.sync_on_write = True
+        adapter._sync_or_raise_full_sync = lambda sync_media: (
+            media_sync_calls.append(sync_media) or {"required": "NO_CHANGES"}
+        )
+
+    collection_service.executor.submit(enable_media_sync_probe).result()
+    synced_media = call(
+        "anki_media_store",
+        {
+            "filename": "synced.txt",
+            "content_base64": base64.b64encode(b"sync me").decode(),
+        },
+    )
+    call("anki_media_get", {"filename": "synced.txt", "sync_before": True})
+    assert synced_media["remote_synced"] is True
+    assert synced_media["media_synced"] is True
+    assert media_sync_calls == [True, True, True]
 
     assert renamed["result"] == {"id": deck_id, "updated": True}
     assert deck["result"]["created"] is True

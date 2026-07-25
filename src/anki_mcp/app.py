@@ -151,9 +151,12 @@ def create_app(settings: Settings) -> ASGIApp:
         idempotency_key: str | None,
         request: dict[str, Any],
         function: Callable[[CollectionAdapter], dict[str, Any]],
+        sync_media: bool = False,
     ) -> dict[str, Any]:
         key = idempotency_key or str(uuid4())
-        result = await execute(service.coordinated_mutation(operation, key, request, function))
+        result = await execute(
+            service.coordinated_mutation(operation, key, request, function, sync_media=sync_media)
+        )
         if not isinstance(result, dict):  # pragma: no cover - coordinator always returns a receipt
             raise RuntimeError("mutation coordinator returned an invalid receipt")
         return result
@@ -660,14 +663,20 @@ def create_app(settings: Settings) -> ASGIApp:
     ) -> dict[str, Any]:
         """List collection media filenames and sizes with bounded pagination."""
         return await execute(
-            service.coordinated_read(lambda adapter: adapter.list_media(offset, limit), sync_before)
+            service.coordinated_read(
+                lambda adapter: adapter.list_media(offset, limit),
+                sync_before,
+                sync_media=True,
+            )
         )
 
     @scoped_tool(name="anki_media_get", scope="read")
     async def media_get(filename: MediaFilename, sync_before: SyncMedia = False) -> dict[str, Any]:
         """Read one bounded media file as base64 by safe filename."""
         return await execute(
-            service.coordinated_read(lambda adapter: adapter.get_media(filename), sync_before)
+            service.coordinated_read(
+                lambda adapter: adapter.get_media(filename), sync_before, sync_media=True
+            )
         )
 
     @scoped_tool(name="anki_media_store", scope="write")
@@ -682,6 +691,7 @@ def create_app(settings: Settings) -> ASGIApp:
             idempotency_key,
             {"filename": filename, "content_base64": content_base64},
             lambda adapter: adapter.store_media(filename, content_base64),
+            sync_media=True,
         )
 
     @scoped_tool(name="anki_media_rename", scope="write")
@@ -696,6 +706,7 @@ def create_app(settings: Settings) -> ASGIApp:
             idempotency_key,
             {"old_filename": old_filename, "new_filename": new_filename},
             lambda adapter: adapter.rename_media(old_filename, new_filename),
+            sync_media=True,
         )
 
     @scoped_tool(
@@ -717,6 +728,7 @@ def create_app(settings: Settings) -> ASGIApp:
             idempotency_key,
             {"filename": filename, "confirm": confirm},
             lambda adapter: adapter.delete_media(filename),
+            sync_media=True,
         )
 
     # FastMCP currently generates argument models with Pydantic's extra="ignore".

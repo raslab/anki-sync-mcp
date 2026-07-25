@@ -194,9 +194,14 @@ class CollectionAdapter:
             )
         return {"bootstrapped": True, "direction": None, "sync": sync_result}
 
-    def coordinated_read(self, read: Callable[[CollectionAdapter], T], sync_before: bool) -> T:
+    def coordinated_read(
+        self,
+        read: Callable[[CollectionAdapter], T],
+        sync_before: bool,
+        sync_media: bool = False,
+    ) -> T:
         if sync_before or self.sync_on_read:
-            self._sync_or_raise_full_sync(sync_media=False)
+            self._sync_or_raise_full_sync(sync_media=sync_media)
         return read(self)
 
     def coordinated_mutation(
@@ -205,6 +210,7 @@ class CollectionAdapter:
         idempotency_key: str,
         request: dict[str, Any],
         mutate: Callable[[CollectionAdapter], dict[str, Any]],
+        sync_media: bool = False,
     ) -> dict[str, Any]:
         if not idempotency_key or len(idempotency_key.encode("utf-8")) > 128:
             raise ValueError("idempotency_key must contain 1 to 128 UTF-8 bytes")
@@ -216,30 +222,33 @@ class CollectionAdapter:
                 raise IdempotencyConflictError(
                     "idempotency key was already used with different content"
                 )
+            media_pending = receipt.get("media_synced") is False
             if (
                 receipt.get("local_committed")
-                and not receipt.get("remote_synced")
                 and receipt.get("retryable")
+                and (not receipt.get("remote_synced") or media_pending)
             ):
                 try:
-                    self._sync_or_raise_full_sync(sync_media=False)
+                    self._sync_or_raise_full_sync(sync_media=sync_media or media_pending)
                 except FullSyncRequiredError:
                     receipt["retryable"] = False
                     self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
                     raise
                 receipt["remote_synced"] = True
+                if media_pending:
+                    receipt["media_synced"] = True
                 receipt["retryable"] = False
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
             return receipt
 
         if self.sync_on_write:
-            self._sync_or_raise_full_sync(sync_media=False)
+            self._sync_or_raise_full_sync(sync_media=sync_media)
         intent: dict[str, Any] = {
             "idempotency_key": idempotency_key,
             "state": "outcome_unknown",
             "local_committed": None,
             "remote_synced": False,
-            "media_synced": None,
+            "media_synced": False if sync_media else None,
             "retryable": False,
             "result": None,
         }
@@ -254,14 +263,14 @@ class CollectionAdapter:
             "state": "committed",
             "local_committed": True,
             "remote_synced": not self.sync_on_write,
-            "media_synced": None,
+            "media_synced": not self.sync_on_write if sync_media else None,
             "retryable": False,
             "result": result,
         }
         self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
         if self.sync_on_write:
             try:
-                self._sync_or_raise_full_sync(sync_media=False)
+                self._sync_or_raise_full_sync(sync_media=sync_media)
             except FullSyncRequiredError:
                 receipt["remote_synced"] = False
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
@@ -272,6 +281,8 @@ class CollectionAdapter:
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
                 return receipt
             receipt["remote_synced"] = True
+            if sync_media:
+                receipt["media_synced"] = True
             self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
         return receipt
 
@@ -791,7 +802,9 @@ class CollectionAdapter:
         ):
             raise ValueError("media filename must be a plain filename without path separators")
         path = Path(self.collection.media.dir()) / filename
-        if require_exists and (not path.is_file() or path.is_symlink()):
+        if path.is_symlink():
+            raise ValueError("media filename must not reference a symbolic link")
+        if require_exists and not path.is_file():
             raise LookupError(f"media {filename} not found")
         return path
 
@@ -819,7 +832,7 @@ class CollectionAdapter:
         }
 
     def store_media(self, filename: str, content_base64: str) -> dict[str, Any]:
-        self._media_path(filename, require_exists=False)
+        path = self._media_path(filename, require_exists=False)
         try:
             content = base64.b64decode(content_base64, validate=True)
         except (binascii.Error, ValueError) as exc:
@@ -827,8 +840,37 @@ class CollectionAdapter:
         if len(content) > self.max_media_bytes:
             raise ValueError(f"media content exceeds ANKI_MAX_MEDIA_BYTES ({self.max_media_bytes})")
         existed = self.collection.media.have(filename)
-        stored_name = self.collection.media.write_data(filename, content)
-        return {"filename": stored_name, "size_bytes": len(content), "created": not existed}
+        previous_content = path.read_bytes() if existed else None
+        try:
+            if existed:
+                self.collection.media.trash_files([filename])
+            stored_name = self.collection.media.write_data(filename, content)
+            if stored_name != filename:
+                raise RuntimeError("Anki did not preserve the requested media filename")
+        except Exception as operation_error:
+            if previous_content is not None:
+                try:
+                    if self.collection.media.have(filename):
+                        self.collection.media.trash_files([filename])
+                    restored_name = self.collection.media.write_data(filename, previous_content)
+                    if restored_name != filename or path.read_bytes() != previous_content:
+                        raise RuntimeError("media replacement rollback verification failed")
+                except Exception:
+                    raise RuntimeError(
+                        "media replacement failed and rollback was incomplete"
+                    ) from operation_error
+            else:
+                try:
+                    if self.collection.media.have(filename):
+                        self.collection.media.trash_files([filename])
+                    if self.collection.media.have(filename):
+                        raise RuntimeError("created media remained after rollback")
+                except Exception:
+                    raise RuntimeError(
+                        "media creation failed and rollback was incomplete"
+                    ) from operation_error
+            raise
+        return {"filename": filename, "size_bytes": len(content), "created": not existed}
 
     def rename_media(self, old_filename: str, new_filename: str) -> dict[str, Any]:
         old_path = self._media_path(old_filename, require_exists=True)
@@ -838,11 +880,25 @@ class CollectionAdapter:
         content = old_path.read_bytes()
         if len(content) > self.max_media_bytes:
             raise ValueError(f"media file exceeds ANKI_MAX_MEDIA_BYTES ({self.max_media_bytes})")
-        stored_name = self.collection.media.write_data(new_filename, content)
         try:
+            stored_name = self.collection.media.write_data(new_filename, content)
+            if stored_name != new_filename:
+                raise RuntimeError("Anki did not preserve the requested media filename")
             self.collection.media.trash_files([old_filename])
-        except Exception:
-            self.collection.media.trash_files([stored_name])
+        except Exception as operation_error:
+            try:
+                if self.collection.media.have(new_filename):
+                    self.collection.media.trash_files([new_filename])
+                if not self.collection.media.have(old_filename):
+                    restored_name = self.collection.media.write_data(old_filename, content)
+                    if restored_name != old_filename:
+                        raise RuntimeError("Anki did not restore the original media filename")
+                if old_path.read_bytes() != content:
+                    raise RuntimeError("media rename rollback verification failed")
+            except Exception:
+                raise RuntimeError(
+                    "media rename failed and rollback was incomplete"
+                ) from operation_error
             raise
         return {"old_filename": old_filename, "filename": stored_name, "updated": True}
 
@@ -1410,9 +1466,14 @@ class AnkiCollectionService:
         return await self.executor.run(lambda adapter: adapter.unsuspend_cards(card_ids))
 
     async def coordinated_read(
-        self, read: Callable[[CollectionAdapter], T], sync_before: bool = False
+        self,
+        read: Callable[[CollectionAdapter], T],
+        sync_before: bool = False,
+        sync_media: bool = False,
     ) -> T:
-        return await self.executor.run(lambda adapter: adapter.coordinated_read(read, sync_before))
+        return await self.executor.run(
+            lambda adapter: adapter.coordinated_read(read, sync_before, sync_media)
+        )
 
     async def coordinated_mutation(
         self,
@@ -1420,10 +1481,11 @@ class AnkiCollectionService:
         idempotency_key: str,
         request: dict[str, Any],
         mutate: Callable[[CollectionAdapter], dict[str, Any]],
+        sync_media: bool = False,
     ) -> dict[str, Any]:
         return await self.executor.run(
             lambda adapter: adapter.coordinated_mutation(
-                operation, idempotency_key, request, mutate
+                operation, idempotency_key, request, mutate, sync_media
             )
         )
 

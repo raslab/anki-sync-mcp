@@ -514,7 +514,9 @@ second client's full download, and a subsequent normal synchronized write/read l
 - Add read-only note-type inspection and schema-gated standard note-type create/update/delete.
   Updates preserve field/template counts to avoid an ambiguous field-mapping API.
 - Add bounded media list/get/store/rename/delete with strict filename validation, base64 transport,
-  decoded-size limits, and Anki media trash semantics.
+  decoded-size limits, rollback-aware replacement, and Anki media trash semantics. Media reads that
+  request synchronization and all automatically synchronized media mutations enable Anki media
+  transfer; durable receipts track and retry media completion without replaying local writes.
 - Keep all new mutations inside the durable synchronized/idempotent coordinator and cover every
   exposed tool through real MCP JSON-RPC calls against disposable official Anki collections.
 

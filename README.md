@@ -228,5 +228,8 @@ create/update remains limited to built-in single-card Basic notes, while deck ch
 suspend/unsuspend support arbitrary cards. Note-type schema writes are disabled by default;
 updates preserve field and template counts while changing names, formats, and CSS through Anki's
 model manager. Media operations reject path components and symlinks, enforce decoded byte limits,
-and use Anki's media manager for writes and trash. Back up the persistent volume before maintenance
-and never mount one collection into multiple live Anki processes.
+use Anki's media manager for rollback-aware replacement and trash, and request media transfer during
+automatic sync.
+Mutation receipts track `media_synced` separately so an idempotent retry can finish media transfer
+without replaying the local write. Back up the persistent volume before maintenance and never mount
+one collection into multiple live Anki processes.
