@@ -302,6 +302,114 @@ async def test_coordinator_retries_only_sync_after_local_commit(
 
 
 @pytest.mark.anyio
+async def test_media_coordinator_syncs_media_and_retries_without_replaying_mutation(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync_calls: list[bool] = []
+    monkeypatch.setattr(
+        Collection,
+        "sync_login",
+        lambda self, username, password, endpoint: SyncAuth(
+            hkey="persistent-key", endpoint=endpoint
+        ),
+    )
+
+    def sync(_: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        sync_calls.append(sync_media)
+        if len(sync_calls) == 2:
+            raise NetworkError("post-commit media sync failure", None, None, None)
+        return SyncOutput(required=0)
+
+    monkeypatch.setattr(Collection, "sync_collection", sync)
+    async with AnkiCollectionService(
+        collection_path, max_page_size=100, sync_on_write=True
+    ) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        first = await service.coordinated_mutation(
+            operation="anki_media_store",
+            idempotency_key="media-sync-key",
+            request={"filename": "sync.txt"},
+            mutate=lambda adapter: {"created": True},
+            sync_media=True,
+        )
+
+    replayed = False
+
+    def must_not_replay(_: object) -> dict[str, object]:
+        nonlocal replayed
+        replayed = True
+        raise AssertionError("media mutation replayed")
+
+    async with AnkiCollectionService(
+        collection_path, max_page_size=100, sync_on_write=True
+    ) as restarted:
+        retried = await restarted.coordinated_mutation(
+            operation="anki_media_store",
+            idempotency_key="media-sync-key",
+            request={"filename": "sync.txt"},
+            mutate=must_not_replay,
+            sync_media=True,
+        )
+        await restarted.coordinated_read(
+            lambda adapter: adapter.list_media(0, 10),
+            sync_before=True,
+            sync_media=True,
+        )
+
+    assert sync_calls == [True, True, True, True]
+    assert first["remote_synced"] is False
+    assert first["media_synced"] is False
+    assert first["retryable"] is True
+    assert retried["remote_synced"] is True
+    assert retried["media_synced"] is True
+    assert retried["retryable"] is False
+    assert replayed is False
+
+
+def test_full_sync_reconciliation_preserves_pending_media_transfer(collection_path: str) -> None:
+    state = PersistentState(collection_path)
+    try:
+        media_receipt = {
+            "state": "committed",
+            "local_committed": True,
+            "remote_synced": False,
+            "media_synced": False,
+            "retryable": False,
+            "result": {"filename": "pending.txt"},
+        }
+        state.put_receipt("media-key", "anki_media_store", "media-hash", media_receipt)
+        state.put_receipt(
+            "note-key",
+            "anki_notes_create",
+            "note-hash",
+            {**media_receipt, "media_synced": None, "result": {"note_id": 1}},
+        )
+
+        state.mark_pending_discarded_by_full_download()
+
+        media = state.get_receipt("media-key")
+        note = state.get_receipt("note-key")
+        assert media is not None
+        assert media[2]["local_committed"] is True
+        assert media[2]["remote_synced"] is True
+        assert media[2]["media_synced"] is False
+        assert media[2]["retryable"] is True
+        assert note is not None
+        assert note[2]["state"] == "discarded_by_full_download"
+        assert note[2]["local_committed"] is False
+
+        state.mark_all_remote_synced()
+        uploaded = state.get_receipt("media-key")
+        assert uploaded is not None
+        assert uploaded[2]["remote_synced"] is True
+        assert uploaded[2]["media_synced"] is False
+        assert uploaded[2]["retryable"] is True
+        assert state.pending_receipt_count() == 1
+    finally:
+        state.close()
+
+
+@pytest.mark.anyio
 async def test_coordinator_fails_closed_before_mutation_and_persists_full_sync_state(
     collection_path: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

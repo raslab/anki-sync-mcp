@@ -186,6 +186,7 @@ Secrets should support both direct environment variables and `_FILE` variants. I
 | `ANKI_OPERATION_TIMEOUT_SECONDS` | No | `120` | Collection operation timeout. |
 | `ANKI_SYNC_TIMEOUT_SECONDS` | No | `300` | Sync timeout. |
 | `MCP_MAX_PAGE_SIZE` | No | `100` | Maximum list/search page size. |
+| `ANKI_MAX_MEDIA_BYTES` | No | `1048576` | Maximum decoded media bytes accepted or returned per call. |
 | `LOG_LEVEL` | No | `INFO` | Application log level. |
 
 The service should authenticate once during bootstrap and persist the resulting sync host key under `/data/state`. Retaining the plaintext sync password after successful bootstrap should not be required when host-key authentication is sufficient.
@@ -242,6 +243,11 @@ Tool names are stable API contracts. Inputs and outputs use Anki IDs where avail
 | `anki_notes_replace_tags` | write | Replace one tag with another across a bounded selection. |
 | `anki_notes_delete` | destructive | Delete notes and generated cards with confirmation. |
 
+Collection-level tag resources use `anki_tags_list`, `anki_tags_rename`, and confirmed
+`anki_tags_delete`. A standalone tag create operation is intentionally absent because the official
+Anki API creates a meaningful tag by assigning it to a note; `anki_notes_add_tags` is that create
+workflow.
+
 ### Cards and scheduling
 
 | Tool | Scope | Purpose |
@@ -263,8 +269,8 @@ These tools can require a one-way full sync and are disabled unless `ANKI_ALLOW_
 |---|---|---|
 | `anki_note_types_list` | read | List note types and stable IDs. |
 | `anki_note_types_get` | read | Return fields, templates, CSS, and generation rules. |
-| `anki_note_types_create` | admin | Create a note type. |
-| `anki_note_types_update` | admin | Rename or change supported note-type properties. |
+| `anki_note_types_create` | admin | Create a standard note type with fields, templates, formats, and CSS. |
+| `anki_note_types_update` | admin | Replace names, formats, and CSS while preserving field/template counts. |
 | `anki_note_type_fields_update` | admin | Add, rename, reorder, or remove fields. |
 | `anki_templates_update` | admin | Update template front, back, browser formats, or CSS. |
 | `anki_note_types_delete` | destructive | Delete a note type only with impact report and confirmation. |
@@ -273,8 +279,10 @@ These tools can require a one-way full sync and are disabled unless `ANKI_ALLOW_
 
 | Tool | Scope | Purpose |
 |---|---|---|
-| `anki_media_get` | read | Retrieve metadata or bounded content for a media file. |
-| `anki_media_store` | write | Store media with filename, type, and size validation. |
+| `anki_media_list` | read | List bounded filename and size metadata. |
+| `anki_media_get` | read | Retrieve bounded base64 content for a safe filename. |
+| `anki_media_store` | write | Create or replace media with filename, base64, and decoded-size validation. |
+| `anki_media_rename` | write | Rename media without overwriting an existing target. |
 | `anki_media_check` | read | Report missing and unused media. |
 | `anki_media_delete` | destructive | Delete media with confirmation. |
 
@@ -500,11 +508,23 @@ self-hosted sync server from the pinned `anki` package. The test proves initial 
 operator-selected resolution, persisted host-key restart, receipt reconciliation and replay, a
 second client's full download, and a subsequent normal synchronized write/read lifecycle.
 
-### Phase 2: complete non-destructive administration
+### Delivered Phase 2A: critical-resource CRUD
 
-- Add deck configuration updates and read-only note-type, field, template, and CSS inspection.
+- Complete confirmed note deletion and collection-level tag list/rename/delete workflows.
+- Add read-only note-type inspection and schema-gated standard note-type create/update/delete.
+  Updates preserve field/template counts to avoid an ambiguous field-mapping API.
+- Add bounded media list/get/store/rename/delete with strict filename validation, base64 transport,
+  decoded-size limits, rollback-aware replacement, and Anki media trash semantics. Media reads that
+  request synchronization and all automatically synchronized media mutations enable Anki media
+  transfer; durable receipts track and retry media completion without replaying local writes.
+- Keep all new mutations inside the durable synchronized/idempotent coordinator and cover every
+  exposed tool through real MCP JSON-RPC calls against disposable official Anki collections.
+
+### Remaining Phase 2: complete non-destructive administration
+
+- Add deck configuration updates and advanced field/template add, remove, and reorder mappings.
 - Add card flags, repositioning, and bounded bulk operations.
-- Add media store/get/check with filename, content, and size validation plus media-sync completion.
+- Add media consistency checking and media-sync completion tracking.
 - Add operation-status APIs and reporting over the durable coordinator state delivered in Phase 1,
   structured audit events, metrics, backup/restore smoke tests, and container persistent-restart
   tests.

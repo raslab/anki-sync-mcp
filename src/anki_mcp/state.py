@@ -77,7 +77,7 @@ class PersistentState:
     def pending_receipt_count(self) -> int:
         rows = self.connection.execute("select receipt_json from mutation_receipts").fetchall()
         return sum(
-            not bool(receipt.get("remote_synced"))
+            (not bool(receipt.get("remote_synced")) or receipt.get("media_synced") is False)
             and receipt.get("state") != "discarded_by_full_download"
             for row in rows
             if isinstance((receipt := json.loads(row[0])), dict)
@@ -90,9 +90,11 @@ class PersistentState:
         ).fetchall()
         for key, receipt_json in rows:
             receipt = json.loads(receipt_json)
-            if receipt.get("local_committed") and not receipt.get("remote_synced"):
+            if receipt.get("local_committed") and (
+                not receipt.get("remote_synced") or receipt.get("media_synced") is False
+            ):
                 receipt["remote_synced"] = True
-                receipt["retryable"] = False
+                receipt["retryable"] = receipt.get("media_synced") is False
                 receipt["state"] = "committed"
                 encoded = json.dumps(
                     receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -110,7 +112,17 @@ class PersistentState:
         ).fetchall()
         for key, receipt_json in rows:
             receipt = json.loads(receipt_json)
-            if (
+            changed = False
+            if receipt.get("media_synced") is False and receipt.get("local_committed"):
+                receipt.update(
+                    {
+                        "state": "committed",
+                        "remote_synced": True,
+                        "retryable": True,
+                    }
+                )
+                changed = True
+            elif (
                 receipt.get("local_committed") or receipt.get("state") == "outcome_unknown"
             ) and not receipt.get("remote_synced"):
                 receipt.update(
@@ -122,6 +134,8 @@ class PersistentState:
                         "result": None,
                     }
                 )
+                changed = True
+            if changed:
                 encoded = json.dumps(
                     receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
                 )

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -61,6 +63,7 @@ class CollectionAdapter:
         max_rendered_field_bytes: int = 262_144,
         max_card_fields: int = 100,
         max_batch_size: int = 50,
+        max_media_bytes: int = 1_048_576,
         sync_on_read: bool = False,
         sync_on_write: bool = False,
     ) -> None:
@@ -72,6 +75,7 @@ class CollectionAdapter:
         self.max_rendered_field_bytes = max_rendered_field_bytes
         self.max_card_fields = max_card_fields
         self.max_batch_size = max_batch_size
+        self.max_media_bytes = max_media_bytes
         self.sync_on_read = sync_on_read
         self.sync_on_write = sync_on_write
         self._backup_folder = Path(path).parent / "backups"
@@ -190,9 +194,14 @@ class CollectionAdapter:
             )
         return {"bootstrapped": True, "direction": None, "sync": sync_result}
 
-    def coordinated_read(self, read: Callable[[CollectionAdapter], T], sync_before: bool) -> T:
+    def coordinated_read(
+        self,
+        read: Callable[[CollectionAdapter], T],
+        sync_before: bool,
+        sync_media: bool = False,
+    ) -> T:
         if sync_before or self.sync_on_read:
-            self._sync_or_raise_full_sync(sync_media=False)
+            self._sync_or_raise_full_sync(sync_media=sync_media)
         return read(self)
 
     def coordinated_mutation(
@@ -201,6 +210,7 @@ class CollectionAdapter:
         idempotency_key: str,
         request: dict[str, Any],
         mutate: Callable[[CollectionAdapter], dict[str, Any]],
+        sync_media: bool = False,
     ) -> dict[str, Any]:
         if not idempotency_key or len(idempotency_key.encode("utf-8")) > 128:
             raise ValueError("idempotency_key must contain 1 to 128 UTF-8 bytes")
@@ -212,30 +222,33 @@ class CollectionAdapter:
                 raise IdempotencyConflictError(
                     "idempotency key was already used with different content"
                 )
+            media_pending = receipt.get("media_synced") is False
             if (
                 receipt.get("local_committed")
-                and not receipt.get("remote_synced")
                 and receipt.get("retryable")
+                and (not receipt.get("remote_synced") or media_pending)
             ):
                 try:
-                    self._sync_or_raise_full_sync(sync_media=False)
+                    self._sync_or_raise_full_sync(sync_media=sync_media or media_pending)
                 except FullSyncRequiredError:
                     receipt["retryable"] = False
                     self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
                     raise
                 receipt["remote_synced"] = True
+                if media_pending:
+                    receipt["media_synced"] = True
                 receipt["retryable"] = False
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
             return receipt
 
         if self.sync_on_write:
-            self._sync_or_raise_full_sync(sync_media=False)
+            self._sync_or_raise_full_sync(sync_media=sync_media)
         intent: dict[str, Any] = {
             "idempotency_key": idempotency_key,
             "state": "outcome_unknown",
             "local_committed": None,
             "remote_synced": False,
-            "media_synced": None,
+            "media_synced": False if sync_media else None,
             "retryable": False,
             "result": None,
         }
@@ -250,14 +263,14 @@ class CollectionAdapter:
             "state": "committed",
             "local_committed": True,
             "remote_synced": not self.sync_on_write,
-            "media_synced": None,
+            "media_synced": not self.sync_on_write if sync_media else None,
             "retryable": False,
             "result": result,
         }
         self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
         if self.sync_on_write:
             try:
-                self._sync_or_raise_full_sync(sync_media=False)
+                self._sync_or_raise_full_sync(sync_media=sync_media)
             except FullSyncRequiredError:
                 receipt["remote_synced"] = False
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
@@ -268,6 +281,8 @@ class CollectionAdapter:
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
                 return receipt
             receipt["remote_synced"] = True
+            if sync_media:
+                receipt["media_synced"] = True
             self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
         return receipt
 
@@ -580,6 +595,317 @@ class CollectionAdapter:
 
     def remove_note_tags(self, note_ids: list[int], tags: list[str]) -> dict[str, Any]:
         return self._update_note_tags(note_ids, tags, remove=True)
+
+    def delete_notes(self, note_ids: list[int]) -> dict[str, Any]:
+        if not note_ids or len(note_ids) > self.max_batch_size:
+            raise ValueError(
+                f"note_ids must contain between 1 and {self.max_batch_size} stable IDs"
+            )
+        if len(set(note_ids)) != len(note_ids):
+            raise ValueError("note_ids must not contain duplicates")
+        for note_id in note_ids:
+            self.get_note(note_id)
+        self.collection.remove_notes([cast("NoteId", note_id) for note_id in note_ids])
+        return {"note_ids": note_ids, "deleted": len(note_ids)}
+
+    def list_tags(self, offset: int, limit: int) -> dict[str, Any]:
+        tags = self.collection.tags.all()
+        if len(tags) > self.max_search_scan:
+            raise ValueError(
+                "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        items = []
+        for tag in sorted(tags, key=str.casefold):
+            name, name_truncated = self._truncate_rendered(tag)
+            items.append({"name": name, "name_truncated": name_truncated})
+        return self._page(items, offset, limit)
+
+    def rename_tag(self, old_name: str, new_name: str) -> dict[str, Any]:
+        if not old_name.strip() or not new_name.strip():
+            raise ValueError("tag names must not be blank")
+        if old_name not in self.collection.tags.all():
+            raise LookupError(f"tag {old_name} not found")
+        if int(self.collection.note_count()) > self.max_search_scan:
+            raise ValueError(
+                "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        result = self.collection.tags.rename(old_name, new_name)
+        return {
+            "old_name": old_name,
+            "new_name": new_name,
+            "updated_notes": int(result.count),
+        }
+
+    def delete_tag(self, name: str) -> dict[str, Any]:
+        if not name.strip():
+            raise ValueError("tag name must not be blank")
+        if name not in self.collection.tags.all():
+            raise LookupError(f"tag {name} not found")
+        if int(self.collection.note_count()) > self.max_search_scan:
+            raise ValueError(
+                "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        result = self.collection.tags.remove(name)
+        return {"name": name, "updated_notes": int(result.count), "deleted": True}
+
+    def list_note_types(self, offset: int, limit: int) -> dict[str, Any]:
+        models = self.collection.models.all_names_and_ids()
+        if len(models) > self.max_search_scan:
+            raise ValueError(
+                "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        items = []
+        for item in sorted(models, key=lambda model: model.name.casefold()):
+            name, name_truncated = self._truncate_rendered(item.name)
+            model = self.collection.models.get(cast("NotetypeId", item.id))
+            items.append(
+                {
+                    "id": int(item.id),
+                    "name": name,
+                    "name_truncated": name_truncated,
+                    "note_count": self.collection.models.use_count(model) if model else 0,
+                }
+            )
+        return self._page(items, offset, limit)
+
+    def get_note_type(self, note_type_id: int) -> dict[str, Any]:
+        model = self.collection.models.get(cast("NotetypeId", note_type_id))
+        if model is None:
+            raise LookupError(f"note type {note_type_id} not found")
+        name, name_truncated = self._truncate_rendered(str(model["name"]))
+        css, css_truncated = self._truncate_rendered(str(model.get("css", "")))
+        fields = []
+        for field in model.get("flds", [])[: self.max_card_fields]:
+            field_name, field_name_truncated = self._truncate_rendered(str(field["name"]))
+            fields.append(
+                {
+                    "name": field_name,
+                    "name_truncated": field_name_truncated,
+                    "ordinal": int(field["ord"]),
+                }
+            )
+        templates = []
+        for template in model.get("tmpls", [])[: self.max_card_fields]:
+            template_name, template_name_truncated = self._truncate_rendered(str(template["name"]))
+            question, question_truncated = self._truncate_rendered(str(template.get("qfmt", "")))
+            answer, answer_truncated = self._truncate_rendered(str(template.get("afmt", "")))
+            templates.append(
+                {
+                    "name": template_name,
+                    "name_truncated": template_name_truncated,
+                    "ordinal": int(template["ord"]),
+                    "question_format": question,
+                    "question_format_truncated": question_truncated,
+                    "answer_format": answer,
+                    "answer_format_truncated": answer_truncated,
+                }
+            )
+        return {
+            "id": int(model["id"]),
+            "name": name,
+            "name_truncated": name_truncated,
+            "kind": "cloze" if int(model.get("type", 0)) == 1 else "standard",
+            "css": css,
+            "css_truncated": css_truncated,
+            "fields": fields,
+            "fields_omitted": max(0, len(model.get("flds", [])) - self.max_card_fields),
+            "templates": templates,
+            "templates_omitted": max(0, len(model.get("tmpls", [])) - self.max_card_fields),
+            "note_count": self.collection.models.use_count(model),
+        }
+
+    def _validate_note_type_parts(self, fields: list[str], templates: list[dict[str, str]]) -> None:
+        if not fields or len(fields) > self.max_card_fields:
+            raise ValueError(f"fields must contain between 1 and {self.max_card_fields} names")
+        if any(not name.strip() for name in fields):
+            raise ValueError("field names must not be blank")
+        if len({name.casefold() for name in fields}) != len(fields):
+            raise ValueError("field names must be unique")
+        if not templates or len(templates) > self.max_card_fields:
+            raise ValueError(f"templates must contain between 1 and {self.max_card_fields} items")
+        names = [template["name"] for template in templates]
+        if any(not name.strip() for name in names):
+            raise ValueError("template names must not be blank")
+        if len({name.casefold() for name in names}) != len(names):
+            raise ValueError("template names must be unique")
+
+    def create_note_type(
+        self,
+        name: str,
+        fields: list[str],
+        templates: list[dict[str, str]],
+        css: str,
+    ) -> dict[str, Any]:
+        if not name.strip():
+            raise ValueError("note type name must not be blank")
+        if self.collection.models.by_name(name) is not None:
+            raise ValueError(f"note type {name} already exists")
+        self._validate_note_type_parts(fields, templates)
+        model = self.collection.models.new(name)
+        for field_name in fields:
+            self.collection.models.add_field(model, self.collection.models.new_field(field_name))
+        for template_input in templates:
+            template = self.collection.models.new_template(template_input["name"])
+            template["qfmt"] = template_input["question_format"]
+            template["afmt"] = template_input["answer_format"]
+            self.collection.models.add_template(model, template)
+        model["css"] = css
+        self.collection.models.add(model)
+        return {"id": int(model["id"]), "created": True}
+
+    def update_note_type(
+        self,
+        note_type_id: int,
+        name: str,
+        fields: list[str],
+        templates: list[dict[str, str]],
+        css: str,
+    ) -> dict[str, Any]:
+        model = self.collection.models.get(cast("NotetypeId", note_type_id))
+        if model is None:
+            raise LookupError(f"note type {note_type_id} not found")
+        if not name.strip():
+            raise ValueError("note type name must not be blank")
+        existing = self.collection.models.by_name(name)
+        if existing is not None and int(existing["id"]) != note_type_id:
+            raise ValueError(f"note type {name} already exists")
+        self._validate_note_type_parts(fields, templates)
+        current_fields = model.get("flds", [])
+        current_templates = model.get("tmpls", [])
+        if len(fields) != len(current_fields) or len(templates) != len(current_templates):
+            raise ValueError("note type update must preserve field and template counts")
+        model["name"] = name
+        model["css"] = css
+        for field, field_name in zip(current_fields, fields, strict=True):
+            field["name"] = field_name
+        for template, template_input in zip(current_templates, templates, strict=True):
+            template["name"] = template_input["name"]
+            template["qfmt"] = template_input["question_format"]
+            template["afmt"] = template_input["answer_format"]
+        self.collection.models.update_dict(model)
+        return {"id": note_type_id, "updated": True}
+
+    def delete_note_type(self, note_type_id: int) -> dict[str, Any]:
+        model = self.collection.models.get(cast("NotetypeId", note_type_id))
+        if model is None:
+            raise LookupError(f"note type {note_type_id} not found")
+        note_count = int(self.collection.models.use_count(model))
+        self.collection.models.remove(cast("NotetypeId", note_type_id))
+        return {"id": note_type_id, "deleted": True, "deleted_notes": note_count}
+
+    def _media_path(self, filename: str, *, require_exists: bool) -> Path:
+        if (
+            "\x00" in filename
+            or not filename.strip()
+            or Path(filename).name != filename
+            or any(separator in filename for separator in ("/", "\\"))
+        ):
+            raise ValueError("media filename must be a plain filename without path separators")
+        path = Path(self.collection.media.dir()) / filename
+        if path.is_symlink():
+            raise ValueError("media filename must not reference a symbolic link")
+        if require_exists and not path.is_file():
+            raise LookupError(f"media {filename} not found")
+        return path
+
+    def list_media(self, offset: int, limit: int) -> dict[str, Any]:
+        items = []
+        for path in Path(self.collection.media.dir()).iterdir():
+            if path.is_file() and not path.is_symlink():
+                items.append({"filename": path.name, "size_bytes": path.stat().st_size})
+                if len(items) > self.max_search_scan:
+                    raise ValueError(
+                        "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+                    )
+        sorted_items = sorted(items, key=lambda item: item["filename"].casefold())
+        return self._page(sorted_items, offset, limit)
+
+    def get_media(self, filename: str) -> dict[str, Any]:
+        path = self._media_path(filename, require_exists=True)
+        size = path.stat().st_size
+        if size > self.max_media_bytes:
+            raise ValueError(f"media file exceeds ANKI_MAX_MEDIA_BYTES ({self.max_media_bytes})")
+        return {
+            "filename": filename,
+            "size_bytes": size,
+            "content_base64": base64.b64encode(path.read_bytes()).decode("ascii"),
+        }
+
+    def store_media(self, filename: str, content_base64: str) -> dict[str, Any]:
+        path = self._media_path(filename, require_exists=False)
+        try:
+            content = base64.b64decode(content_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("content_base64 must be valid base64") from exc
+        if len(content) > self.max_media_bytes:
+            raise ValueError(f"media content exceeds ANKI_MAX_MEDIA_BYTES ({self.max_media_bytes})")
+        existed = self.collection.media.have(filename)
+        previous_content = path.read_bytes() if existed else None
+        try:
+            if existed:
+                self.collection.media.trash_files([filename])
+            stored_name = self.collection.media.write_data(filename, content)
+            if stored_name != filename:
+                raise RuntimeError("Anki did not preserve the requested media filename")
+        except Exception as operation_error:
+            if previous_content is not None:
+                try:
+                    if self.collection.media.have(filename):
+                        self.collection.media.trash_files([filename])
+                    restored_name = self.collection.media.write_data(filename, previous_content)
+                    if restored_name != filename or path.read_bytes() != previous_content:
+                        raise RuntimeError("media replacement rollback verification failed")
+                except Exception:
+                    raise RuntimeError(
+                        "media replacement failed and rollback was incomplete"
+                    ) from operation_error
+            else:
+                try:
+                    if self.collection.media.have(filename):
+                        self.collection.media.trash_files([filename])
+                    if self.collection.media.have(filename):
+                        raise RuntimeError("created media remained after rollback")
+                except Exception:
+                    raise RuntimeError(
+                        "media creation failed and rollback was incomplete"
+                    ) from operation_error
+            raise
+        return {"filename": filename, "size_bytes": len(content), "created": not existed}
+
+    def rename_media(self, old_filename: str, new_filename: str) -> dict[str, Any]:
+        old_path = self._media_path(old_filename, require_exists=True)
+        self._media_path(new_filename, require_exists=False)
+        if self.collection.media.have(new_filename):
+            raise ValueError(f"media {new_filename} already exists")
+        content = old_path.read_bytes()
+        if len(content) > self.max_media_bytes:
+            raise ValueError(f"media file exceeds ANKI_MAX_MEDIA_BYTES ({self.max_media_bytes})")
+        try:
+            stored_name = self.collection.media.write_data(new_filename, content)
+            if stored_name != new_filename:
+                raise RuntimeError("Anki did not preserve the requested media filename")
+            self.collection.media.trash_files([old_filename])
+        except Exception as operation_error:
+            try:
+                if self.collection.media.have(new_filename):
+                    self.collection.media.trash_files([new_filename])
+                if not self.collection.media.have(old_filename):
+                    restored_name = self.collection.media.write_data(old_filename, content)
+                    if restored_name != old_filename:
+                        raise RuntimeError("Anki did not restore the original media filename")
+                if old_path.read_bytes() != content:
+                    raise RuntimeError("media rename rollback verification failed")
+            except Exception:
+                raise RuntimeError(
+                    "media rename failed and rollback was incomplete"
+                ) from operation_error
+            raise
+        return {"old_filename": old_filename, "filename": stored_name, "updated": True}
+
+    def delete_media(self, filename: str) -> dict[str, Any]:
+        self._media_path(filename, require_exists=True)
+        self.collection.media.trash_files([filename])
+        return {"filename": filename, "deleted": True}
 
     def search_cards(self, query: str, offset: int, limit: int) -> dict[str, Any]:
         # Validate bounds before potentially expensive collection search.
@@ -911,6 +1237,7 @@ class CollectionExecutor:
         max_rendered_field_bytes: int = 262_144,
         max_card_fields: int = 100,
         max_batch_size: int = 50,
+        max_media_bytes: int = 1_048_576,
         sync_on_read: bool = False,
         sync_on_write: bool = False,
     ) -> None:
@@ -920,6 +1247,7 @@ class CollectionExecutor:
         self._max_rendered_field_bytes = max_rendered_field_bytes
         self._max_card_fields = max_card_fields
         self._max_batch_size = max_batch_size
+        self._max_media_bytes = max_media_bytes
         self._sync_on_read = sync_on_read
         self._sync_on_write = sync_on_write
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anki-collection")
@@ -941,6 +1269,7 @@ class CollectionExecutor:
                 self._max_rendered_field_bytes,
                 self._max_card_fields,
                 self._max_batch_size,
+                self._max_media_bytes,
                 self._sync_on_read,
                 self._sync_on_write,
             )
@@ -978,6 +1307,7 @@ class AnkiCollectionService:
         max_rendered_field_bytes: int = 262_144,
         max_card_fields: int = 100,
         max_batch_size: int = 50,
+        max_media_bytes: int = 1_048_576,
         sync_on_read: bool = False,
         sync_on_write: bool = False,
     ) -> None:
@@ -988,6 +1318,7 @@ class AnkiCollectionService:
             max_rendered_field_bytes,
             max_card_fields,
             max_batch_size,
+            max_media_bytes,
             sync_on_read,
             sync_on_write,
         )
@@ -1043,6 +1374,69 @@ class AnkiCollectionService:
     async def remove_note_tags(self, note_ids: list[int], tags: list[str]) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.remove_note_tags(note_ids, tags))
 
+    async def delete_notes(self, note_ids: list[int]) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.delete_notes(note_ids))
+
+    async def list_tags(self, offset: int, limit: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.list_tags(offset, limit))
+
+    async def rename_tag(self, old_name: str, new_name: str) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.rename_tag(old_name, new_name))
+
+    async def delete_tag(self, name: str) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.delete_tag(name))
+
+    async def list_note_types(self, offset: int, limit: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.list_note_types(offset, limit))
+
+    async def get_note_type(self, note_type_id: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.get_note_type(note_type_id))
+
+    async def create_note_type(
+        self,
+        name: str,
+        fields: list[str],
+        templates: list[dict[str, str]],
+        css: str,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.create_note_type(name, fields, templates, css)
+        )
+
+    async def update_note_type(
+        self,
+        note_type_id: int,
+        name: str,
+        fields: list[str],
+        templates: list[dict[str, str]],
+        css: str,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.update_note_type(note_type_id, name, fields, templates, css)
+        )
+
+    async def delete_note_type(self, note_type_id: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.delete_note_type(note_type_id))
+
+    async def list_media(self, offset: int, limit: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.list_media(offset, limit))
+
+    async def get_media(self, filename: str) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.get_media(filename))
+
+    async def store_media(self, filename: str, content_base64: str) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.store_media(filename, content_base64)
+        )
+
+    async def rename_media(self, old_filename: str, new_filename: str) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.rename_media(old_filename, new_filename)
+        )
+
+    async def delete_media(self, filename: str) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.delete_media(filename))
+
     async def search_cards(self, query: str, offset: int, limit: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.search_cards(query, offset, limit))
 
@@ -1072,9 +1466,14 @@ class AnkiCollectionService:
         return await self.executor.run(lambda adapter: adapter.unsuspend_cards(card_ids))
 
     async def coordinated_read(
-        self, read: Callable[[CollectionAdapter], T], sync_before: bool = False
+        self,
+        read: Callable[[CollectionAdapter], T],
+        sync_before: bool = False,
+        sync_media: bool = False,
     ) -> T:
-        return await self.executor.run(lambda adapter: adapter.coordinated_read(read, sync_before))
+        return await self.executor.run(
+            lambda adapter: adapter.coordinated_read(read, sync_before, sync_media)
+        )
 
     async def coordinated_mutation(
         self,
@@ -1082,10 +1481,11 @@ class AnkiCollectionService:
         idempotency_key: str,
         request: dict[str, Any],
         mutate: Callable[[CollectionAdapter], dict[str, Any]],
+        sync_media: bool = False,
     ) -> dict[str, Any]:
         return await self.executor.run(
             lambda adapter: adapter.coordinated_mutation(
-                operation, idempotency_key, request, mutate
+                operation, idempotency_key, request, mutate, sync_media
             )
         )
 

@@ -75,6 +75,8 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
         "anki_notes_update_fields",
         "anki_notes_add_tags",
         "anki_notes_remove_tags",
+        "anki_tags_list",
+        "anki_tags_rename",
         "anki_cards_search",
         "anki_cards_get",
         "anki_cards_create",
@@ -82,10 +84,22 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
         "anki_cards_change_deck",
         "anki_cards_suspend",
         "anki_cards_unsuspend",
+        "anki_note_types_list",
+        "anki_note_types_get",
+        "anki_media_list",
+        "anki_media_get",
+        "anki_media_store",
+        "anki_media_rename",
     ]
     assert all(tool["inputSchema"]["additionalProperties"] is False for tool in tools)
     assert "anki_decks_delete" not in names
     assert "anki_cards_delete" not in names
+    assert "anki_notes_delete" not in names
+    assert "anki_tags_delete" not in names
+    assert "anki_note_types_create" not in names
+    assert "anki_note_types_update" not in names
+    assert "anki_note_types_delete" not in names
+    assert "anki_media_delete" not in names
     assert "anki_sync_full_download" not in names
     assert "anki_sync_full_upload" not in names
 
@@ -121,8 +135,13 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
         "anki_decks_get",
         "anki_notes_search",
         "anki_notes_get",
+        "anki_tags_list",
         "anki_cards_search",
         "anki_cards_get",
+        "anki_note_types_list",
+        "anki_note_types_get",
+        "anki_media_list",
+        "anki_media_get",
     ]
 
     all_enabled = phase_settings.model_copy(
@@ -130,6 +149,7 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
             "scopes_csv": "read,write,admin,destructive",
             "allow_destructive": True,
             "allow_full_sync": True,
+            "allow_schema_changes": True,
         }
     )
     with TestClient(create_app(all_enabled)) as client:
@@ -160,6 +180,12 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
     all_names = [tool["name"] for tool in listed.json()["result"]["tools"]]
     assert "anki_decks_delete" in all_names
     assert "anki_cards_delete" in all_names
+    assert "anki_notes_delete" in all_names
+    assert "anki_tags_delete" in all_names
+    assert "anki_note_types_create" in all_names
+    assert "anki_note_types_update" in all_names
+    assert "anki_note_types_delete" in all_names
+    assert "anki_media_delete" in all_names
     assert "anki_sync_full_download" in all_names
     assert "anki_sync_full_upload" in all_names
 

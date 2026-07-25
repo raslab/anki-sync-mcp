@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 from anki.collection import Collection
@@ -32,6 +34,7 @@ def settings(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Settings:
     monkeypatch.setenv("MCP_SCOPES", "read,write,admin,destructive")
     monkeypatch.setenv("ANKI_ALLOW_DESTRUCTIVE", "true")
     monkeypatch.setenv("ANKI_ALLOW_FULL_SYNC", "true")
+    monkeypatch.setenv("ANKI_ALLOW_SCHEMA_CHANGES", "true")
     return Settings(_env_file=None)
 
 
@@ -207,6 +210,10 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_notes_update_fields",
         "anki_notes_add_tags",
         "anki_notes_remove_tags",
+        "anki_notes_delete",
+        "anki_tags_list",
+        "anki_tags_rename",
+        "anki_tags_delete",
         "anki_cards_search",
         "anki_cards_get",
         "anki_cards_create",
@@ -215,6 +222,16 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_cards_suspend",
         "anki_cards_unsuspend",
         "anki_cards_delete",
+        "anki_note_types_list",
+        "anki_note_types_get",
+        "anki_note_types_create",
+        "anki_note_types_update",
+        "anki_note_types_delete",
+        "anki_media_list",
+        "anki_media_get",
+        "anki_media_store",
+        "anki_media_rename",
+        "anki_media_delete",
     ]
     assert all(tool["inputSchema"]["additionalProperties"] is False for tool in tools)
     paginated = [tool for tool in tools if "limit" in tool["inputSchema"]["properties"]]
@@ -227,11 +244,15 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_sync_full_upload",
         "anki_decks_delete",
         "anki_cards_delete",
+        "anki_notes_delete",
+        "anki_tags_delete",
+        "anki_note_types_delete",
+        "anki_media_delete",
     ):
         assert by_name[name]["inputSchema"]["properties"]["confirm"]["type"] == "boolean"
 
 
-def test_deck_and_card_crud_tools_work_through_json_rpc(client: TestClient) -> None:
+def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) -> None:
     headers = {
         "Authorization": "Bearer correct-token",
         "Accept": "application/json, text/event-stream",
@@ -288,6 +309,93 @@ def test_deck_and_card_crud_tools_work_through_json_rpc(client: TestClient) -> N
     )
     card_deleted = call("anki_cards_delete", {"card_id": card_id, "confirm": True})
     deck_deleted = call("anki_decks_delete", {"deck_id": deck_id, "confirm": True})
+
+    note_type = call(
+        "anki_note_types_create",
+        {
+            "name": "Protocol Type",
+            "fields": ["Question", "Answer"],
+            "templates": [
+                {
+                    "name": "Card 1",
+                    "question_format": "{{Question}}",
+                    "answer_format": "{{Answer}}",
+                }
+            ],
+        },
+    )
+    note_type_id = note_type["result"]["id"]
+    assert call("anki_note_types_get", {"note_type_id": note_type_id})["name"] == "Protocol Type"
+    assert call("anki_note_types_list", {"limit": 100})["total"] >= 1
+    call(
+        "anki_note_types_update",
+        {
+            "note_type_id": note_type_id,
+            "name": "Protocol Type Updated",
+            "fields": ["Prompt", "Response"],
+            "templates": [
+                {
+                    "name": "Prompt Card",
+                    "question_format": "{{Prompt}}",
+                    "answer_format": "{{Response}}",
+                }
+            ],
+        },
+    )
+    resources_deck = call("anki_decks_create", {"name": "Resource CRUD"})
+    resources_deck_id = resources_deck["result"]["id"]
+    note = call(
+        "anki_notes_create",
+        {
+            "deck_id": resources_deck_id,
+            "note_type_id": note_type_id,
+            "fields": {"Prompt": "protocol note", "Response": "answer"},
+            "tags": ["protocol-old"],
+        },
+    )
+    note_id = note["result"]["note_id"]
+    assert call("anki_tags_list", {"limit": 100})["total"] >= 1
+    call("anki_tags_rename", {"old_name": "protocol-old", "new_name": "protocol-new"})
+    call("anki_tags_delete", {"name": "protocol-new", "confirm": True})
+    call("anki_notes_delete", {"note_ids": [note_id], "confirm": True})
+    call("anki_note_types_delete", {"note_type_id": note_type_id, "confirm": True})
+    call("anki_decks_delete", {"deck_id": resources_deck_id, "confirm": True})
+
+    encoded = base64.b64encode(b"protocol media").decode()
+    media = call(
+        "anki_media_store",
+        {"filename": "protocol.txt", "content_base64": encoded},
+    )
+    assert media["result"]["created"] is True
+    assert call("anki_media_list", {"limit": 100})["total"] == 1
+    assert call("anki_media_get", {"filename": "protocol.txt"})["content_base64"] == encoded
+    call(
+        "anki_media_rename",
+        {"old_filename": "protocol.txt", "new_filename": "renamed.txt"},
+    )
+    call("anki_media_delete", {"filename": "renamed.txt", "confirm": True})
+
+    media_sync_calls: list[bool] = []
+    collection_service = client.app.app.state.collection_service
+
+    def enable_media_sync_probe(adapter: Any) -> None:
+        adapter.sync_on_write = True
+        adapter._sync_or_raise_full_sync = lambda sync_media: (
+            media_sync_calls.append(sync_media) or {"required": "NO_CHANGES"}
+        )
+
+    collection_service.executor.submit(enable_media_sync_probe).result()
+    synced_media = call(
+        "anki_media_store",
+        {
+            "filename": "synced.txt",
+            "content_base64": base64.b64encode(b"sync me").decode(),
+        },
+    )
+    call("anki_media_get", {"filename": "synced.txt", "sync_before": True})
+    assert synced_media["remote_synced"] is True
+    assert synced_media["media_synced"] is True
+    assert media_sync_calls == [True, True, True]
 
     assert renamed["result"] == {"id": deck_id, "updated": True}
     assert deck["result"]["created"] is True
