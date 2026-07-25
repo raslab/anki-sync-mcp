@@ -194,8 +194,11 @@ class PersistentState:
                     receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
                 )
                 self.connection.execute(
-                    "update mutation_receipts set receipt_json = ? where idempotency_key = ?",
-                    (encoded, key),
+                    """
+                    update mutation_receipts set receipt_json = ?, updated_at = ?
+                    where idempotency_key = ?
+                    """,
+                    (encoded, datetime.now(UTC).isoformat(), key),
                 )
         self.connection.commit()
 
@@ -234,8 +237,11 @@ class PersistentState:
                     receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
                 )
                 self.connection.execute(
-                    "update mutation_receipts set receipt_json = ? where idempotency_key = ?",
-                    (encoded, key),
+                    """
+                    update mutation_receipts set receipt_json = ?, updated_at = ?
+                    where idempotency_key = ?
+                    """,
+                    (encoded, datetime.now(UTC).isoformat(), key),
                 )
         self.connection.commit()
 

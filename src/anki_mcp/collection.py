@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import threading
@@ -289,7 +290,9 @@ class CollectionAdapter:
                     {
                         "event": "anki_mutation",
                         "tool": operation,
-                        "idempotency_key": idempotency_key,
+                        "operation_id": hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[
+                            :16
+                        ],
                         "target_count": target_count,
                         "local_committed": receipt.get("local_committed"),
                         "remote_synced": receipt.get("remote_synced"),
@@ -1419,12 +1422,20 @@ class CollectionAdapter:
                 "added": str(status.progress.added),
                 "removed": str(status.progress.removed),
             }
+            if progress != self._media_sync_progress:
+                self._media_sync_progress = progress
+                self._save_operational_status()
             if not status.active:
                 self._last_media_sync_at = datetime.now(UTC).isoformat()
-                self._media_sync_progress = progress
                 self._save_operational_status()
                 return {"completed": True, **progress}
             if time.monotonic() >= deadline:
+                try:
+                    self.collection.abort_media_sync()
+                except Exception as exc:
+                    raise MediaSyncFailedError(
+                        "media synchronization timed out and could not be aborted"
+                    ) from exc
                 raise MediaSyncFailedError(
                     "media synchronization did not complete before the sync timeout"
                 )

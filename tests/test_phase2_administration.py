@@ -230,6 +230,51 @@ def test_legacy_receipts_get_timestamps_and_recent_updates_sort_first(tmp_path: 
     assert operations[0]["idempotency_key"] == "legacy"
 
 
+def test_full_sync_reconciliation_updates_operation_timestamps(tmp_path: Path) -> None:
+    state = PersistentState(tmp_path / "collection.anki2")
+    try:
+        state.put_receipt(
+            "upload",
+            "upload_operation",
+            "upload-hash",
+            {
+                "state": "committed",
+                "local_committed": True,
+                "remote_synced": False,
+                "media_synced": True,
+            },
+        )
+        upload_before = state.get_operation("upload")
+        assert upload_before is not None
+        time.sleep(0.001)
+        state.mark_all_remote_synced()
+        upload_after = state.get_operation("upload")
+        assert upload_after is not None
+        assert upload_after["updated_at"] > upload_before["updated_at"]
+
+        state.put_receipt(
+            "download",
+            "download_operation",
+            "download-hash",
+            {
+                "state": "committed",
+                "local_committed": True,
+                "remote_synced": False,
+                "media_synced": True,
+            },
+        )
+        download_before = state.get_operation("download")
+        assert download_before is not None
+        time.sleep(0.001)
+        state.mark_pending_discarded_by_full_download()
+        download_after = state.get_operation("download")
+    finally:
+        state.close()
+
+    assert download_after is not None
+    assert download_after["updated_at"] > download_before["updated_at"]
+
+
 @pytest.mark.anyio
 async def test_operation_status_and_metrics_survive_service_restart(
     phase2_collection: str,
@@ -310,6 +355,7 @@ async def test_media_sync_waits_for_completion_and_persists_progress(
 async def test_media_sync_timeout_preserves_persisted_sync_authentication(
     phase2_collection: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    aborts: list[bool] = []
     monkeypatch.setattr(
         Collection,
         "sync_login",
@@ -322,8 +368,11 @@ async def test_media_sync_timeout_preserves_persisted_sync_authentication(
     )
     monkeypatch.setattr(
         "anki._backend.RustBackend.media_sync_status",
-        lambda self: MediaSyncStatusResponse(active=True),
+        lambda self: MediaSyncStatusResponse(
+            active=True, progress=MediaSyncProgress(checked="5", added="2", removed="1")
+        ),
     )
+    monkeypatch.setattr(Collection, "abort_media_sync", lambda self: aborts.append(True))
 
     async with AnkiCollectionService(
         phase2_collection, max_page_size=100, sync_timeout_seconds=0.001
@@ -334,6 +383,8 @@ async def test_media_sync_timeout_preserves_persisted_sync_authentication(
         status = await service.status()
 
     assert status["authenticated"] is True
+    assert status["media_sync_progress"] == {"checked": "5", "added": "2", "removed": "1"}
+    assert aborts == [True]
 
 
 @pytest.mark.anyio
@@ -352,11 +403,13 @@ async def test_mutation_emits_content_free_structured_audit_event(
     event = json.loads(caplog.messages[-1])
     assert event["event"] == "anki_mutation"
     assert event["tool"] == "anki_decks_create"
-    assert event["idempotency_key"] == "audit-operation"
+    assert "idempotency_key" not in event
+    assert len(event["operation_id"]) == 16
     assert event["local_committed"] is True
     assert event["remote_synced"] is True
     assert event["duration_ms"] >= 0
     assert "sensitive deck content" not in caplog.text
+    assert "audit-operation" not in caplog.text
 
 
 @pytest.mark.anyio
