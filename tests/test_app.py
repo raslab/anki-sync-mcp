@@ -207,6 +207,7 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_decks_create",
         "anki_decks_update",
         "anki_decks_update_config",
+        "anki_decks_delete_preview",
         "anki_decks_delete",
         "anki_notes_search",
         "anki_notes_get",
@@ -215,9 +216,11 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_notes_update_fields",
         "anki_notes_add_tags",
         "anki_notes_remove_tags",
+        "anki_notes_delete_preview",
         "anki_notes_delete",
         "anki_tags_list",
         "anki_tags_rename",
+        "anki_tags_delete_preview",
         "anki_tags_delete",
         "anki_cards_search",
         "anki_cards_get",
@@ -228,9 +231,11 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_cards_unsuspend",
         "anki_cards_set_flag",
         "anki_cards_reposition",
+        "anki_cards_delete_preview",
         "anki_cards_delete",
         "anki_note_types_list",
         "anki_note_types_get",
+        "anki_note_types_change_preview",
         "anki_note_types_create",
         "anki_note_types_update",
         "anki_note_type_fields_update",
@@ -241,6 +246,7 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_media_check",
         "anki_media_store",
         "anki_media_rename",
+        "anki_media_delete_preview",
         "anki_media_delete",
     ]
     assert all(tool["inputSchema"]["additionalProperties"] is False for tool in tools)
@@ -252,6 +258,9 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     for name in (
         "anki_sync_full_download",
         "anki_sync_full_upload",
+    ):
+        assert by_name[name]["inputSchema"]["properties"]["confirm"]["type"] == "boolean"
+    for name in (
         "anki_decks_delete",
         "anki_cards_delete",
         "anki_notes_delete",
@@ -259,7 +268,7 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_note_types_delete",
         "anki_media_delete",
     ):
-        assert by_name[name]["inputSchema"]["properties"]["confirm"]["type"] == "boolean"
+        assert by_name[name]["inputSchema"]["properties"]["confirmation_token"]["type"] == "string"
 
 
 def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -> None:
@@ -334,6 +343,18 @@ def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -
             "idempotency_key": "phase2-reposition",
         },
     )
+    fields_preview = call(
+        "anki_note_types_change_preview",
+        {
+            "operation": "fields_update",
+            "note_type_id": note_type_id,
+            "field_mappings": [
+                {"name": "Back", "source_ordinal": 1},
+                {"name": "Hint", "source_ordinal": None},
+                {"name": "Front", "source_ordinal": 0},
+            ],
+        },
+    )
     fields = call(
         "anki_note_type_fields_update",
         {
@@ -343,7 +364,23 @@ def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -
                 {"name": "Hint", "source_ordinal": None},
                 {"name": "Front", "source_ordinal": 0},
             ],
+            "confirmation_token": fields_preview["confirmation_token"],
             "idempotency_key": "phase2-fields",
+        },
+    )
+    templates_preview = call(
+        "anki_note_types_change_preview",
+        {
+            "operation": "templates_update",
+            "note_type_id": note_type_id,
+            "template_mappings": [
+                {
+                    "name": "Card 1",
+                    "source_ordinal": 0,
+                    "question_format": "{{Front}}",
+                    "answer_format": "{{FrontSide}}<hr id=answer>{{Back}}",
+                }
+            ],
         },
     )
     templates = call(
@@ -358,6 +395,7 @@ def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -
                     "answer_format": "{{FrontSide}}<hr id=answer>{{Back}}",
                 }
             ],
+            "confirmation_token": templates_preview["confirmation_token"],
             "idempotency_key": "phase2-templates",
         },
     )
@@ -432,9 +470,26 @@ def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) 
         "anki_cards_update",
         {"card_id": card_id, "front": "new question", "back": "new answer"},
     )
-    card_deleted = call("anki_cards_delete", {"card_id": card_id, "confirm": True})
-    deck_deleted = call("anki_decks_delete", {"deck_id": deck_id, "confirm": True})
+    card_token = call("anki_cards_delete_preview", {"card_id": card_id})["confirmation_token"]
+    card_deleted = call("anki_cards_delete", {"card_id": card_id, "confirmation_token": card_token})
+    deck_token = call("anki_decks_delete_preview", {"deck_id": deck_id})["confirmation_token"]
+    deck_deleted = call("anki_decks_delete", {"deck_id": deck_id, "confirmation_token": deck_token})
 
+    create_token = call(
+        "anki_note_types_change_preview",
+        {
+            "operation": "create",
+            "name": "Protocol Type",
+            "fields": ["Question", "Answer"],
+            "templates": [
+                {
+                    "name": "Card 1",
+                    "question_format": "{{Question}}",
+                    "answer_format": "{{Answer}}",
+                }
+            ],
+        },
+    )["confirmation_token"]
     note_type = call(
         "anki_note_types_create",
         {
@@ -447,11 +502,28 @@ def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) 
                     "answer_format": "{{Answer}}",
                 }
             ],
+            "confirmation_token": create_token,
         },
     )
     note_type_id = note_type["result"]["id"]
     assert call("anki_note_types_get", {"note_type_id": note_type_id})["name"] == "Protocol Type"
     assert call("anki_note_types_list", {"limit": 100})["total"] >= 1
+    update_token = call(
+        "anki_note_types_change_preview",
+        {
+            "operation": "update",
+            "note_type_id": note_type_id,
+            "name": "Protocol Type Updated",
+            "fields": ["Prompt", "Response"],
+            "templates": [
+                {
+                    "name": "Prompt Card",
+                    "question_format": "{{Prompt}}",
+                    "answer_format": "{{Response}}",
+                }
+            ],
+        },
+    )["confirmation_token"]
     call(
         "anki_note_types_update",
         {
@@ -465,6 +537,7 @@ def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) 
                     "answer_format": "{{Response}}",
                 }
             ],
+            "confirmation_token": update_token,
         },
     )
     resources_deck = call("anki_decks_create", {"name": "Resource CRUD"})
@@ -481,10 +554,25 @@ def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) 
     note_id = note["result"]["note_id"]
     assert call("anki_tags_list", {"limit": 100})["total"] >= 1
     call("anki_tags_rename", {"old_name": "protocol-old", "new_name": "protocol-new"})
-    call("anki_tags_delete", {"name": "protocol-new", "confirm": True})
-    call("anki_notes_delete", {"note_ids": [note_id], "confirm": True})
-    call("anki_note_types_delete", {"note_type_id": note_type_id, "confirm": True})
-    call("anki_decks_delete", {"deck_id": resources_deck_id, "confirm": True})
+    tag_token = call("anki_tags_delete_preview", {"name": "protocol-new"})["confirmation_token"]
+    call("anki_tags_delete", {"name": "protocol-new", "confirmation_token": tag_token})
+    note_token = call("anki_notes_delete_preview", {"note_ids": [note_id]})["confirmation_token"]
+    call("anki_notes_delete", {"note_ids": [note_id], "confirmation_token": note_token})
+    type_token = call(
+        "anki_note_types_change_preview",
+        {"operation": "delete", "note_type_id": note_type_id},
+    )["confirmation_token"]
+    call(
+        "anki_note_types_delete",
+        {"note_type_id": note_type_id, "confirmation_token": type_token},
+    )
+    resource_deck_token = call("anki_decks_delete_preview", {"deck_id": resources_deck_id})[
+        "confirmation_token"
+    ]
+    call(
+        "anki_decks_delete",
+        {"deck_id": resources_deck_id, "confirmation_token": resource_deck_token},
+    )
 
     encoded = base64.b64encode(b"protocol media").decode()
     media = call(
@@ -498,7 +586,13 @@ def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) 
         "anki_media_rename",
         {"old_filename": "protocol.txt", "new_filename": "renamed.txt"},
     )
-    call("anki_media_delete", {"filename": "renamed.txt", "confirm": True})
+    media_token = call("anki_media_delete_preview", {"filename": "renamed.txt"})[
+        "confirmation_token"
+    ]
+    call(
+        "anki_media_delete",
+        {"filename": "renamed.txt", "confirmation_token": media_token},
+    )
 
     media_sync_calls: list[bool] = []
     collection_service = client.app.app.state.collection_service
@@ -660,6 +754,58 @@ def test_sync_failures_have_safe_machine_readable_codes(
     assert "secret" not in payload["message"]
 
 
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("anki_cards_set_flag", {"card_ids": [1], "flag": 8}),
+        ("anki_cards_reposition", {"card_ids": [1], "starting_from": 0}),
+        ("anki_cards_set_flag", {"card_ids": [1], "flag": 1, "unexpected": True}),
+    ],
+)
+def test_argument_validation_has_stable_machine_readable_error(
+    client: TestClient, name: str, arguments: dict[str, object]
+) -> None:
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    initialized = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1"},
+            },
+        },
+    )
+    headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+    response = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
+    )
+
+    result = response.json()["result"]
+    text = result["content"][0]["text"]
+    payload = json.loads(text[text.index("{") :])
+    assert result["isError"] is True
+    assert payload["code"] == "INVALID_ARGUMENT"
+    assert payload["message"] == "tool arguments failed validation"
+    assert payload["correlation_id"]
+    assert "pydantic.dev" not in text
+    assert "unexpected" not in text
+
+
 def test_media_sync_timeout_has_stable_error_and_preserves_authentication(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -774,9 +920,6 @@ def test_sync_login_rejects_an_unconfigured_username_before_contacting_remote(
 @pytest.mark.parametrize(
     ("tool", "arguments"),
     [
-        ("anki_decks_delete", {"deck_id": 1, "confirm": 1}),
-        ("anki_decks_delete", {"deck_id": 1, "confirm": "true"}),
-        ("anki_cards_delete", {"card_id": 1, "confirm": 1}),
         ("anki_sync", {"sync_media": 1}),
         ("anki_sync_full_download", {"confirm": 1}),
         ("anki_sync_full_upload", {"confirm": "true"}),
@@ -816,7 +959,7 @@ def test_boolean_tool_inputs_are_strict(
     )
     result = response.json()["result"]
     assert result["isError"] is True
-    assert "validation error" in result["content"][0]["text"].lower()
+    assert json.loads(result["content"][0]["text"])["code"] == "INVALID_ARGUMENT"
 
 
 @pytest.mark.parametrize(
@@ -863,7 +1006,7 @@ def test_tool_ids_and_strings_are_runtime_bounded(
     )
     result = response.json()["result"]
     assert result["isError"] is True
-    assert "validation error" in result["content"][0]["text"].lower()
+    assert json.loads(result["content"][0]["text"])["code"] == "INVALID_ARGUMENT"
 
 
 def test_mcp_request_body_budget_is_enforced(settings: Settings) -> None:

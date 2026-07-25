@@ -3,14 +3,23 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Annotated, Any, NoReturn, TypeVar
+from typing import Annotated, Any, Literal, NoReturn, TypeVar
 from uuid import uuid4
 
 from anki.errors import NetworkError, SyncError, SyncErrorKind
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, StrictStr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+)
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -28,6 +37,7 @@ from anki_mcp.collection import (
     SyncLoginRequiredError,
 )
 from anki_mcp.config import Settings
+from anki_mcp.guard import ConfirmationRegistry
 
 T = TypeVar("T")
 Offset = StrictInt
@@ -51,6 +61,10 @@ DailyLimit = Annotated[StrictInt, Field(ge=0, le=999_999)]
 Retention = Annotated[StrictFloat, Field(ge=0.7, le=0.99)]
 Tags = Annotated[list[Tag], Field(max_length=100)]
 NoteFields = dict[Annotated[StrictStr, Field(min_length=1, max_length=512)], CardText]
+ConfirmationToken = Annotated[StrictStr, Field(min_length=1, max_length=256)]
+SchemaChangeOperation = Literal["create", "update", "fields_update", "templates_update", "delete"]
+ReviewRating = Annotated[StrictInt, Field(ge=1, le=4)]
+AnswerSeconds = Annotated[StrictInt, Field(ge=0, le=86_400)]
 
 
 class NoteCreateInput(BaseModel):
@@ -91,6 +105,10 @@ class ResponseTooLargeError(RuntimeError):
     """Raised when a tool result exceeds the configured serialized response budget."""
 
 
+class ConfirmationRequiredError(ValueError):
+    """Raised when a guarded operation lacks a valid preview token."""
+
+
 def create_app(settings: Settings) -> ASGIApp:
     """Create the complete ASGI application and MCP registry."""
 
@@ -118,6 +136,7 @@ def create_app(settings: Settings) -> ASGIApp:
         ),
     )
     registered_tool_names: list[str] = []
+    confirmations = ConfirmationRegistry(settings.confirmation_ttl_seconds)
 
     def scoped_tool(
         name: str, scope: str, *, enabled: bool = True
@@ -156,6 +175,8 @@ def create_app(settings: Settings) -> ASGIApp:
             raise_tool_error("FULL_SYNC_REQUIRED", str(exc), exc)
         except LookupError as exc:
             raise_tool_error("NOT_FOUND", str(exc), exc)
+        except ConfirmationRequiredError as exc:
+            raise_tool_error("DESTRUCTIVE_CONFIRMATION_REQUIRED", str(exc), exc)
         except ValueError as exc:
             raise_tool_error("INVALID_ARGUMENT", str(exc), exc)
         except SyncLoginRequiredError as exc:
@@ -186,6 +207,54 @@ def create_app(settings: Settings) -> ASGIApp:
         if not isinstance(result, dict):  # pragma: no cover - coordinator always returns a receipt
             raise RuntimeError("mutation coordinator returned an invalid receipt")
         return result
+
+    async def preview(
+        operation: str,
+        request: dict[str, Any],
+        function: Callable[[CollectionAdapter], dict[str, Any]],
+    ) -> dict[str, Any]:
+        impact = await execute(service.coordinated_read(function))
+        if not isinstance(impact, dict):  # pragma: no cover - previews always return mappings
+            raise RuntimeError("impact preview returned an invalid result")
+        return {
+            "operation": operation,
+            "impact": impact,
+            "confirmation_token": confirmations.issue(
+                operation, {"request": request, "impact": impact}
+            ),
+            "expires_in_seconds": settings.confirmation_ttl_seconds,
+        }
+
+    async def guarded_mutate(
+        operation: str,
+        idempotency_key: str | None,
+        request: dict[str, Any],
+        confirmation_token: str,
+        guard_request: dict[str, Any],
+        preview_function: Callable[[CollectionAdapter], dict[str, Any]],
+        function: Callable[[CollectionAdapter], dict[str, Any]],
+        *,
+        sync_media: bool = False,
+    ) -> dict[str, Any]:
+        def guarded(adapter: CollectionAdapter) -> dict[str, Any]:
+            current_impact = preview_function(adapter)
+            try:
+                confirmations.consume(
+                    confirmation_token,
+                    operation,
+                    {"request": guard_request, "impact": current_impact},
+                )
+            except ValueError as exc:
+                raise ConfirmationRequiredError(str(exc)) from exc
+            return adapter.backup_before(lambda: function(adapter))
+
+        return await mutate(
+            operation,
+            idempotency_key,
+            request,
+            guarded,
+            sync_media=sync_media,
+        )
 
     @scoped_tool(name="anki_status", scope="read")
     async def status() -> dict[str, Any]:
@@ -329,23 +398,36 @@ def create_app(settings: Settings) -> ASGIApp:
         )
 
     @scoped_tool(
+        name="anki_decks_delete_preview",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def decks_delete_preview(deck_id: StableId) -> dict[str, Any]:
+        """Preview the decks, cards, and notes affected by a deck deletion."""
+        request = {"deck_id": deck_id}
+        return await preview(
+            "anki_decks_delete", request, lambda adapter: adapter.preview_deck_delete(deck_id)
+        )
+
+    @scoped_tool(
         name="anki_decks_delete",
         scope="destructive",
         enabled=settings.allow_destructive,
     )
     async def decks_delete(
         deck_id: StableId,
-        confirm: Confirmation = False,
+        confirmation_token: ConfirmationToken,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Delete a deck and its cards when confirm is explicitly true."""
-        if not confirm:
-            cause = ValueError("confirm must be true for deck deletion")
-            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
-        return await mutate(
+        """Delete a deck after a matching impact preview and required backup."""
+        request = {"deck_id": deck_id}
+        return await guarded_mutate(
             "anki_decks_delete",
             idempotency_key,
-            {"deck_id": deck_id, "confirm": confirm},
+            request,
+            confirmation_token,
+            request,
+            lambda adapter: adapter.preview_deck_delete(deck_id),
             lambda adapter: adapter.delete_deck(deck_id),
         )
 
@@ -452,23 +534,36 @@ def create_app(settings: Settings) -> ASGIApp:
         )
 
     @scoped_tool(
+        name="anki_notes_delete_preview",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def notes_delete_preview(note_ids: StableIds) -> dict[str, Any]:
+        """Preview the notes and generated cards affected by note deletion."""
+        request = {"note_ids": note_ids}
+        return await preview(
+            "anki_notes_delete", request, lambda adapter: adapter.preview_notes_delete(note_ids)
+        )
+
+    @scoped_tool(
         name="anki_notes_delete",
         scope="destructive",
         enabled=settings.allow_destructive,
     )
     async def notes_delete(
         note_ids: StableIds,
-        confirm: Confirmation = False,
+        confirmation_token: ConfirmationToken,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Delete notes and all generated cards when confirm is explicitly true."""
-        if not confirm:
-            cause = ValueError("confirm must be true for note deletion")
-            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
-        return await mutate(
+        """Delete notes after a matching impact preview and required backup."""
+        request = {"note_ids": note_ids}
+        return await guarded_mutate(
             "anki_notes_delete",
             idempotency_key,
-            {"note_ids": note_ids, "confirm": confirm},
+            request,
+            confirmation_token,
+            request,
+            lambda adapter: adapter.preview_notes_delete(note_ids),
             lambda adapter: adapter.delete_notes(note_ids),
         )
 
@@ -498,23 +593,36 @@ def create_app(settings: Settings) -> ASGIApp:
         )
 
     @scoped_tool(
+        name="anki_tags_delete_preview",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def tags_delete_preview(name: Tag) -> dict[str, Any]:
+        """Preview how many notes will lose a collection tag."""
+        request = {"name": name}
+        return await preview(
+            "anki_tags_delete", request, lambda adapter: adapter.preview_tag_delete(name)
+        )
+
+    @scoped_tool(
         name="anki_tags_delete",
         scope="destructive",
         enabled=settings.allow_destructive,
     )
     async def tags_delete(
         name: Tag,
-        confirm: Confirmation = False,
+        confirmation_token: ConfirmationToken,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Remove a tag from every note when confirm is explicitly true."""
-        if not confirm:
-            cause = ValueError("confirm must be true for tag deletion")
-            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
-        return await mutate(
+        """Remove a tag after a matching impact preview and required backup."""
+        request = {"name": name}
+        return await guarded_mutate(
             "anki_tags_delete",
             idempotency_key,
-            {"name": name, "confirm": confirm},
+            request,
+            confirmation_token,
+            request,
+            lambda adapter: adapter.preview_tag_delete(name),
             lambda adapter: adapter.delete_tag(name),
         )
 
@@ -650,23 +758,55 @@ def create_app(settings: Settings) -> ASGIApp:
         )
 
     @scoped_tool(
+        name="anki_cards_answer",
+        scope="admin",
+        enabled=settings.allow_review_answers,
+    )
+    async def cards_answer(
+        card_id: StableId,
+        rating: ReviewRating,
+        answer_seconds: AnswerSeconds = 0,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Record a real review answer when explicitly enabled by the operator."""
+        return await mutate(
+            "anki_cards_answer",
+            idempotency_key,
+            {"card_id": card_id, "rating": rating, "answer_seconds": answer_seconds},
+            lambda adapter: adapter.answer_card(card_id, rating, answer_seconds),
+        )
+
+    @scoped_tool(
+        name="anki_cards_delete_preview",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def cards_delete_preview(card_id: StableId) -> dict[str, Any]:
+        """Preview card deletion and whether its orphaned note will also be deleted."""
+        request = {"card_id": card_id}
+        return await preview(
+            "anki_cards_delete", request, lambda adapter: adapter.preview_card_delete(card_id)
+        )
+
+    @scoped_tool(
         name="anki_cards_delete",
         scope="destructive",
         enabled=settings.allow_destructive,
     )
     async def cards_delete(
         card_id: StableId,
-        confirm: Confirmation = False,
+        confirmation_token: ConfirmationToken,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Delete one card and any orphaned note when confirm is explicitly true."""
-        if not confirm:
-            cause = ValueError("confirm must be true for card deletion")
-            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
-        return await mutate(
+        """Delete one card after a matching impact preview and required backup."""
+        request = {"card_id": card_id}
+        return await guarded_mutate(
             "anki_cards_delete",
             idempotency_key,
-            {"card_id": card_id, "confirm": confirm},
+            request,
+            confirmation_token,
+            request,
+            lambda adapter: adapter.preview_card_delete(card_id),
             lambda adapter: adapter.delete_card(card_id),
         )
 
@@ -695,41 +835,175 @@ def create_app(settings: Settings) -> ASGIApp:
         )
 
     @scoped_tool(
+        name="anki_note_types_change_preview",
+        scope="admin",
+        enabled=settings.allow_schema_changes and settings.allow_full_sync,
+    )
+    async def note_types_change_preview(
+        operation: SchemaChangeOperation,
+        note_type_id: StableId | None = None,
+        name: ResourceName | None = None,
+        fields: list[ResourceName] | None = None,
+        templates: list[NoteTypeTemplateInput] | None = None,
+        css: CardText = "",
+        field_mappings: FieldMappings | None = None,
+        template_mappings: TemplateMappings | None = None,
+    ) -> dict[str, Any]:
+        """Preview an exact proposed schema mutation and issue a maintenance token."""
+        operation_names = {
+            "create": "anki_note_types_create",
+            "update": "anki_note_types_update",
+            "fields_update": "anki_note_type_fields_update",
+            "templates_update": "anki_templates_update",
+            "delete": "anki_note_types_delete",
+        }
+        template_values = (
+            [template.model_dump() for template in templates] if templates is not None else None
+        )
+        field_mapping_values = (
+            [mapping.model_dump() for mapping in field_mappings]
+            if field_mappings is not None
+            else None
+        )
+        template_mapping_values = (
+            [mapping.model_dump() for mapping in template_mappings]
+            if template_mappings is not None
+            else None
+        )
+        if operation == "create":
+            if (
+                note_type_id is not None
+                or name is None
+                or fields is None
+                or template_values is None
+                or field_mapping_values is not None
+                or template_mapping_values is not None
+            ):
+                cause = ValueError("create preview requires only name, fields, templates, and css")
+                raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+            mutation_request = {
+                "name": name,
+                "fields": fields,
+                "templates": template_values,
+                "css": css,
+            }
+        elif operation == "update":
+            if (
+                note_type_id is None
+                or name is None
+                or fields is None
+                or template_values is None
+                or field_mapping_values is not None
+                or template_mapping_values is not None
+            ):
+                cause = ValueError(
+                    "update preview requires note_type_id, name, fields, templates, and css"
+                )
+                raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+            mutation_request = {
+                "note_type_id": note_type_id,
+                "name": name,
+                "fields": fields,
+                "templates": template_values,
+                "css": css,
+            }
+        elif operation == "fields_update":
+            if (
+                note_type_id is None
+                or field_mapping_values is None
+                or name is not None
+                or fields is not None
+                or template_values is not None
+                or template_mapping_values is not None
+                or css
+            ):
+                cause = ValueError(
+                    "fields_update preview requires only note_type_id and field_mappings"
+                )
+                raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+            mutation_request = {
+                "note_type_id": note_type_id,
+                "mappings": field_mapping_values,
+            }
+        elif operation == "templates_update":
+            if (
+                note_type_id is None
+                or template_mapping_values is None
+                or name is not None
+                or fields is not None
+                or template_values is not None
+                or field_mapping_values is not None
+                or css
+            ):
+                cause = ValueError(
+                    "templates_update preview requires only note_type_id and template_mappings"
+                )
+                raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+            mutation_request = {
+                "note_type_id": note_type_id,
+                "mappings": template_mapping_values,
+            }
+        else:
+            if (
+                note_type_id is None
+                or name is not None
+                or fields is not None
+                or template_values is not None
+                or field_mapping_values is not None
+                or template_mapping_values is not None
+                or css
+            ):
+                cause = ValueError("delete preview requires only note_type_id")
+                raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+            mutation_request = {"note_type_id": note_type_id}
+        guard_request = {"operation": operation, "request": mutation_request}
+        return await preview(
+            operation_names[operation],
+            guard_request,
+            lambda adapter: adapter.preview_note_type_change(operation, note_type_id),
+        )
+
+    @scoped_tool(
         name="anki_note_types_create",
         scope="admin",
-        enabled=settings.allow_schema_changes,
+        enabled=settings.allow_schema_changes and settings.allow_full_sync,
     )
     async def note_types_create(
         name: ResourceName,
         fields: list[ResourceName],
         templates: list[NoteTypeTemplateInput],
+        confirmation_token: ConfirmationToken,
         css: CardText = "",
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Create a standard note type when schema changes are explicitly enabled."""
+        """Create a note type after preview, backup, and full-sync maintenance gating."""
         template_values = [template.model_dump() for template in templates]
         request = {"name": name, "fields": fields, "templates": template_values, "css": css}
-        return await mutate(
+        return await guarded_mutate(
             "anki_note_types_create",
             idempotency_key,
             request,
+            confirmation_token,
+            {"operation": "create", "request": request},
+            lambda adapter: adapter.preview_note_type_change("create", None),
             lambda adapter: adapter.create_note_type(name, fields, template_values, css),
         )
 
     @scoped_tool(
         name="anki_note_types_update",
         scope="admin",
-        enabled=settings.allow_schema_changes,
+        enabled=settings.allow_schema_changes and settings.allow_full_sync,
     )
     async def note_types_update(
         note_type_id: StableId,
         name: ResourceName,
         fields: list[ResourceName],
         templates: list[NoteTypeTemplateInput],
+        confirmation_token: ConfirmationToken,
         css: CardText = "",
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Replace note-type names, formats, and CSS while preserving field/template counts."""
+        """Replace note-type data after guarded full-sync maintenance approval."""
         template_values = [template.model_dump() for template in templates]
         request = {
             "note_type_id": note_type_id,
@@ -738,10 +1012,13 @@ def create_app(settings: Settings) -> ASGIApp:
             "templates": template_values,
             "css": css,
         }
-        return await mutate(
+        return await guarded_mutate(
             "anki_note_types_update",
             idempotency_key,
             request,
+            confirmation_token,
+            {"operation": "update", "request": request},
+            lambda adapter: adapter.preview_note_type_change("update", note_type_id),
             lambda adapter: adapter.update_note_type(
                 note_type_id, name, fields, template_values, css
             ),
@@ -750,59 +1027,74 @@ def create_app(settings: Settings) -> ASGIApp:
     @scoped_tool(
         name="anki_note_type_fields_update",
         scope="admin",
-        enabled=settings.allow_schema_changes,
+        enabled=settings.allow_schema_changes and settings.allow_full_sync,
     )
     async def note_type_fields_update(
         note_type_id: StableId,
         mappings: FieldMappings,
+        confirmation_token: ConfirmationToken,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Add, remove, rename, and reorder fields using explicit source mappings."""
+        """Change fields after guarded full-sync maintenance approval."""
         mapping_values = [mapping.model_dump() for mapping in mappings]
-        return await mutate(
+        request = {"note_type_id": note_type_id, "mappings": mapping_values}
+        return await guarded_mutate(
             "anki_note_type_fields_update",
             idempotency_key,
-            {"note_type_id": note_type_id, "mappings": mapping_values},
+            request,
+            confirmation_token,
+            {"operation": "fields_update", "request": request},
+            lambda adapter: adapter.preview_note_type_change("fields_update", note_type_id),
             lambda adapter: adapter.update_note_type_fields(note_type_id, mapping_values),
         )
 
     @scoped_tool(
         name="anki_templates_update",
         scope="admin",
-        enabled=settings.allow_schema_changes,
+        enabled=settings.allow_schema_changes and settings.allow_full_sync,
     )
     async def templates_update(
         note_type_id: StableId,
         mappings: TemplateMappings,
+        confirmation_token: ConfirmationToken,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Add, remove, update, and reorder templates using explicit source mappings."""
+        """Change templates after guarded full-sync maintenance approval."""
         mapping_values = [mapping.model_dump() for mapping in mappings]
-        return await mutate(
+        request = {"note_type_id": note_type_id, "mappings": mapping_values}
+        return await guarded_mutate(
             "anki_templates_update",
             idempotency_key,
-            {"note_type_id": note_type_id, "mappings": mapping_values},
+            request,
+            confirmation_token,
+            {"operation": "templates_update", "request": request},
+            lambda adapter: adapter.preview_note_type_change("templates_update", note_type_id),
             lambda adapter: adapter.update_templates(note_type_id, mapping_values),
         )
 
     @scoped_tool(
         name="anki_note_types_delete",
         scope="destructive",
-        enabled=settings.allow_destructive and settings.allow_schema_changes,
+        enabled=(
+            settings.allow_destructive
+            and settings.allow_schema_changes
+            and settings.allow_full_sync
+        ),
     )
     async def note_types_delete(
         note_type_id: StableId,
-        confirm: Confirmation = False,
+        confirmation_token: ConfirmationToken,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Delete a note type and its notes/cards after safety gates and confirmation."""
-        if not confirm:
-            cause = ValueError("confirm must be true for note type deletion")
-            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
-        return await mutate(
+        """Delete a note type after preview, backup, and full-sync maintenance gating."""
+        request = {"note_type_id": note_type_id}
+        return await guarded_mutate(
             "anki_note_types_delete",
             idempotency_key,
-            {"note_type_id": note_type_id, "confirm": confirm},
+            request,
+            confirmation_token,
+            {"operation": "delete", "request": request},
+            lambda adapter: adapter.preview_note_type_change("delete", note_type_id),
             lambda adapter: adapter.delete_note_type(note_type_id),
         )
 
@@ -876,23 +1168,36 @@ def create_app(settings: Settings) -> ASGIApp:
         )
 
     @scoped_tool(
+        name="anki_media_delete_preview",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def media_delete_preview(filename: MediaFilename) -> dict[str, Any]:
+        """Preview the bounded media file that will be moved to Anki's trash."""
+        request = {"filename": filename}
+        return await preview(
+            "anki_media_delete", request, lambda adapter: adapter.preview_media_delete(filename)
+        )
+
+    @scoped_tool(
         name="anki_media_delete",
         scope="destructive",
         enabled=settings.allow_destructive,
     )
     async def media_delete(
         filename: MediaFilename,
-        confirm: Confirmation = False,
+        confirmation_token: ConfirmationToken,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Move one media file to Anki's trash when confirmation is true."""
-        if not confirm:
-            cause = ValueError("confirm must be true for media deletion")
-            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
-        return await mutate(
+        """Move media to trash after a matching impact preview and required backup."""
+        request = {"filename": filename}
+        return await guarded_mutate(
             "anki_media_delete",
             idempotency_key,
-            {"filename": filename, "confirm": confirm},
+            request,
+            confirmation_token,
+            request,
+            lambda adapter: adapter.preview_media_delete(filename),
             lambda adapter: adapter.delete_media(filename),
             sync_media=True,
         )
@@ -919,6 +1224,29 @@ def create_app(settings: Settings) -> ASGIApp:
             id_schema = properties.get(id_name)
             if id_schema is not None:
                 id_schema["minimum"] = 1
+
+    original_call_tool = mcp._tool_manager.call_tool  # pyright: ignore[reportPrivateUsage]
+
+    async def call_tool_with_stable_validation_errors(
+        name: str,
+        arguments: dict[str, Any],
+        context: Any = None,
+        convert_result: bool = False,
+    ) -> Any:
+        try:
+            return await original_call_tool(
+                name, arguments, context=context, convert_result=convert_result
+            )
+        except ToolError as exc:
+            if isinstance(exc.__cause__, ValidationError):
+                raise_tool_error(
+                    "INVALID_ARGUMENT", "tool arguments failed validation", exc.__cause__
+                )
+            raise
+
+    mcp._tool_manager.call_tool = (  # pyright: ignore[reportPrivateUsage]
+        call_tool_with_stable_validation_errors
+    )
 
     mcp_app = mcp.streamable_http_app()
 
