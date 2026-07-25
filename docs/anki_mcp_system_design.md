@@ -520,18 +520,23 @@ second client's full download, and a subsequent normal synchronized write/read l
 - Keep all new mutations inside the durable synchronized/idempotent coordinator and cover every
   exposed tool through real MCP JSON-RPC calls against disposable official Anki collections.
 
-### Remaining Phase 2: complete non-destructive administration
+### Delivered Phase 2: complete non-destructive administration
 
-- Add deck configuration updates and advanced field/template add, remove, and reorder mappings.
-- Add card flags, repositioning, and bounded bulk operations.
-- Add media consistency checking and media-sync completion tracking.
-- Add operation-status APIs and reporting over the durable coordinator state delivered in Phase 1,
-  structured audit events, metrics, backup/restore smoke tests, and container persistent-restart
-  tests.
+- Added deck configuration updates and schema-gated explicit field/template add, remove, rename,
+  update, and reorder mappings.
+- Added bounded card flag and new-card repositioning operations.
+- Added media consistency checking and backend-confirmed media-sync completion tracking that
+  persists progress and preserves sync authentication on timeout.
+- Added paginated operation-status APIs over durable receipts, content-free mutation metrics,
+  structured audit events, native backup/restore coverage, and persistent-restart coverage for the
+  application lifecycle and Compose data volume.
+- Covered every new collection operation through disposable official Anki collections and every
+  exposed tool through authenticated MCP JSON-RPC calls.
 
 ### Phase 3: guarded advanced administration
 
-- Add note-type, field, template, and CSS mutations behind `ANKI_ALLOW_SCHEMA_CHANGES`.
+- Harden schema mutations already gated by `ANKI_ALLOW_SCHEMA_CHANGES` with impact previews,
+  required backups, and explicit full-sync maintenance handling.
 - Replace provisional confirmation-only deletion with impact previews, short-lived confirmation
   tokens, backups where required, feature-gated registration, and tests proving rejected operations
   leave the collection unchanged.

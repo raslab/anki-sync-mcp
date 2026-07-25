@@ -15,13 +15,16 @@ Endpoint: `http://<host>:8000/mcp`
 
 | Tools | Scope | Purpose |
 | --- | --- | --- |
-| `anki_status` | read | Report package, collection, authentication, last-sync, pending mutation, and pending full-sync state. |
+| `anki_status` | read | Report package, collection, authentication, collection/media sync, pending mutation, and pending full-sync state. |
+| `anki_operations_list`, `anki_operations_get` | read | Inspect bounded durable mutation receipts, timestamps, and retry state. |
+| `anki_metrics` | read | Report content-free durable mutation counts and synchronization state. |
 | `anki_sync_login` | admin | Authenticate and persist the sync host key. |
 | `anki_sync` | write | Synchronize collection changes and optionally media. |
-| `anki_backup_create` | admin | Request an explicit persistent local backup. |
+| `anki_backup_create` | admin | Create an explicit persistent `.colpkg` backup and return its path. |
 | `anki_sync_full_download`, `anki_sync_full_upload` | admin + flag | Perform a confirmed, server-requested full sync in the operator-selected direction. |
 | `anki_decks_list`, `anki_decks_get` | read | Read bounded deck metadata by stable IDs. |
 | `anki_decks_create`, `anki_decks_update` | write | Create or rename decks through durable mutation receipts. |
+| `anki_decks_update_config` | admin | Update bounded daily limits, answer time, and desired retention. |
 | `anki_decks_delete` | destructive + flag | Delete a deck and its cards with `confirm=true`. |
 | `anki_notes_search`, `anki_notes_get` | read | Search and read arbitrary note types with bounded fields and stable IDs. |
 | `anki_notes_create`, `anki_notes_create_batch` | write | Duplicate-checked, field-validated, idempotent note creation. Batches are bounded and atomic. |
@@ -33,12 +36,14 @@ Endpoint: `http://<host>:8000/mcp`
 | `anki_tags_delete` | destructive + flag | Remove a tag from every note with `confirm=true`. |
 | `anki_cards_search`, `anki_cards_get` | read | Search and read rendered card and scheduling state. |
 | `anki_cards_create`, `anki_cards_update` | write | Compatibility workflows for built-in single-card Basic notes. |
-| `anki_cards_change_deck`, `anki_cards_suspend`, `anki_cards_unsuspend` | write | Control arbitrary supported cards by stable IDs. |
+| `anki_cards_change_deck`, `anki_cards_suspend`, `anki_cards_unsuspend`, `anki_cards_set_flag` | write | Apply bounded controls to arbitrary supported cards by stable IDs. |
+| `anki_cards_reposition` | admin | Reposition bounded sets of new cards. |
 | `anki_cards_delete` | destructive + flag | Delete a card and its orphaned note with `confirm=true`. |
 | `anki_note_types_list`, `anki_note_types_get` | read | Inspect stable note-type IDs, usage, fields, templates, formats, CSS, and kind. |
 | `anki_note_types_create`, `anki_note_types_update` | admin + schema flag | Create standard note types or replace names/formats/CSS while preserving field/template counts. |
+| `anki_note_type_fields_update`, `anki_templates_update` | admin + schema flag | Add, remove, rename, update, and reorder fields/templates through explicit source mappings. |
 | `anki_note_types_delete` | destructive + schema flag | Delete a note type and its notes/cards with `confirm=true`. |
-| `anki_media_list`, `anki_media_get` | read | List media metadata and read bounded content as base64 using safe filenames. |
+| `anki_media_list`, `anki_media_get`, `anki_media_check` | read | List/read bounded media and report missing or unused files. |
 | `anki_media_store`, `anki_media_rename` | write | Create/replace or rename bounded collection media. |
 | `anki_media_delete` | destructive + flag | Move media to Anki's trash with `confirm=true`. |
 
@@ -151,7 +156,7 @@ Exactly one token source is required. Setting both is a startup error.
 | `ANKI_SYNC_ON_READ` | `false` | Sync before every read; each read can also request `sync_before=true`. |
 | `ANKI_SYNC_ON_WRITE` | `true` | Sync before and after every mutation through the durable coordinator. |
 | `ANKI_ALLOW_DESTRUCTIVE` | `false` | Register confirmed deck, note, tag, card, note-type, and media deletion tools when the destructive scope is also enabled. |
-| `ANKI_ALLOW_SCHEMA_CHANGES` | `false` | Register note-type create/update tools; note-type deletion additionally requires the destructive gate. |
+| `ANKI_ALLOW_SCHEMA_CHANGES` | `false` | Register note-type, field, and template mutation tools; note-type deletion additionally requires the destructive gate. |
 | `ANKI_ALLOW_FULL_SYNC` | `false` | Register confirmed full upload/download maintenance tools when the admin scope is enabled. |
 | `ANKI_BOOTSTRAP_MODE` | `disabled` | `download_if_empty` explicitly permits startup login and download-only full sync, but refuses a nonempty local collection or server-required upload. |
 | `ANKI_MAX_BATCH_SIZE` | `50` | Maximum note-create, note-tag, and card-control batch size; range 1–500. |
@@ -164,6 +169,7 @@ Exactly one token source is required. Setting both is a startup error.
 | `MCP_MAX_RENDERED_FIELD_BYTES` | `262144` | UTF-8 byte cap for each rendered card question/answer; responses include truncation flags. |
 | `MCP_MAX_CARD_FIELDS` | `100` | Maximum number of fields/templates returned or accepted for one note type/card. |
 | `ANKI_MAX_MEDIA_BYTES` | `1048576` | Maximum decoded bytes accepted or returned by one media operation. Aggregate HTTP budgets still apply. |
+| `ANKI_SYNC_TIMEOUT_SECONDS` | `300` | Maximum wait for remote collection or media synchronization; range greater than 0 through 3600. |
 | `MCP_MAX_RESPONSE_BYTES` | `1048576` | Aggregate UTF-8 JSON budget for one tool result; oversized responses fail with `RESPONSE_TOO_LARGE`. |
 | `MCP_MAX_REQUEST_BYTES` | `1048576` | Aggregate byte budget for one MCP HTTP request body; oversized requests receive HTTP 413. |
 | `MCP_ALLOWED_HOSTS` | local and `anki-mcp` hosts | Comma-separated exact hosts or `host:*` patterns accepted by Streamable HTTP. |
@@ -230,6 +236,9 @@ updates preserve field and template counts while changing names, formats, and CS
 model manager. Media operations reject path components and symlinks, enforce decoded byte limits,
 use Anki's media manager for rollback-aware replacement and trash, and request media transfer during
 automatic sync.
-Mutation receipts track `media_synced` separately so an idempotent retry can finish media transfer
-without replaying the local write. Back up the persistent volume before maintenance and never mount
-one collection into multiple live Anki processes.
+Mutation receipts track `media_synced` separately, and media synchronization is marked complete only
+after Anki's backend reports it inactive. Completion time and progress survive restart; timeout uses
+the stable `MEDIA_SYNC_FAILED` tool error without discarding the persisted sync host key. Durable
+operation APIs, content-free metrics, and structured audit events expose synchronization outcomes
+without logging note fields or media bytes. Back up the persistent volume before maintenance and
+never mount one collection into multiple live Anki processes.
