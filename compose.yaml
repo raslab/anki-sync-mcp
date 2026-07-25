@@ -9,8 +9,8 @@ services:
       MCP_PORT: "8000"
       MCP_AUTH_TOKEN_FILE: "/run/secrets/anki_mcp_token"
       ANKI_COLLECTION_PATH: "/data/collection.anki2"
-      ANKI_SYNC_USERNAME: "${ANKI_SYNC_USERNAME:?ANKI_SYNC_USERNAME is required}"
-      ANKI_SYNC_PASSWORD: "${ANKI_SYNC_PASSWORD:?ANKI_SYNC_PASSWORD is required}"
+      ANKI_SYNC_USERNAME: "${ANKI_SYNC_USERNAME:-}"
+      ANKI_SYNC_PASSWORD: "${ANKI_SYNC_PASSWORD:-}"
       ANKI_SYNC_HOST: "${ANKI_SYNC_HOST:-}"
       MCP_MAX_PAGE_SIZE: "100"
     secrets:
