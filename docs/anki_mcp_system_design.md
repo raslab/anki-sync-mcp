@@ -438,30 +438,72 @@ Before production use, perform an end-to-end test with a disposable sync account
 
 ## 16. Delivery Phases
 
-### Phase 1: Safe core
+The implementation is currently a working baseline rather than the original Phase 1 safe core.
+The phases below record that baseline explicitly and order the remaining work by operational
+dependency. A phase is complete only when its tools, safety semantics, and integration tests are
+all delivered.
 
-- Container, persistent collection, authentication, health checks.
-- MCP protocol conformance.
-- Status and explicit sync.
-- Deck list/get/create.
-- Note search/get/create/update.
-- Tag add/remove.
-- Card search/get/suspend/unsuspend/change-deck.
-- Idempotency, serialization, backups, and full-sync fail-closed behavior.
+### Delivered baseline: authenticated deck and Basic-card service (`0.2.0`)
 
-### Phase 2: Complete non-destructive administration
+- Non-root container and Compose sidecar with a persistent `/data` volume, private MCP network,
+  separate sync egress, health checks, and one Uvicorn worker.
+- Authenticated Streamable HTTP MCP using bearer tokens, direct or `_FILE` secrets, strict tool
+  inputs, bounded requests/responses, and host/origin checks.
+- One dedicated collection-owner thread serializes all local collection and sync calls.
+- Bounded deck list/get/create/rename/delete and card search/get/create/update/move/delete tools.
+  Card creation and card update/move are intentionally limited to Anki's built-in single-card
+  Basic note type.
+- Explicit sync login and collection sync against AnkiWeb or a custom endpoint, including an
+  optional media-sync request and trusted endpoint migration handling. Media-sync completion is
+  not yet tracked.
+- Full-sync requirements are reported without automatically choosing a direction. Confirmed
+  upload/download tools require a preceding compatible server requirement and request a local
+  backup first.
+- Automated coverage for configuration, authentication, MCP schemas and calls, collection CRUD,
+  serialization, response bounds, rollback behavior, sync safety, and Compose isolation.
 
-- Deck configuration.
-- Flags, repositioning, bulk operations.
-- Media store/get/check and media-sync completion.
-- Better audit metrics and operation status.
+The baseline does **not** yet provide automatic sync around mutations, persisted sync
+authentication, operation idempotency, general note/tag workflows, scheduling controls, media
+file tools, scoped authorization, audit state, or the design's preview-token protection for
+destructive operations. Its delete and full-sync tools use strict `confirm=true`; treat them as a
+provisional private-deployment interface until the guarded administration phase is complete.
 
-### Phase 3: Guarded advanced administration
+### Phase 1 (next): safe synchronized note workflows
 
-- Note-type, field, template, and CSS changes.
-- Destructive tools with impact previews and confirmation tokens.
-- Optional review-answering tools.
-- Multiple MCP credentials and per-token scopes if required.
+- Enforce internal read/write/admin/destructive scopes for the current shared credential and omit
+  feature-gated tools from discovery when their scope or safety flag is disabled.
+- Add `anki_status` and explicit backup creation, persisted sync host-key state, controlled
+  bootstrap, and actionable readiness/status for authentication and pending full-sync conditions.
+- Add the operation coordinator: optional sync-before-read, sync-before-and-after-write, durable
+  mutation receipts, idempotency keys, and sync-only retry after a local commit.
+- Fail closed when normal operations encounter a full-sync requirement. Keep direction selection
+  operator-controlled and reconcile the baseline full-sync tools with the administrative boundary
+  defined in Section 9.
+- Implement general note search/get/create/batch-create/field-update and tag add/remove workflows,
+  with duplicate checks, stable IDs, bounded atomic batches, and field validation.
+- Complete core card controls for arbitrary supported cards: change deck, suspend, and unsuspend.
+- Prove the complete write lifecycle, restart recovery, idempotency, and full-sync behavior against
+  a disposable official self-hosted sync server.
+
+### Phase 2: complete non-destructive administration
+
+- Add deck configuration updates and read-only note-type, field, template, and CSS inspection.
+- Add card flags, repositioning, and bounded bulk operations.
+- Add media store/get/check with filename, content, and size validation plus media-sync completion.
+- Add operation-status APIs and reporting over the durable coordinator state delivered in Phase 1,
+  structured audit events, metrics, backup/restore smoke tests, and container persistent-restart
+  tests.
+
+### Phase 3: guarded advanced administration
+
+- Add note-type, field, template, and CSS mutations behind `ANKI_ALLOW_SCHEMA_CHANGES`.
+- Replace provisional confirmation-only deletion with impact previews, short-lived confirmation
+  tokens, backups where required, feature-gated registration, and tests proving rejected operations
+  leave the collection unchanged.
+- Add guarded note, note-type, and media deletion; retain deck/card deletion under the same model.
+- Add optional review answering only behind an explicit feature flag and administrative scope.
+- Add multiple MCP credentials mapped to the established read/write/admin/destructive scopes if
+  deployment requirements justify them; add HTTP Basic only if a concrete client requires it.
 
 ## 17. Key Decisions
 
