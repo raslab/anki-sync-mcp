@@ -39,6 +39,9 @@ SearchQuery = Annotated[StrictStr, Field(max_length=4096)]
 CardText = Annotated[StrictStr, Field(max_length=262_144)]
 IdempotencyKey = Annotated[StrictStr, Field(min_length=1, max_length=128)]
 Tag = Annotated[StrictStr, Field(min_length=1, max_length=512)]
+ResourceName = Annotated[StrictStr, Field(min_length=1, max_length=512)]
+MediaFilename = Annotated[StrictStr, Field(min_length=1, max_length=255)]
+MediaContent = Annotated[StrictStr, Field(min_length=1, max_length=22_369_624)]
 StableIds = Annotated[list[StableId], Field(min_length=1, max_length=500)]
 Tags = Annotated[list[Tag], Field(max_length=100)]
 NoteFields = dict[Annotated[StrictStr, Field(min_length=1, max_length=512)], CardText]
@@ -51,6 +54,14 @@ class NoteCreateInput(BaseModel):
     note_type_id: StableId
     fields: NoteFields
     tags: Tags = Field(default_factory=list)
+
+
+class NoteTypeTemplateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    name: ResourceName
+    question_format: CardText
+    answer_format: CardText
 
 
 class ResponseTooLargeError(RuntimeError):
@@ -67,6 +78,7 @@ def create_app(settings: Settings) -> ASGIApp:
         settings.max_rendered_field_bytes,
         settings.max_card_fields,
         settings.max_batch_size,
+        settings.max_media_bytes,
         settings.sync_on_read,
         settings.sync_on_write,
     )
@@ -363,6 +375,73 @@ def create_app(settings: Settings) -> ASGIApp:
             lambda adapter: adapter.remove_note_tags(note_ids, tags),
         )
 
+    @scoped_tool(
+        name="anki_notes_delete",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def notes_delete(
+        note_ids: StableIds,
+        confirm: Confirmation = False,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Delete notes and all generated cards when confirm is explicitly true."""
+        if not confirm:
+            cause = ValueError("confirm must be true for note deletion")
+            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+        return await mutate(
+            "anki_notes_delete",
+            idempotency_key,
+            {"note_ids": note_ids, "confirm": confirm},
+            lambda adapter: adapter.delete_notes(note_ids),
+        )
+
+    @scoped_tool(name="anki_tags_list", scope="read")
+    async def tags_list(
+        offset: Offset = 0,
+        limit: PageLimit = settings.max_page_size,
+        sync_before: SyncMedia = False,
+    ) -> dict[str, Any]:
+        """List collection tags with bounded offset pagination."""
+        return await execute(
+            service.coordinated_read(lambda adapter: adapter.list_tags(offset, limit), sync_before)
+        )
+
+    @scoped_tool(name="anki_tags_rename", scope="write")
+    async def tags_rename(
+        old_name: Tag,
+        new_name: Tag,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Rename a tag across the collection."""
+        return await mutate(
+            "anki_tags_rename",
+            idempotency_key,
+            {"old_name": old_name, "new_name": new_name},
+            lambda adapter: adapter.rename_tag(old_name, new_name),
+        )
+
+    @scoped_tool(
+        name="anki_tags_delete",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def tags_delete(
+        name: Tag,
+        confirm: Confirmation = False,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Remove a tag from every note when confirm is explicitly true."""
+        if not confirm:
+            cause = ValueError("confirm must be true for tag deletion")
+            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+        return await mutate(
+            "anki_tags_delete",
+            idempotency_key,
+            {"name": name, "confirm": confirm},
+            lambda adapter: adapter.delete_tag(name),
+        )
+
     @scoped_tool(name="anki_cards_search", scope="read")
     async def cards_search(
         query: SearchQuery = "",
@@ -473,6 +552,171 @@ def create_app(settings: Settings) -> ASGIApp:
             idempotency_key,
             {"card_id": card_id, "confirm": confirm},
             lambda adapter: adapter.delete_card(card_id),
+        )
+
+    @scoped_tool(name="anki_note_types_list", scope="read")
+    async def note_types_list(
+        offset: Offset = 0,
+        limit: PageLimit = settings.max_page_size,
+        sync_before: SyncMedia = False,
+    ) -> dict[str, Any]:
+        """List note types with stable IDs and bounded pagination."""
+        return await execute(
+            service.coordinated_read(
+                lambda adapter: adapter.list_note_types(offset, limit), sync_before
+            )
+        )
+
+    @scoped_tool(name="anki_note_types_get", scope="read")
+    async def note_types_get(
+        note_type_id: StableId, sync_before: SyncMedia = False
+    ) -> dict[str, Any]:
+        """Get fields, templates, CSS, kind, and usage for one note type."""
+        return await execute(
+            service.coordinated_read(
+                lambda adapter: adapter.get_note_type(note_type_id), sync_before
+            )
+        )
+
+    @scoped_tool(
+        name="anki_note_types_create",
+        scope="admin",
+        enabled=settings.allow_schema_changes,
+    )
+    async def note_types_create(
+        name: ResourceName,
+        fields: list[ResourceName],
+        templates: list[NoteTypeTemplateInput],
+        css: CardText = "",
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Create a standard note type when schema changes are explicitly enabled."""
+        template_values = [template.model_dump() for template in templates]
+        request = {"name": name, "fields": fields, "templates": template_values, "css": css}
+        return await mutate(
+            "anki_note_types_create",
+            idempotency_key,
+            request,
+            lambda adapter: adapter.create_note_type(name, fields, template_values, css),
+        )
+
+    @scoped_tool(
+        name="anki_note_types_update",
+        scope="admin",
+        enabled=settings.allow_schema_changes,
+    )
+    async def note_types_update(
+        note_type_id: StableId,
+        name: ResourceName,
+        fields: list[ResourceName],
+        templates: list[NoteTypeTemplateInput],
+        css: CardText = "",
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Replace note-type names, formats, and CSS while preserving field/template counts."""
+        template_values = [template.model_dump() for template in templates]
+        request = {
+            "note_type_id": note_type_id,
+            "name": name,
+            "fields": fields,
+            "templates": template_values,
+            "css": css,
+        }
+        return await mutate(
+            "anki_note_types_update",
+            idempotency_key,
+            request,
+            lambda adapter: adapter.update_note_type(
+                note_type_id, name, fields, template_values, css
+            ),
+        )
+
+    @scoped_tool(
+        name="anki_note_types_delete",
+        scope="destructive",
+        enabled=settings.allow_destructive and settings.allow_schema_changes,
+    )
+    async def note_types_delete(
+        note_type_id: StableId,
+        confirm: Confirmation = False,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Delete a note type and its notes/cards after safety gates and confirmation."""
+        if not confirm:
+            cause = ValueError("confirm must be true for note type deletion")
+            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+        return await mutate(
+            "anki_note_types_delete",
+            idempotency_key,
+            {"note_type_id": note_type_id, "confirm": confirm},
+            lambda adapter: adapter.delete_note_type(note_type_id),
+        )
+
+    @scoped_tool(name="anki_media_list", scope="read")
+    async def media_list(
+        offset: Offset = 0,
+        limit: PageLimit = settings.max_page_size,
+        sync_before: SyncMedia = False,
+    ) -> dict[str, Any]:
+        """List collection media filenames and sizes with bounded pagination."""
+        return await execute(
+            service.coordinated_read(lambda adapter: adapter.list_media(offset, limit), sync_before)
+        )
+
+    @scoped_tool(name="anki_media_get", scope="read")
+    async def media_get(filename: MediaFilename, sync_before: SyncMedia = False) -> dict[str, Any]:
+        """Read one bounded media file as base64 by safe filename."""
+        return await execute(
+            service.coordinated_read(lambda adapter: adapter.get_media(filename), sync_before)
+        )
+
+    @scoped_tool(name="anki_media_store", scope="write")
+    async def media_store(
+        filename: MediaFilename,
+        content_base64: MediaContent,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Create or replace one bounded media file from base64 content."""
+        return await mutate(
+            "anki_media_store",
+            idempotency_key,
+            {"filename": filename, "content_base64": content_base64},
+            lambda adapter: adapter.store_media(filename, content_base64),
+        )
+
+    @scoped_tool(name="anki_media_rename", scope="write")
+    async def media_rename(
+        old_filename: MediaFilename,
+        new_filename: MediaFilename,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Rename one bounded media file without overwriting an existing target."""
+        return await mutate(
+            "anki_media_rename",
+            idempotency_key,
+            {"old_filename": old_filename, "new_filename": new_filename},
+            lambda adapter: adapter.rename_media(old_filename, new_filename),
+        )
+
+    @scoped_tool(
+        name="anki_media_delete",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def media_delete(
+        filename: MediaFilename,
+        confirm: Confirmation = False,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Move one media file to Anki's trash when confirmation is true."""
+        if not confirm:
+            cause = ValueError("confirm must be true for media deletion")
+            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+        return await mutate(
+            "anki_media_delete",
+            idempotency_key,
+            {"filename": filename, "confirm": confirm},
+            lambda adapter: adapter.delete_media(filename),
         )
 
     # FastMCP currently generates argument models with Pydantic's extra="ignore".

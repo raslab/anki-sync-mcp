@@ -90,6 +90,7 @@ class Settings(BaseSettings):
     sync_on_write: bool = Field(True, alias="ANKI_SYNC_ON_WRITE")
     allow_destructive: bool = Field(False, alias="ANKI_ALLOW_DESTRUCTIVE")
     allow_full_sync: bool = Field(False, alias="ANKI_ALLOW_FULL_SYNC")
+    allow_schema_changes: bool = Field(False, alias="ANKI_ALLOW_SCHEMA_CHANGES")
     bootstrap_mode: Literal["disabled", "download_if_empty"] = Field(
         "disabled", alias="ANKI_BOOTSTRAP_MODE"
     )
@@ -100,6 +101,7 @@ class Settings(BaseSettings):
         262_144, ge=1, le=4_194_304, alias="MCP_MAX_RENDERED_FIELD_BYTES"
     )
     max_card_fields: int = Field(100, ge=1, le=1000, alias="MCP_MAX_CARD_FIELDS")
+    max_media_bytes: int = Field(1_048_576, ge=1, le=16_777_216, alias="ANKI_MAX_MEDIA_BYTES")
     max_response_bytes: int = Field(
         1_048_576, ge=1024, le=16_777_216, alias="MCP_MAX_RESPONSE_BYTES"
     )
