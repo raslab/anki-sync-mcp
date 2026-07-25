@@ -1,255 +1,83 @@
-# Anki MCP
+# anki-sync-mcp
 
-A small, production-shaped sidecar based on
-[`docs/anki_mcp_system_design.md`](docs/anki_mcp_system_design.md). It exposes one local Anki
-collection through authenticated Streamable HTTP MCP and synchronizes it through Anki's official
-sync client API.
+**A headless, sync-native Anki MCP sidecar for always-on AI agents.**
 
-The service exposes safe synchronized CRUD for Anki's critical deck, note, tag, card, note-type,
-template, and media resources. All collection and sync calls—including automatic synchronization
-around operations—run on one dedicated owner thread.
+`anki-sync-mcp` lets an MCP client safely manage a real Anki collection without Anki
+Desktop or AnkiConnect. It runs as an authenticated Streamable HTTP service, uses Anki's
+official collection and sync APIs, and synchronizes with AnkiWeb or a self-hosted Anki sync
+server.
 
-## Included surface
+Unlike desktop bridges, it is designed to run unattended in Docker. Writes are serialized,
+idempotent, persisted across restarts, and synchronized before and after mutation. Destructive
+and schema-changing tools are disabled by default and use preview tokens plus verified backups
+when enabled.
 
-Endpoint: `http://<host>:8000/mcp`
+It supports decks, notes, cards, tags, note types, templates, media, scheduling controls,
+backups, and explicit full-sync recovery.
 
-| Tools | Scope | Purpose |
-| --- | --- | --- |
-| `anki_status` | read | Report package, collection, authentication, collection/media sync, pending mutation, and pending full-sync state. |
-| `anki_operations_list`, `anki_operations_get` | read | Inspect bounded durable mutation receipts, timestamps, and retry state. |
-| `anki_metrics` | read | Report content-free durable mutation counts and synchronization state. |
-| `anki_sync_login` | admin | Authenticate and persist the sync host key. |
-| `anki_sync` | write | Synchronize collection changes and optionally media. |
-| `anki_backup_create` | admin | Create an explicit persistent `.colpkg` backup and return its path. |
-| `anki_sync_full_download`, `anki_sync_full_upload` | admin + flag | Perform a confirmed, server-requested full sync in the operator-selected direction. |
-| `anki_decks_list`, `anki_decks_get` | read | Read bounded deck metadata by stable IDs. |
-| `anki_decks_create`, `anki_decks_update` | write | Create or rename decks through durable mutation receipts. |
-| `anki_decks_update_config` | admin | Update bounded daily limits, answer time, and desired retention. |
-| `anki_decks_delete` | destructive + flag | Delete a deck and its cards with `confirm=true`. |
-| `anki_notes_search`, `anki_notes_get` | read | Search and read arbitrary note types with bounded fields and stable IDs. |
-| `anki_notes_create`, `anki_notes_create_batch` | write | Duplicate-checked, field-validated, idempotent note creation. Batches are bounded and atomic. |
-| `anki_notes_update_fields` | write | Patch validated named fields on an arbitrary note type. |
-| `anki_notes_add_tags`, `anki_notes_remove_tags` | write | Apply normalized tag changes to bounded note-ID sets. |
-| `anki_notes_delete` | destructive + flag | Delete bounded note-ID sets and their generated cards with `confirm=true`. |
-| `anki_tags_list` | read | List the collection's tag registry with bounded pagination. |
-| `anki_tags_rename` | write | Rename a tag across all notes. Tags are created by adding them to notes. |
-| `anki_tags_delete` | destructive + flag | Remove a tag from every note with `confirm=true`. |
-| `anki_cards_search`, `anki_cards_get` | read | Search and read rendered card and scheduling state. |
-| `anki_cards_create`, `anki_cards_update` | write | Compatibility workflows for built-in single-card Basic notes. |
-| `anki_cards_change_deck`, `anki_cards_suspend`, `anki_cards_unsuspend`, `anki_cards_set_flag` | write | Apply bounded controls to arbitrary supported cards by stable IDs. |
-| `anki_cards_reposition` | admin | Reposition bounded sets of new cards. |
-| `anki_cards_delete` | destructive + flag | Delete a card and its orphaned note with `confirm=true`. |
-| `anki_note_types_list`, `anki_note_types_get` | read | Inspect stable note-type IDs, usage, fields, templates, formats, CSS, and kind. |
-| `anki_note_types_create`, `anki_note_types_update` | admin + schema flag | Create standard note types or replace names/formats/CSS while preserving field/template counts. |
-| `anki_note_type_fields_update`, `anki_templates_update` | admin + schema flag | Add, remove, rename, update, and reorder fields/templates through explicit source mappings. |
-| `anki_note_types_delete` | destructive + schema flag | Delete a note type and its notes/cards with `confirm=true`. |
-| `anki_media_list`, `anki_media_get`, `anki_media_check` | read | List/read bounded media and report missing or unused files. |
-| `anki_media_store`, `anki_media_rename` | write | Create/replace or rename bounded collection media. |
-| `anki_media_delete` | destructive + flag | Move media to Anki's trash with `confirm=true`. |
+## Quick start with Docker Compose
 
-Public, content-free probes:
-
-- `GET /health/live`
-- `GET /health/ready`
-
-Tools are omitted from discovery when their configured scope or feature flag is disabled. The
-service never chooses a full-sync direction itself, never opens Anki Desktop, and never writes
-directly to Anki's SQLite schema. Basic HTTP auth and multi-user MCP credentials are not included.
-
-## Requirements
-
-- Python 3.12
-- [`uv`](https://docs.astral.sh/uv/), or Docker for container-only use
-- A high-entropy MCP bearer token
-- An AnkiWeb or self-hosted sync account
-
-## Develop and verify
+Requirements: Docker Compose, Python 3 for token generation, and an AnkiWeb or self-hosted
+sync account.
 
 ```sh
-uv sync --frozen --all-groups
-uv run pytest
-uv run ruff check .
-uv run ruff format --check .
-uv run pyright
-uv build
-```
+git clone https://github.com/YOUR-USERNAME/anki-sync-mcp.git
+cd anki-sync-mcp
 
-The tests create disposable collections through the official `anki` Python API and launch the
-official self-hosted sync server shipped by the pinned package. They cover scoped discovery,
-configuration and secret files, authentication, note/deck/card workflows, strict bounds,
-sync-before/write/sync-after, full-sync gating, persisted restart recovery, and idempotent replay.
-
-## Run locally
-
-```sh
-mkdir -p .local-data
-export MCP_AUTH_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-export ANKI_COLLECTION_PATH="$PWD/.local-data/collection.anki2"
-export ANKI_SYNC_USERNAME="your-sync-username"
-export ANKI_SYNC_PASSWORD="your-sync-password"
-export ANKI_SYNC_HOST="" # empty selects AnkiWeb; otherwise use an HTTPS custom sync base URL
-export MCP_SCOPES="read,write,admin"
-export ANKI_SYNC_ON_WRITE="true"
-uv run anki-mcp
-```
-
-Configure the MCP client for Streamable HTTP at `http://127.0.0.1:8000/mcp` with this header:
-
-Supply an `Authorization` header using the Bearer scheme and the configured token.
-
-Do not use an AnkiWeb password as the MCP token. MCP authentication and remote Anki sync
-authentication are separate. Call `anki_sync_login` once; the host key is persisted under
-`state/sync-auth` with owner-only permissions and is reused after restart, so the plaintext sync
-password can be removed when manual reauthentication is acceptable. Writes synchronize before and
-after the local commit by default. Reads use the local snapshot unless `sync_before=true` or
-`ANKI_SYNC_ON_READ=true`.
-
-When status or a tool reports `FULL_SYNC_REQUIRED`, normal synchronized operations stop and
-readiness reports `full_sync_required`. Create a backup, inspect which direction the server
-requires, and enable `ANKI_ALLOW_FULL_SYNC=true` only for the operator-controlled maintenance
-window. Call the compatible confirmed administrative tool, then disable the flag again. Both
-directions request a local backup; an upload reconciles pending local mutation receipts as remotely
-synchronized. The service never chooses a destructive direction itself.
-
-Destructive operations use a two-step flow. Call the matching `*_delete_preview` tool, inspect its
-bounded impact, then pass the returned one-time `confirmation_token` to the delete tool before it
-expires. The service creates and verifies a collection backup immediately before every deletion.
-Tokens bind both the exact request and an opaque fingerprint of the previewed state, so altered
-requests and stale previews are rejected. Schema mutations use `anki_note_types_change_preview` in
-the same way: the preview call must contain the exact proposed create/update payload, or
-`field_mappings`/`template_mappings` for those operations. Schema tools are exposed only during a
-maintenance window with both `ANKI_ALLOW_SCHEMA_CHANGES=true` and `ANKI_ALLOW_FULL_SYNC=true`.
-
-## Run as the OpenClaw sidecar
-
-Create the Compose secret and build the image:
-
-```sh
 mkdir -p secrets
 python -c 'import secrets; print(secrets.token_urlsafe(32))' > secrets/anki_mcp_token
 read -rsp "Anki sync password: " ANKI_PASSWORD
 printf '%s' "$ANKI_PASSWORD" > secrets/anki_sync_password
 unset ANKI_PASSWORD
-printf '\n'
-chmod 600 secrets/anki_mcp_token
-chmod 600 secrets/anki_sync_password
+chmod 600 secrets/*
+
 export ANKI_SYNC_USERNAME="your-sync-username"
-export ANKI_SYNC_HOST="" # AnkiWeb
-docker compose build
-docker compose up -d
+export ANKI_SYNC_HOST="" # empty for AnkiWeb; otherwise an HTTPS sync-server URL
+
+docker compose up -d --build
 docker compose exec anki-mcp anki-mcp-healthcheck
 ```
 
-The checked-in Compose file keeps MCP traffic on the private `assistant` network, adds a separate
-egress-capable network for AnkiWeb/self-hosted sync, and exposes no host port. A container on the
-private network connects to `http://anki-mcp:8000/mcp` and reads the bearer token from the same
-secret source. Add a temporary `ports: ["127.0.0.1:8000:8000"]` mapping only for host-side development.
+The included Compose configuration exposes MCP only to containers on its private `assistant`
+network. Connect your agent container to that network and configure:
 
-The image runs as UID/GID `10001`, owns `/data`, uses one Uvicorn worker, and stores the collection
-on the `anki_data` volume. Never mount the same collection read/write into two running sidecars,
-Anki Desktop, or a sync server's storage directory.
+- URL: `http://anki-mcp:8000/mcp`
+- Header: `Authorization: Bearer <contents of secrets/anki_mcp_token>`
 
-## Configuration
+For a client running directly on the host, add this to the `anki-mcp` service in
+`compose.yaml`, then run `docker compose up -d` again:
 
-Exactly one token source is required. Setting both is a startup error.
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `MCP_AUTH_TOKEN` | — | Bearer token supplied directly. |
-| `MCP_AUTH_TOKEN_FILE` | — | File containing the bearer token; preferred in containers. |
-| `ANKI_SYNC_USERNAME` | empty | Remote sync username used by login and controlled bootstrap. |
-| `ANKI_SYNC_PASSWORD` | — | Optional remote sync password supplied directly; intended for local development only. |
-| `ANKI_SYNC_PASSWORD_FILE` | — | Optional password file; preferred in containers. It is unnecessary at restart when persisted host-key authentication is sufficient. |
-| `ANKI_SYNC_HOST` | empty | Empty selects AnkiWeb; otherwise an HTTPS self-hosted sync base URL. HTTP is accepted only for loopback development. User-info, query strings, and fragments are rejected. |
-| `MCP_SCOPES` | `read,write,admin` | Enabled internal scopes from `read`, `write`, `admin`, and `destructive`. Tools outside these scopes are omitted. |
-| `ANKI_SYNC_ON_READ` | `false` | Sync before every read; each read can also request `sync_before=true`. |
-| `ANKI_SYNC_ON_WRITE` | `true` | Sync before and after every mutation through the durable coordinator. |
-| `ANKI_ALLOW_DESTRUCTIVE` | `false` | Register preview-token-guarded deck, note, tag, card, note-type, and media deletion tools when the destructive scope is also enabled. |
-| `ANKI_ALLOW_SCHEMA_CHANGES` | `false` | Register note-type, field, and template mutation tools only when full-sync maintenance is also enabled; note-type deletion additionally requires the destructive gate. |
-| `ANKI_ALLOW_FULL_SYNC` | `false` | Register confirmed full upload/download maintenance tools when the admin scope is enabled. |
-| `ANKI_ALLOW_REVIEW_ANSWERS` | `false` | Register the administrative `anki_cards_answer` tool for recording real reviews. |
-| `ANKI_CONFIRMATION_TTL_SECONDS` | `300` | Lifetime of one-time destructive/schema confirmation tokens; range 30–3600 seconds. |
-| `ANKI_BOOTSTRAP_MODE` | `disabled` | `download_if_empty` explicitly permits startup login and download-only full sync, but refuses a nonempty local collection or server-required upload. |
-| `ANKI_MAX_BATCH_SIZE` | `50` | Maximum note-create, note-tag, and card-control batch size; range 1–500. |
-| `MCP_HOST` | `0.0.0.0` | Bind address. |
-| `MCP_PORT` | `8000` | Bind port. |
-| `MCP_PATH` | `/mcp` | Absolute, non-root MCP path. |
-| `ANKI_COLLECTION_PATH` | `/data/collection.anki2` | Persistent collection file. |
-| `MCP_MAX_PAGE_SIZE` | `100` | Server-side maximum, from 1 through 1000. |
-| `MCP_MAX_SEARCH_SCAN` | `10000` | Refuse deck/card searches when the collection could require scanning more items. |
-| `MCP_MAX_RENDERED_FIELD_BYTES` | `262144` | UTF-8 byte cap for each rendered card question/answer; responses include truncation flags. |
-| `MCP_MAX_CARD_FIELDS` | `100` | Maximum number of fields/templates returned or accepted for one note type/card. |
-| `ANKI_MAX_MEDIA_BYTES` | `1048576` | Maximum decoded bytes accepted or returned by one media operation. Aggregate HTTP budgets still apply. |
-| `ANKI_SYNC_TIMEOUT_SECONDS` | `300` | Maximum wait for remote collection or media synchronization; range greater than 0 through 3600. |
-| `MCP_MAX_RESPONSE_BYTES` | `1048576` | Aggregate UTF-8 JSON budget for one tool result; oversized responses fail with `RESPONSE_TOO_LARGE`. |
-| `MCP_MAX_REQUEST_BYTES` | `1048576` | Aggregate byte budget for one MCP HTTP request body; oversized requests receive HTTP 413. |
-| `MCP_ALLOWED_HOSTS` | local and `anki-mcp` hosts | Comma-separated exact hosts or `host:*` patterns accepted by Streamable HTTP. |
-| `MCP_ALLOWED_ORIGINS` | local HTTP origins | Comma-separated exact origins or `origin:*` patterns; browser requests with other origins are rejected. |
-| `LOG_LEVEL` | `INFO` | Uvicorn log level. |
-
-At most one of `ANKI_SYNC_PASSWORD` and `ANKI_SYNC_PASSWORD_FILE` may be set. One is needed for a
-new login or `download_if_empty` bootstrap unless persisted host-key authentication already exists.
-Routine health, authentication, and tool errors do not return credentials or the collection path.
-Every HTTP method under the MCP path is authenticated with a constant-time token comparison. Sync
-host keys, pending full-sync state, and mutation receipts persist under `/data/state`; `sync-auth`
-is written with mode `0600`.
-Server-directed migrations are accepted only within the configured custom origin, or to an HTTPS
-`ankiweb.net` host when using AnkiWeb.
-
-Missing IDs, invalid pagination, generated-schema failures, and forbidden extra arguments return
-MCP tool errors containing a compact JSON object with a stable `code` (`NOT_FOUND` or
-`INVALID_ARGUMENT`), a safe message, and a request correlation ID. Pydantic details, input values,
-and documentation URLs are not exposed.
-
-## Project layout
-
-```text
-src/anki_mcp/
-  app.py          ASGI composition, scoped discovery, and FastMCP tool contracts
-  auth.py         bearer authentication middleware
-  collection.py   official Anki workflows, operation coordinator, and owner-thread executor
-  config.py       strict environment and secret-file settings
-  state.py        durable sync authentication, status, and idempotency receipts
-  healthcheck.py  container readiness command
-  __main__.py     one-worker Uvicorn entry point
-tests/             config, collection, auth, health, and MCP integration tests
-Dockerfile         multi-stage, non-root production image
-compose.yaml       private MCP network plus controlled sync-egress sidecar deployment
-pyproject.toml     package, test, lint, format, and type-check configuration
-uv.lock            reproducible dependency lock
+```yaml
+ports:
+  - "127.0.0.1:8000:8000"
 ```
 
-## Current safety boundary
+Use `http://127.0.0.1:8000/mcp` as the MCP URL. After connecting, call
+`anki_sync_login` once. The resulting sync host key is stored in the persistent Docker volume,
+so you can later remove `ANKI_SYNC_PASSWORD_FILE` from `compose.yaml` and delete the password
+secret when automatic reauthentication is not required.
 
-The collection executor owns `anki.collection.Collection` on exactly one dedicated worker thread.
-Reads optionally synchronize first. Mutations use `sync → validate/idempotency check → local commit
-→ durable receipt → sync`; a retry after a post-commit network failure performs only the sync step.
-Receipts report `local_committed`, `remote_synced`, `media_synced`, and `retryable` and retain stable
-result IDs across restart. The coordinator durably records intent before mutation; if the process
-dies in the narrow mutation-to-receipt window, the same key returns `state=outcome_unknown` and
-fails closed instead of replaying a potentially committed operation. An operator must inspect the
-collection and use a new key if the operation should be attempted again. A full download marks
-local-only or uncertain receipts `discarded_by_full_download` so they cannot report lost mutations
-as committed.
+Do not run two sidecars, Anki Desktop, or any other process against the same collection file.
+Keep destructive, schema, and full-sync feature flags disabled except during deliberate
+maintenance.
 
-Full-sync requirements persist, degrade readiness, and fail closed. Full-sync tools require the
-admin scope, an explicit safety flag, a preceding compatible server requirement, strict
-confirmation, and a local backup. `download_if_empty` is the only automatic full-sync direction and
-must be selected in process configuration; it refuses nonempty local data and server-required
-uploads. Delete tools independently require the destructive scope, safety flag, and strict
-`confirm=true`.
+## Development
 
-General note workflows validate exact create fields against the note type, validate patched field
-names, reject empty/duplicate first fields, bound batches, and use stable note/card IDs. Legacy card
-create/update remains limited to built-in single-card Basic notes, while deck changes and
-suspend/unsuspend support arbitrary cards. Note-type schema writes are disabled by default;
-updates preserve field and template counts while changing names, formats, and CSS through Anki's
-model manager. Media operations reject path components and symlinks, enforce decoded byte limits,
-use Anki's media manager for rollback-aware replacement and trash, and request media transfer during
-automatic sync.
-Mutation receipts track `media_synced` separately, and media synchronization is marked complete only
-after Anki's backend reports it inactive. Completion time and progress survive restart; timeout uses
-the stable `MEDIA_SYNC_FAILED` tool error without discarding the persisted sync host key. Durable
-operation APIs, content-free metrics, and structured audit events expose synchronization outcomes
-without logging note fields or media bytes. Back up the persistent volume before maintenance and
-never mount one collection into multiple live Anki processes.
+Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
+
+```sh
+uv sync --frozen --all-groups
+uv run pytest
+uv run ruff check .
+uv run pyright
+```
+
+## License
+
+[MIT](LICENSE) — free to use, modify, and distribute under the license terms.
+
+## Trademark disclaimer
+
+This is an independent, unofficial project. It is not affiliated with, endorsed by, or
+sponsored by Anki, AnkiWeb, Ankitects Pty Ltd, or their maintainers. Anki and AnkiWeb are
+trademarks of their respective owners.
