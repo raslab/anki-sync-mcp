@@ -409,6 +409,55 @@ def test_sync_failures_have_safe_machine_readable_codes(
     assert "secret" not in payload["message"]
 
 
+def test_sync_login_rejects_an_unconfigured_username_before_contacting_remote(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    custom = settings.model_copy(update={"sync_username": ""})
+
+    def unexpected_login(*args: object, **kwargs: object) -> SyncAuth:
+        pytest.fail("sync backend must not be called without a configured username")
+
+    monkeypatch.setattr(Collection, "sync_login", unexpected_login)
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(create_app(custom)) as custom_client:
+        initialized = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                },
+            },
+        )
+        headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+        response = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "anki_sync_login", "arguments": {}},
+            },
+        )
+
+    result = response.json()["result"]
+    text = result["content"][0]["text"]
+    payload = json.loads(text[text.index("{") :])
+    assert result["isError"] is True
+    assert payload["code"] == "INVALID_ARGUMENT"
+    assert payload["message"] == "ANKI_SYNC_USERNAME is not configured"
+    assert payload["correlation_id"]
+
+
 @pytest.mark.parametrize(
     ("tool", "arguments"),
     [

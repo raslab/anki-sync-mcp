@@ -142,11 +142,34 @@ class CollectionAdapter:
         self.collection.decks.rename(cast("DeckId", deck_id), name)
         return {"id": deck_id, "updated": True}
 
+    def _raise_after_delete_failure(
+        self,
+        operation_error: Exception,
+        resource_name: str,
+        verify_present: Callable[[], object],
+    ) -> None:
+        try:
+            verify_present()
+        except LookupError:
+            try:
+                self.collection.undo()
+                verify_present()
+            except Exception:
+                raise RuntimeError(
+                    f"{resource_name} deletion failed and rollback was incomplete"
+                ) from operation_error
+        raise operation_error
+
     def delete_deck(self, deck_id: int) -> dict[str, Any]:
         self.get_deck(deck_id)
         if deck_id == 1:
             raise ValueError("the Default deck cannot be deleted")
-        self.collection.decks.remove([cast("DeckId", deck_id)])
+        try:
+            self.collection.decks.remove([cast("DeckId", deck_id)])
+        except Exception as operation_error:
+            self._raise_after_delete_failure(
+                operation_error, "deck", lambda: self.get_deck(deck_id)
+            )
         return {"id": deck_id, "deleted": True}
 
     def search_cards(self, query: str, offset: int, limit: int) -> dict[str, Any]:
@@ -329,7 +352,12 @@ class CollectionAdapter:
 
     def delete_card(self, card_id: int) -> dict[str, Any]:
         self.get_card(card_id)
-        self.collection.remove_cards_and_orphaned_notes([cast("CardId", card_id)])
+        try:
+            self.collection.remove_cards_and_orphaned_notes([cast("CardId", card_id)])
+        except Exception as operation_error:
+            self._raise_after_delete_failure(
+                operation_error, "card", lambda: self.get_card(card_id)
+            )
         return {"id": card_id, "deleted": True}
 
     def sync_login(self, username: str, password: str, endpoint: str | None) -> dict[str, Any]:

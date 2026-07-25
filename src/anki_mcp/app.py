@@ -95,6 +95,9 @@ def create_app(settings: Settings) -> ASGIApp:
     @mcp.tool(name="anki_sync_login")
     async def sync_login() -> dict[str, Any]:
         """Authenticate to the configured AnkiWeb or self-hosted sync endpoint."""
+        if not settings.sync_username.strip():
+            cause = ValueError("ANKI_SYNC_USERNAME is not configured")
+            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
         return await execute(
             service.sync_login(
                 settings.sync_username,

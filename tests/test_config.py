@@ -37,10 +37,15 @@ def test_direct_token_and_defaults(tmp_path: Path) -> None:
     assert settings.sync_host == "https://sync.example.test/"
 
 
-@pytest.mark.parametrize("missing", ["ANKI_SYNC_USERNAME", "ANKI_SYNC_PASSWORD"])
-def test_sync_credentials_are_required_from_environment(tmp_path: Path, missing: str) -> None:
+def test_sync_username_can_be_empty_until_login(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, **env(tmp_path, ANKI_SYNC_USERNAME=""))
+
+    assert settings.sync_username == ""
+
+
+def test_sync_password_is_required_from_environment(tmp_path: Path) -> None:
     values = env(tmp_path)
-    del values[missing]
+    del values["ANKI_SYNC_PASSWORD"]
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **values)
 

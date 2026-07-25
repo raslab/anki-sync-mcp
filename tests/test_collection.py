@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from anki.collection import Collection
+from anki.decks import DeckManager
 from anki.sync import SyncAuth, SyncOutput
 
 from anki_mcp.collection import AnkiCollectionService, CollectionAdapter
@@ -143,6 +144,34 @@ async def test_deck_crud_cycle(populated_collection: str) -> None:
 
 
 @pytest.mark.anyio
+async def test_delete_deck_undoes_when_removal_applies_then_raises(
+    populated_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    collection = Collection(populated_collection)
+    try:
+        deck_id = int(collection.decks.id("Delete Rollback"))
+        note = collection.new_note(collection.models.current())
+        note["Front"] = "preserve"
+        note["Back"] = "me"
+        collection.add_note(note, deck_id)
+        card_id = int(collection.find_cards(f"nid:{int(note.id)}")[0])
+    finally:
+        collection.close()
+    original_remove = DeckManager.remove
+
+    def apply_then_raise(self: DeckManager, deck_ids: list[int]) -> None:
+        original_remove(self, deck_ids)
+        raise RuntimeError("deck removal failed after apply")
+
+    monkeypatch.setattr(DeckManager, "remove", apply_then_raise)
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        with pytest.raises(RuntimeError, match="failed after apply"):
+            await service.delete_deck(deck_id)
+        assert (await service.get_deck(deck_id))["name"] == "Delete Rollback"
+        assert (await service.get_card(card_id))["deck_id"] == deck_id
+
+
+@pytest.mark.anyio
 async def test_deck_receipts_do_not_guess_anki_canonical_names(populated_collection: str) -> None:
     async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
         normalized = await service.create_deck("Canonical::")
@@ -190,6 +219,28 @@ async def test_card_crud_cycle(populated_collection: str) -> None:
         "updated": True,
     }
     assert deleted == {"id": created["id"], "deleted": True}
+
+
+@pytest.mark.anyio
+async def test_delete_card_undoes_when_removal_applies_then_raises(
+    populated_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    collection = Collection(populated_collection)
+    try:
+        card_id = int(collection.find_cards("deck:Languages::Spanish")[0])
+    finally:
+        collection.close()
+    original_remove = Collection.remove_cards_and_orphaned_notes
+
+    def apply_then_raise(self: Collection, card_ids: list[int]) -> None:
+        original_remove(self, card_ids)
+        raise RuntimeError("card removal failed after apply")
+
+    monkeypatch.setattr(Collection, "remove_cards_and_orphaned_notes", apply_then_raise)
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        with pytest.raises(RuntimeError, match="failed after apply"):
+            await service.delete_card(card_id)
+        assert (await service.get_card(card_id))["id"] == card_id
 
 
 @pytest.mark.anyio
@@ -583,15 +634,15 @@ async def test_full_sync_requirements_are_reported_without_choosing_direction(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("required", "upload", "direction", "sync_media", "expected_server_usn"),
+    ("required", "upload", "direction", "sync_media", "expected_server_usn", "backup_created"),
     [
-        (2, False, "download", False, None),
-        (2, True, "upload", True, 42),
-        (3, False, "download", False, None),
-        (4, True, "upload", True, 42),
+        (2, False, "download", False, None, True),
+        (2, True, "upload", True, 42, True),
+        (3, False, "download", False, None, False),
+        (4, True, "upload", True, 42, False),
     ],
 )
-async def test_confirmed_full_sync_uses_required_direction_and_creates_backup(
+async def test_confirmed_full_sync_uses_required_direction_and_requests_backup(
     populated_collection: str,
     monkeypatch: pytest.MonkeyPatch,
     required: int,
@@ -599,6 +650,7 @@ async def test_confirmed_full_sync_uses_required_direction_and_creates_backup(
     direction: str,
     sync_media: bool,
     expected_server_usn: int | None,
+    backup_created: bool,
 ) -> None:
     full_calls: list[tuple[str, int | None, bool]] = []
     backups: list[str] = []
@@ -625,7 +677,7 @@ async def test_confirmed_full_sync_uses_required_direction_and_creates_backup(
         assert force is True
         assert wait_for_completion is True
         backups.append(backup_folder)
-        return True
+        return backup_created
 
     monkeypatch.setattr(Collection, "full_upload_or_download", full_sync)
     monkeypatch.setattr(Collection, "create_backup", backup)
@@ -634,7 +686,11 @@ async def test_confirmed_full_sync_uses_required_direction_and_creates_backup(
         await service.sync(sync_media=sync_media)
         result = await service.full_sync(upload=upload)
 
-    assert result == {"completed": True, "direction": direction, "backup_created": True}
+    assert result == {
+        "completed": True,
+        "direction": direction,
+        "backup_created": backup_created,
+    }
     assert full_calls == [("host-key", expected_server_usn, upload)]
     assert backups == [str(Path(populated_collection).parent / "backups")]
 

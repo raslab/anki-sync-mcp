@@ -82,7 +82,8 @@ authentication are separate. Call `anki_sync_login` after each service restart, 
 `anki_sync` explicitly before reading remote changes or after local mutations. The returned sync
 payload never contains the configured password, Anki host key, or endpoint. When it reports
 `FULL_SYNC`, `FULL_DOWNLOAD`, or `FULL_UPLOAD`, call the matching confirmed full-sync tool. Both
-directions create a local backup first; the service never chooses a destructive direction itself.
+directions request a local backup first; Anki may reuse the current backup when the collection is
+unchanged, reported as `backup_created=false`. The service never chooses a destructive direction itself.
 
 ## Run as the OpenClaw sidecar
 
@@ -121,7 +122,7 @@ Exactly one token source is required. Setting both is a startup error.
 | --- | --- | --- |
 | `MCP_AUTH_TOKEN` | — | Bearer token supplied directly. |
 | `MCP_AUTH_TOKEN_FILE` | — | File containing the bearer token; preferred in containers. |
-| `ANKI_SYNC_USERNAME` | — | Required remote sync account username. |
+| `ANKI_SYNC_USERNAME` | empty | Remote sync account username. The service can start without it, but `anki_sync_login` rejects calls until it is configured. |
 | `ANKI_SYNC_PASSWORD` | — | Remote sync password supplied directly; intended for local development only. |
 | `ANKI_SYNC_PASSWORD_FILE` | — | File containing the remote sync password; used by Compose and preferred in containers. |
 | `ANKI_SYNC_HOST` | empty | Empty selects AnkiWeb; otherwise an HTTPS self-hosted sync base URL. HTTP is accepted only for loopback development. User-info, query strings, and fragments are rejected. |
@@ -176,7 +177,8 @@ The collection executor owns the `anki.collection.Collection` object on exactly 
 worker thread. All tool calls, including remote login and sync, are serialized through that thread.
 Sync is explicit rather than automatic: callers should use `sync -> mutate -> sync`. Full sync
 requires a preceding server requirement, a direction-compatible tool, strict confirmation, and a
-local backup under the collection's `backups/` directory. Delete tools
+local backup request under the collection's `backups/` directory. Anki may reuse an existing current
+backup when no local data changed. Delete tools
 require a strict JSON boolean `confirm=true`; the Default deck cannot be deleted, and deleting any
 other deck removes its contained cards. Card creation, field updates, and moves support only Anki's
 built-in single-card Basic note type (`Front` and `Back`). Back up the persistent volume before

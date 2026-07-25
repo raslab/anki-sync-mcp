@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     auth_token_input: SecretStr | None = Field(None, alias="MCP_AUTH_TOKEN")
     auth_token_file: Path | None = Field(None, alias="MCP_AUTH_TOKEN_FILE")
     collection_path: Path = Field(Path("/data/collection.anki2"), alias="ANKI_COLLECTION_PATH")
-    sync_username: str = Field(min_length=1, alias="ANKI_SYNC_USERNAME")
+    sync_username: str = Field("", alias="ANKI_SYNC_USERNAME")
     sync_password_input: SecretStr | None = Field(None, alias="ANKI_SYNC_PASSWORD")
     sync_password_file: Path | None = Field(None, alias="ANKI_SYNC_PASSWORD_FILE")
     sync_host: str = Field("", alias="ANKI_SYNC_HOST")
@@ -105,13 +105,6 @@ class Settings(BaseSettings):
     )
     auth_token: SecretStr = Field(default=SecretStr(""), exclude=True)
     sync_password: SecretStr = Field(default=SecretStr(""), exclude=True)
-
-    @field_validator("sync_username")
-    @classmethod
-    def valid_sync_username(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("ANKI_SYNC_USERNAME must not be blank")
-        return value
 
     @field_validator("sync_password")
     @classmethod
