@@ -10,7 +10,7 @@ from anki.errors import NetworkError, SyncError, SyncErrorKind
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, StrictStr
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -24,6 +24,7 @@ from anki_mcp.collection import (
     DuplicateNoteError,
     FullSyncRequiredError,
     IdempotencyConflictError,
+    MediaSyncFailedError,
     SyncLoginRequiredError,
 )
 from anki_mcp.config import Settings
@@ -43,6 +44,11 @@ ResourceName = Annotated[StrictStr, Field(min_length=1, max_length=512)]
 MediaFilename = Annotated[StrictStr, Field(min_length=1, max_length=255)]
 MediaContent = Annotated[StrictStr, Field(min_length=1, max_length=22_369_624)]
 StableIds = Annotated[list[StableId], Field(min_length=1, max_length=500)]
+NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
+PositiveInt = Annotated[StrictInt, Field(gt=0)]
+CardFlag = Annotated[StrictInt, Field(ge=0, le=7)]
+DailyLimit = Annotated[StrictInt, Field(ge=0, le=999_999)]
+Retention = Annotated[StrictFloat, Field(ge=0.7, le=0.99)]
 Tags = Annotated[list[Tag], Field(max_length=100)]
 NoteFields = dict[Annotated[StrictStr, Field(min_length=1, max_length=512)], CardText]
 
@@ -64,6 +70,23 @@ class NoteTypeTemplateInput(BaseModel):
     answer_format: CardText
 
 
+class NoteTypeFieldMappingInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    name: ResourceName
+    source_ordinal: NonNegativeInt | None = None
+
+
+class NoteTypeTemplateMappingInput(NoteTypeTemplateInput):
+    source_ordinal: NonNegativeInt | None = None
+
+
+FieldMappings = Annotated[list[NoteTypeFieldMappingInput], Field(min_length=1, max_length=1000)]
+TemplateMappings = Annotated[
+    list[NoteTypeTemplateMappingInput], Field(min_length=1, max_length=1000)
+]
+
+
 class ResponseTooLargeError(RuntimeError):
     """Raised when a tool result exceeds the configured serialized response budget."""
 
@@ -79,6 +102,7 @@ def create_app(settings: Settings) -> ASGIApp:
         settings.max_card_fields,
         settings.max_batch_size,
         settings.max_media_bytes,
+        settings.sync_timeout_seconds,
         settings.sync_on_read,
         settings.sync_on_write,
     )
@@ -136,6 +160,8 @@ def create_app(settings: Settings) -> ASGIApp:
             raise_tool_error("INVALID_ARGUMENT", str(exc), exc)
         except SyncLoginRequiredError as exc:
             raise_tool_error("AUTHENTICATION_FAILED", str(exc), exc)
+        except MediaSyncFailedError as exc:
+            raise_tool_error("MEDIA_SYNC_FAILED", str(exc), exc)
         except ResponseTooLargeError as exc:
             raise_tool_error("RESPONSE_TOO_LARGE", str(exc), exc)
         except NetworkError as exc:
@@ -165,6 +191,23 @@ def create_app(settings: Settings) -> ASGIApp:
     async def status() -> dict[str, Any]:
         """Return actionable local collection, authentication, sync, and recovery status."""
         return await execute(service.status())
+
+    @scoped_tool(name="anki_operations_list", scope="read")
+    async def operations_list(
+        offset: Offset = 0, limit: PageLimit = settings.max_page_size
+    ) -> dict[str, Any]:
+        """List durable mutation operations and their synchronization state."""
+        return await execute(service.list_operations(offset, limit))
+
+    @scoped_tool(name="anki_operations_get", scope="read")
+    async def operations_get(idempotency_key: IdempotencyKey) -> dict[str, Any]:
+        """Get one durable mutation operation by idempotency key."""
+        return await execute(service.get_operation(idempotency_key))
+
+    @scoped_tool(name="anki_metrics", scope="read")
+    async def metrics() -> dict[str, Any]:
+        """Return content-free durable mutation and synchronization metrics."""
+        return await execute(service.metrics())
 
     @scoped_tool(name="anki_sync_login", scope="admin")
     async def sync_login() -> dict[str, Any]:
@@ -253,6 +296,36 @@ def create_app(settings: Settings) -> ASGIApp:
             idempotency_key,
             {"deck_id": deck_id, "name": name},
             lambda adapter: adapter.update_deck(deck_id, name),
+        )
+
+    @scoped_tool(name="anki_decks_update_config", scope="admin")
+    async def decks_update_config(
+        deck_id: StableId,
+        new_cards_per_day: DailyLimit | None = None,
+        reviews_per_day: DailyLimit | None = None,
+        max_answer_seconds: NonNegativeInt | None = None,
+        desired_retention: Retention | None = None,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Update supported bounded options on a deck's shared configuration."""
+        request = {
+            "deck_id": deck_id,
+            "new_cards_per_day": new_cards_per_day,
+            "reviews_per_day": reviews_per_day,
+            "max_answer_seconds": max_answer_seconds,
+            "desired_retention": desired_retention,
+        }
+        return await mutate(
+            "anki_decks_update_config",
+            idempotency_key,
+            request,
+            lambda adapter: adapter.update_deck_config(
+                deck_id,
+                new_cards_per_day,
+                reviews_per_day,
+                max_answer_seconds,
+                desired_retention,
+            ),
         )
 
     @scoped_tool(
@@ -536,6 +609,46 @@ def create_app(settings: Settings) -> ASGIApp:
             lambda adapter: adapter.unsuspend_cards(card_ids),
         )
 
+    @scoped_tool(name="anki_cards_set_flag", scope="write")
+    async def cards_set_flag(
+        card_ids: StableIds,
+        flag: CardFlag,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Set or clear the flag on a bounded set of cards."""
+        return await mutate(
+            "anki_cards_set_flag",
+            idempotency_key,
+            {"card_ids": card_ids, "flag": flag},
+            lambda adapter: adapter.set_card_flag(card_ids, flag),
+        )
+
+    @scoped_tool(name="anki_cards_reposition", scope="admin")
+    async def cards_reposition(
+        card_ids: StableIds,
+        starting_from: PositiveInt,
+        step_size: PositiveInt = 1,
+        randomize: StrictBool = False,
+        shift_existing: StrictBool = True,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Reposition a bounded set of new cards using explicit scheduling controls."""
+        request = {
+            "card_ids": card_ids,
+            "starting_from": starting_from,
+            "step_size": step_size,
+            "randomize": randomize,
+            "shift_existing": shift_existing,
+        }
+        return await mutate(
+            "anki_cards_reposition",
+            idempotency_key,
+            request,
+            lambda adapter: adapter.reposition_cards(
+                card_ids, starting_from, step_size, randomize, shift_existing
+            ),
+        )
+
     @scoped_tool(
         name="anki_cards_delete",
         scope="destructive",
@@ -635,6 +748,44 @@ def create_app(settings: Settings) -> ASGIApp:
         )
 
     @scoped_tool(
+        name="anki_note_type_fields_update",
+        scope="admin",
+        enabled=settings.allow_schema_changes,
+    )
+    async def note_type_fields_update(
+        note_type_id: StableId,
+        mappings: FieldMappings,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Add, remove, rename, and reorder fields using explicit source mappings."""
+        mapping_values = [mapping.model_dump() for mapping in mappings]
+        return await mutate(
+            "anki_note_type_fields_update",
+            idempotency_key,
+            {"note_type_id": note_type_id, "mappings": mapping_values},
+            lambda adapter: adapter.update_note_type_fields(note_type_id, mapping_values),
+        )
+
+    @scoped_tool(
+        name="anki_templates_update",
+        scope="admin",
+        enabled=settings.allow_schema_changes,
+    )
+    async def templates_update(
+        note_type_id: StableId,
+        mappings: TemplateMappings,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Add, remove, update, and reorder templates using explicit source mappings."""
+        mapping_values = [mapping.model_dump() for mapping in mappings]
+        return await mutate(
+            "anki_templates_update",
+            idempotency_key,
+            {"note_type_id": note_type_id, "mappings": mapping_values},
+            lambda adapter: adapter.update_templates(note_type_id, mapping_values),
+        )
+
+    @scoped_tool(
         name="anki_note_types_delete",
         scope="destructive",
         enabled=settings.allow_destructive and settings.allow_schema_changes,
@@ -676,6 +827,21 @@ def create_app(settings: Settings) -> ASGIApp:
         return await execute(
             service.coordinated_read(
                 lambda adapter: adapter.get_media(filename), sync_before, sync_media=True
+            )
+        )
+
+    @scoped_tool(name="anki_media_check", scope="read")
+    async def media_check(
+        offset: Offset = 0,
+        limit: PageLimit = settings.max_page_size,
+        sync_before: SyncMedia = False,
+    ) -> dict[str, Any]:
+        """Report bounded missing and unused media after optional synchronization."""
+        return await execute(
+            service.coordinated_read(
+                lambda adapter: adapter.check_media(offset, limit),
+                sync_before,
+                sync_media=True,
             )
         )
 

@@ -61,6 +61,9 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
     names = [tool["name"] for tool in tools]
     assert names == [
         "anki_status",
+        "anki_operations_list",
+        "anki_operations_get",
+        "anki_metrics",
         "anki_sync_login",
         "anki_sync",
         "anki_backup_create",
@@ -68,6 +71,7 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
         "anki_decks_get",
         "anki_decks_create",
         "anki_decks_update",
+        "anki_decks_update_config",
         "anki_notes_search",
         "anki_notes_get",
         "anki_notes_create",
@@ -84,10 +88,13 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
         "anki_cards_change_deck",
         "anki_cards_suspend",
         "anki_cards_unsuspend",
+        "anki_cards_set_flag",
+        "anki_cards_reposition",
         "anki_note_types_list",
         "anki_note_types_get",
         "anki_media_list",
         "anki_media_get",
+        "anki_media_check",
         "anki_media_store",
         "anki_media_rename",
     ]
@@ -131,6 +138,9 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
         )
     assert [tool["name"] for tool in listed.json()["result"]["tools"]] == [
         "anki_status",
+        "anki_operations_list",
+        "anki_operations_get",
+        "anki_metrics",
         "anki_decks_list",
         "anki_decks_get",
         "anki_notes_search",
@@ -142,6 +152,7 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
         "anki_note_types_get",
         "anki_media_list",
         "anki_media_get",
+        "anki_media_check",
     ]
 
     all_enabled = phase_settings.model_copy(

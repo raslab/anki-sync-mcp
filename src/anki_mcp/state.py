@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,25 @@ class PersistentState:
                 receipt_json text not null
             )
             """
+        )
+        columns = {
+            str(row[1])
+            for row in self.connection.execute("pragma table_info(mutation_receipts)").fetchall()
+        }
+        if "created_at" not in columns:
+            self.connection.execute(
+                "alter table mutation_receipts add column created_at text not null default ''"
+            )
+        if "updated_at" not in columns:
+            self.connection.execute(
+                "alter table mutation_receipts add column updated_at text not null default ''"
+            )
+        migrated_at = datetime.now(UTC).isoformat()
+        self.connection.execute(
+            "update mutation_receipts set created_at = ? where created_at = ''", (migrated_at,)
+        )
+        self.connection.execute(
+            "update mutation_receipts set updated_at = ? where updated_at = ''", (migrated_at,)
         )
         self.connection.commit()
 
@@ -60,15 +80,89 @@ class PersistentState:
         self, key: str, operation: str, request_hash: str, receipt: dict[str, Any]
     ) -> None:
         encoded = json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        now = datetime.now(UTC).isoformat()
         self.connection.execute(
             """
-            insert into mutation_receipts(idempotency_key, operation, request_hash, receipt_json)
-            values (?, ?, ?, ?)
-            on conflict(idempotency_key) do update set receipt_json = excluded.receipt_json
+            insert into mutation_receipts(
+                idempotency_key, operation, request_hash, receipt_json, created_at, updated_at
+            )
+            values (?, ?, ?, ?, ?, ?)
+            on conflict(idempotency_key) do update set
+                receipt_json = excluded.receipt_json,
+                updated_at = excluded.updated_at
             """,
-            (key, operation, request_hash, encoded),
+            (key, operation, request_hash, encoded, now, now),
         )
         self.connection.commit()
+
+    def get_operation(self, key: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            select operation, receipt_json, created_at, updated_at
+            from mutation_receipts where idempotency_key = ?
+            """,
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        operation, receipt_json, created_at, updated_at = row
+        return {
+            "idempotency_key": key,
+            "operation": str(operation),
+            "created_at": str(created_at),
+            "updated_at": str(updated_at),
+            "receipt": json.loads(receipt_json),
+        }
+
+    def list_operations(self, offset: int, limit: int) -> tuple[list[dict[str, Any]], int]:
+        total = int(self.connection.execute("select count(*) from mutation_receipts").fetchone()[0])
+        rows = self.connection.execute(
+            """
+            select idempotency_key, operation, receipt_json, created_at, updated_at
+            from mutation_receipts order by updated_at desc, rowid desc limit ? offset ?
+            """,
+            (limit, offset),
+        ).fetchall()
+        return (
+            [
+                {
+                    "idempotency_key": str(key),
+                    "operation": str(operation),
+                    "created_at": str(created_at),
+                    "updated_at": str(updated_at),
+                    "receipt": json.loads(receipt_json),
+                }
+                for key, operation, receipt_json, created_at, updated_at in rows
+            ],
+            total,
+        )
+
+    def metrics(self) -> dict[str, Any]:
+        rows = self.connection.execute(
+            "select operation, receipt_json from mutation_receipts"
+        ).fetchall()
+        by_operation: dict[str, int] = {}
+        committed = 0
+        outcome_unknown = 0
+        pending = 0
+        for operation, receipt_json in rows:
+            name = str(operation)
+            by_operation[name] = by_operation.get(name, 0) + 1
+            receipt = json.loads(receipt_json)
+            committed += receipt.get("state") == "committed"
+            outcome_unknown += receipt.get("state") == "outcome_unknown"
+            pending += (
+                not bool(receipt.get("remote_synced")) or receipt.get("media_synced") is False
+            ) and receipt.get("state") != "discarded_by_full_download"
+        return {
+            "mutations": {
+                "total": len(rows),
+                "committed": committed,
+                "outcome_unknown": outcome_unknown,
+                "pending": pending,
+                "by_operation": dict(sorted(by_operation.items())),
+            }
+        }
 
     def delete_receipt(self, key: str) -> None:
         self.connection.execute("delete from mutation_receipts where idempotency_key = ?", (key,))
@@ -100,8 +194,11 @@ class PersistentState:
                     receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
                 )
                 self.connection.execute(
-                    "update mutation_receipts set receipt_json = ? where idempotency_key = ?",
-                    (encoded, key),
+                    """
+                    update mutation_receipts set receipt_json = ?, updated_at = ?
+                    where idempotency_key = ?
+                    """,
+                    (encoded, datetime.now(UTC).isoformat(), key),
                 )
         self.connection.commit()
 
@@ -140,8 +237,11 @@ class PersistentState:
                     receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
                 )
                 self.connection.execute(
-                    "update mutation_receipts set receipt_json = ? where idempotency_key = ?",
-                    (encoded, key),
+                    """
+                    update mutation_receipts set receipt_json = ?, updated_at = ?
+                    where idempotency_key = ?
+                    """,
+                    (encoded, datetime.now(UTC).isoformat(), key),
                 )
         self.connection.commit()
 

@@ -9,6 +9,7 @@ import pytest
 from anki.collection import Collection
 from anki.errors import NetworkError, SyncError, SyncErrorKind
 from anki.sync import SyncAuth, SyncOutput
+from anki.sync_pb2 import MediaSyncStatusResponse
 from starlette.testclient import TestClient
 
 from anki_mcp.app import create_app
@@ -193,6 +194,9 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     names = [tool["name"] for tool in tools]
     assert names == [
         "anki_status",
+        "anki_operations_list",
+        "anki_operations_get",
+        "anki_metrics",
         "anki_sync_login",
         "anki_sync",
         "anki_sync_full_download",
@@ -202,6 +206,7 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_decks_get",
         "anki_decks_create",
         "anki_decks_update",
+        "anki_decks_update_config",
         "anki_decks_delete",
         "anki_notes_search",
         "anki_notes_get",
@@ -221,14 +226,19 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_cards_change_deck",
         "anki_cards_suspend",
         "anki_cards_unsuspend",
+        "anki_cards_set_flag",
+        "anki_cards_reposition",
         "anki_cards_delete",
         "anki_note_types_list",
         "anki_note_types_get",
         "anki_note_types_create",
         "anki_note_types_update",
+        "anki_note_type_fields_update",
+        "anki_templates_update",
         "anki_note_types_delete",
         "anki_media_list",
         "anki_media_get",
+        "anki_media_check",
         "anki_media_store",
         "anki_media_rename",
         "anki_media_delete",
@@ -250,6 +260,121 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_media_delete",
     ):
         assert by_name[name]["inputSchema"]["properties"]["confirm"]["type"] == "boolean"
+
+
+def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -> None:
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    initialized = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1"},
+            },
+        },
+    )
+    headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+    request_id = 1
+
+    def call(name: str, arguments: dict[str, object]) -> dict[str, Any]:
+        nonlocal request_id
+        request_id += 1
+        response = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+        )
+        result = response.json()["result"]
+        assert result.get("isError") is not True, result
+        return json.loads(result["content"][0]["text"])
+
+    decks = call("anki_decks_list", {})
+    deck_id = next(item["id"] for item in decks["items"] if item["name"] == "Languages::Spanish")
+    cards = call("anki_cards_search", {"query": 'deck:"Languages::Spanish"'})
+    card_id = cards["items"][0]["id"]
+    note_types = call("anki_note_types_list", {})
+    note_type_id = next(item["id"] for item in note_types["items"] if item["name"] == "Basic")
+
+    deck_config = call(
+        "anki_decks_update_config",
+        {
+            "deck_id": deck_id,
+            "new_cards_per_day": 13,
+            "reviews_per_day": 77,
+            "max_answer_seconds": 42,
+            "desired_retention": 0.9,
+            "idempotency_key": "phase2-deck-config",
+        },
+    )
+    flagged = call(
+        "anki_cards_set_flag",
+        {"card_ids": [card_id], "flag": 4, "idempotency_key": "phase2-flag"},
+    )
+    repositioned = call(
+        "anki_cards_reposition",
+        {
+            "card_ids": [card_id],
+            "starting_from": 20,
+            "step_size": 1,
+            "randomize": False,
+            "shift_existing": True,
+            "idempotency_key": "phase2-reposition",
+        },
+    )
+    fields = call(
+        "anki_note_type_fields_update",
+        {
+            "note_type_id": note_type_id,
+            "mappings": [
+                {"name": "Back", "source_ordinal": 1},
+                {"name": "Hint", "source_ordinal": None},
+                {"name": "Front", "source_ordinal": 0},
+            ],
+            "idempotency_key": "phase2-fields",
+        },
+    )
+    templates = call(
+        "anki_templates_update",
+        {
+            "note_type_id": note_type_id,
+            "mappings": [
+                {
+                    "name": "Card 1",
+                    "source_ordinal": 0,
+                    "question_format": "{{Front}}",
+                    "answer_format": "{{FrontSide}}<hr id=answer>{{Back}}",
+                }
+            ],
+            "idempotency_key": "phase2-templates",
+        },
+    )
+    media = call("anki_media_check", {})
+    operations = call("anki_operations_list", {})
+    operation = call("anki_operations_get", {"idempotency_key": "phase2-deck-config"})
+    metrics = call("anki_metrics", {})
+
+    assert deck_config["result"]["updated"] is True
+    assert flagged["result"]["flag"] == 4
+    assert repositioned["result"]["repositioned"] == 1
+    assert fields["result"]["field_count"] == 3
+    assert templates["result"]["template_count"] == 1
+    assert media["missing_total"] == 0
+    assert operations["total"] == 5
+    assert operation["operation"] == "anki_decks_update_config"
+    assert metrics["mutations"]["total"] == 5
 
 
 def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) -> None:
@@ -533,6 +658,68 @@ def test_sync_failures_have_safe_machine_readable_codes(
     assert result["isError"] is True
     assert payload["code"] == expected_code
     assert "secret" not in payload["message"]
+
+
+def test_media_sync_timeout_has_stable_error_and_preserves_authentication(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    custom = settings.model_copy(update={"sync_timeout_seconds": 0.001})
+    monkeypatch.setattr(
+        Collection,
+        "sync_login",
+        lambda self, username, password, endpoint: SyncAuth(hkey="phase2", endpoint=endpoint),
+    )
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: SyncOutput(required=0),
+    )
+    monkeypatch.setattr(
+        "anki._backend.RustBackend.media_sync_status",
+        lambda self: MediaSyncStatusResponse(active=True),
+    )
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(create_app(custom)) as custom_client:
+        initialized = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                },
+            },
+        )
+        headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+
+        def call(request_id: int, name: str, arguments: dict[str, object]) -> dict[str, Any]:
+            return custom_client.post(
+                "/mcp",
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                },
+            ).json()["result"]
+
+        assert call(2, "anki_sync_login", {}).get("isError") is not True
+        failed = call(3, "anki_sync", {"sync_media": True})
+        status = call(4, "anki_status", {})
+
+    text = failed["content"][0]["text"]
+    payload = json.loads(text[text.index("{") :])
+    assert failed["isError"] is True
+    assert payload["code"] == "MEDIA_SYNC_FAILED"
+    assert json.loads(status["content"][0]["text"])["authenticated"] is True
 
 
 def test_sync_login_rejects_an_unconfigured_username_before_contacting_remote(

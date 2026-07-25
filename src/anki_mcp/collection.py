@@ -3,7 +3,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
+import json
+import logging
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -27,6 +31,7 @@ if TYPE_CHECKING:
     from anki.notes import NoteId
 
 T = TypeVar("T")
+AUDIT_LOGGER = logging.getLogger("anki_mcp.audit")
 SYNC_REQUIRED_NAMES = (
     "NO_CHANGES",
     "NORMAL_SYNC",
@@ -52,6 +57,10 @@ class IdempotencyConflictError(ValueError):
     """Raised when an idempotency key is reused with different content."""
 
 
+class MediaSyncFailedError(TimeoutError):
+    """Raised when requested media synchronization does not complete safely."""
+
+
 class CollectionAdapter:
     """Synchronous adapter; an instance must only be used by its owning thread."""
 
@@ -64,6 +73,7 @@ class CollectionAdapter:
         max_card_fields: int = 100,
         max_batch_size: int = 50,
         max_media_bytes: int = 1_048_576,
+        sync_timeout_seconds: float = 300,
         sync_on_read: bool = False,
         sync_on_write: bool = False,
     ) -> None:
@@ -76,6 +86,7 @@ class CollectionAdapter:
         self.max_card_fields = max_card_fields
         self.max_batch_size = max_batch_size
         self.max_media_bytes = max_media_bytes
+        self.sync_timeout_seconds = sync_timeout_seconds
         self.sync_on_read = sync_on_read
         self.sync_on_write = sync_on_write
         self._backup_folder = Path(path).parent / "backups"
@@ -100,6 +111,8 @@ class CollectionAdapter:
             else None
         )
         self._last_sync_at = status.get("last_sync_at")
+        self._last_media_sync_at = status.get("last_media_sync_at")
+        self._media_sync_progress = status.get("media_sync_progress")
 
     def close(self) -> None:
         try:
@@ -119,7 +132,14 @@ class CollectionAdapter:
                 "required": self._pending_full_sync[0],
                 "server_media_usn": self._pending_full_sync[1],
             }
-        self._state.save_status({"last_sync_at": self._last_sync_at, "pending_full_sync": pending})
+        self._state.save_status(
+            {
+                "last_sync_at": self._last_sync_at,
+                "last_media_sync_at": self._last_media_sync_at,
+                "media_sync_progress": self._media_sync_progress,
+                "pending_full_sync": pending,
+            }
+        )
 
     def _invalidate_sync_auth(self) -> None:
         self._sync_auth = None
@@ -153,15 +173,57 @@ class CollectionAdapter:
             "readiness_reason": reason,
             "pending_full_sync": pending_name,
             "last_sync_at": self._last_sync_at,
+            "last_media_sync_at": self._last_media_sync_at,
+            "media_sync_progress": self._media_sync_progress,
             "pending_mutations": self._state.pending_receipt_count(),
         }
 
+    def get_operation(self, idempotency_key: str) -> dict[str, Any]:
+        operation = self._state.get_operation(idempotency_key)
+        if operation is None:
+            raise LookupError(f"operation {idempotency_key} not found")
+        return operation
+
+    def list_operations(self, offset: int, limit: int) -> dict[str, Any]:
+        self._page([], offset, limit)
+        items, total = self._state.list_operations(offset, limit)
+        return {
+            "items": items,
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "has_more": offset + limit < total,
+        }
+
+    def metrics(self) -> dict[str, Any]:
+        metrics = self._state.metrics()
+        metrics["sync"] = {
+            "last_successful_collection_sync_at": self._last_sync_at,
+            "last_successful_media_sync_at": self._last_media_sync_at,
+            "media_progress": self._media_sync_progress,
+            "pending_full_sync": (
+                SYNC_REQUIRED_NAMES[self._pending_full_sync[0]]
+                if self._pending_full_sync is not None
+                else None
+            ),
+        }
+        return metrics
+
     def create_backup(self) -> dict[str, Any]:
         self._backup_folder.mkdir(parents=True, exist_ok=True)
+        existing = set(self._backup_folder.glob("*.colpkg"))
         created = self.collection.create_backup(
             backup_folder=str(self._backup_folder), force=True, wait_for_completion=True
         )
-        return {"requested": True, "created": bool(created)}
+        candidates = set(self._backup_folder.glob("*.colpkg")) - existing
+        if not candidates:
+            candidates = set(self._backup_folder.glob("*.colpkg"))
+        path = max(candidates, key=lambda item: item.stat().st_mtime_ns) if candidates else None
+        return {
+            "requested": True,
+            "created": bool(created),
+            "path": str(path) if path is not None else None,
+        }
 
     def bootstrap(
         self,
@@ -212,6 +274,36 @@ class CollectionAdapter:
         mutate: Callable[[CollectionAdapter], dict[str, Any]],
         sync_media: bool = False,
     ) -> dict[str, Any]:
+        started = time.monotonic()
+
+        def audit(receipt: dict[str, Any]) -> None:
+            target_count = max(
+                (
+                    len(value)
+                    for key, value in request.items()
+                    if key.endswith("_ids") and isinstance(value, list)
+                ),
+                default=1,
+            )
+            AUDIT_LOGGER.info(
+                json.dumps(
+                    {
+                        "event": "anki_mutation",
+                        "tool": operation,
+                        "operation_id": hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[
+                            :16
+                        ],
+                        "target_count": target_count,
+                        "local_committed": receipt.get("local_committed"),
+                        "remote_synced": receipt.get("remote_synced"),
+                        "media_synced": receipt.get("media_synced"),
+                        "retryable": receipt.get("retryable"),
+                        "duration_ms": round((time.monotonic() - started) * 1000, 3),
+                    },
+                    separators=(",", ":"),
+                )
+            )
+
         if not idempotency_key or len(idempotency_key.encode("utf-8")) > 128:
             raise ValueError("idempotency_key must contain 1 to 128 UTF-8 bytes")
         request_hash = self._state.request_hash(operation, request)
@@ -239,6 +331,7 @@ class CollectionAdapter:
                     receipt["media_synced"] = True
                 receipt["retryable"] = False
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
+            audit(receipt)
             return receipt
 
         if self.sync_on_write:
@@ -279,11 +372,13 @@ class CollectionAdapter:
                 receipt["remote_synced"] = False
                 receipt["retryable"] = True
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
+                audit(receipt)
                 return receipt
             receipt["remote_synced"] = True
             if sync_media:
                 receipt["media_synced"] = True
             self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
+        audit(receipt)
         return receipt
 
     def _sync_or_raise_full_sync(self, sync_media: bool) -> dict[str, Any]:
@@ -375,6 +470,48 @@ class CollectionAdapter:
             raise ValueError("deck name must not be blank")
         self.collection.decks.rename(cast("DeckId", deck_id), name)
         return {"id": deck_id, "updated": True}
+
+    def update_deck_config(
+        self,
+        deck_id: int,
+        new_cards_per_day: int | None = None,
+        reviews_per_day: int | None = None,
+        max_answer_seconds: int | None = None,
+        desired_retention: float | None = None,
+    ) -> dict[str, Any]:
+        deck = self.collection.decks.get(cast("DeckId", deck_id), default=False)
+        if deck is None:
+            raise LookupError(f"deck {deck_id} not found")
+        if bool(deck.get("dyn", 0)):
+            raise ValueError("dynamic decks do not have an editable deck configuration")
+        updates = (
+            new_cards_per_day,
+            reviews_per_day,
+            max_answer_seconds,
+            desired_retention,
+        )
+        if all(value is None for value in updates):
+            raise ValueError("at least one deck configuration update must be provided")
+        for name, value in (
+            ("new_cards_per_day", new_cards_per_day),
+            ("reviews_per_day", reviews_per_day),
+            ("max_answer_seconds", max_answer_seconds),
+        ):
+            if value is not None and not 0 <= value <= 999_999:
+                raise ValueError(f"{name} must be between 0 and 999999")
+        if desired_retention is not None and not 0.7 <= desired_retention <= 0.99:
+            raise ValueError("desired_retention must be between 0.7 and 0.99")
+        config = self.collection.decks.config_dict_for_deck_id(cast("DeckId", deck_id))
+        if new_cards_per_day is not None:
+            config.setdefault("new", {})["perDay"] = new_cards_per_day
+        if reviews_per_day is not None:
+            config.setdefault("rev", {})["perDay"] = reviews_per_day
+        if max_answer_seconds is not None:
+            config["maxTaken"] = max_answer_seconds
+        if desired_retention is not None:
+            config["desiredRetention"] = desired_retention
+        self.collection.decks.update_config(config)
+        return {"id": deck_id, "config_id": int(config["id"]), "updated": True}
 
     def _raise_after_delete_failure(
         self,
@@ -785,6 +922,91 @@ class CollectionAdapter:
         self.collection.models.update_dict(model)
         return {"id": note_type_id, "updated": True}
 
+    def update_note_type_fields(
+        self, note_type_id: int, mappings: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        model = self.collection.models.get(cast("NotetypeId", note_type_id))
+        if model is None:
+            raise LookupError(f"note type {note_type_id} not found")
+        if not mappings or len(mappings) > self.max_card_fields:
+            raise ValueError(
+                f"fields must contain between 1 and {self.max_card_fields} explicit mappings"
+            )
+        names = [str(mapping["name"]) for mapping in mappings]
+        if any(not name.strip() for name in names):
+            raise ValueError("field names must not be blank")
+        if len({name.casefold() for name in names}) != len(names):
+            raise ValueError("field names must be unique")
+        current = list(model.get("flds", []))
+        source_ordinals = [mapping.get("source_ordinal") for mapping in mappings]
+        retained = [ordinal for ordinal in source_ordinals if ordinal is not None]
+        if any(
+            not isinstance(ordinal, int) or not 0 <= ordinal < len(current) for ordinal in retained
+        ):
+            raise ValueError("field source_ordinal does not identify an existing field")
+        if len(set(retained)) != len(retained):
+            raise ValueError("field source_ordinal values must not be reused")
+        desired = []
+        for name, source_ordinal in zip(names, source_ordinals, strict=True):
+            if source_ordinal is None:
+                field = self.collection.models.new_field(name)
+                self.collection.models.add_field(model, field)
+            else:
+                field = current[source_ordinal]
+                self.collection.models.rename_field(model, field, name)
+            desired.append(field)
+        for ordinal, field in enumerate(current):
+            if ordinal not in retained:
+                self.collection.models.remove_field(model, field)
+        for index, field in enumerate(desired):
+            self.collection.models.reposition_field(model, field, index)
+        self.collection.models.update_dict(model)
+        return {"id": note_type_id, "updated": True, "field_count": len(desired)}
+
+    def update_templates(self, note_type_id: int, mappings: list[dict[str, Any]]) -> dict[str, Any]:
+        model = self.collection.models.get(cast("NotetypeId", note_type_id))
+        if model is None:
+            raise LookupError(f"note type {note_type_id} not found")
+        if int(model.get("type", 0)) == 1:
+            raise ValueError("cloze note types do not support template structure changes")
+        if not mappings or len(mappings) > self.max_card_fields:
+            raise ValueError(
+                f"templates must contain between 1 and {self.max_card_fields} explicit mappings"
+            )
+        names = [str(mapping["name"]) for mapping in mappings]
+        if any(not name.strip() for name in names):
+            raise ValueError("template names must not be blank")
+        if len({name.casefold() for name in names}) != len(names):
+            raise ValueError("template names must be unique")
+        current = list(model.get("tmpls", []))
+        source_ordinals = [mapping.get("source_ordinal") for mapping in mappings]
+        retained = [ordinal for ordinal in source_ordinals if ordinal is not None]
+        if any(
+            not isinstance(ordinal, int) or not 0 <= ordinal < len(current) for ordinal in retained
+        ):
+            raise ValueError("template source_ordinal does not identify an existing template")
+        if len(set(retained)) != len(retained):
+            raise ValueError("template source_ordinal values must not be reused")
+        desired = []
+        for mapping, source_ordinal in zip(mappings, source_ordinals, strict=True):
+            name = str(mapping["name"])
+            if source_ordinal is None:
+                template = self.collection.models.new_template(name)
+                self.collection.models.add_template(model, template)
+            else:
+                template = current[source_ordinal]
+                template["name"] = name
+            template["qfmt"] = str(mapping["question_format"])
+            template["afmt"] = str(mapping["answer_format"])
+            desired.append(template)
+        for ordinal, template in enumerate(current):
+            if ordinal not in retained:
+                self.collection.models.remove_template(model, template)
+        for index, template in enumerate(desired):
+            self.collection.models.reposition_template(model, template, index)
+        self.collection.models.update_dict(model)
+        return {"id": note_type_id, "updated": True, "template_count": len(desired)}
+
     def delete_note_type(self, note_type_id: int) -> dict[str, Any]:
         model = self.collection.models.get(cast("NotetypeId", note_type_id))
         if model is None:
@@ -906,6 +1128,26 @@ class CollectionAdapter:
         self._media_path(filename, require_exists=True)
         self.collection.media.trash_files([filename])
         return {"filename": filename, "deleted": True}
+
+    def check_media(self, offset: int, limit: int) -> dict[str, Any]:
+        self._page([], offset, limit)
+        response = self.collection.media.check()
+        missing = sorted((str(name) for name in response.missing), key=str.casefold)
+        unused = sorted((str(name) for name in response.unused), key=str.casefold)
+        if len(missing) > self.max_search_scan or len(unused) > self.max_search_scan:
+            raise ValueError(
+                "media check exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        return {
+            "missing": missing[offset : offset + limit],
+            "unused": unused[offset : offset + limit],
+            "missing_total": len(missing),
+            "unused_total": len(unused),
+            "offset": offset,
+            "limit": limit,
+            "has_more": offset + limit < max(len(missing), len(unused)),
+            "have_trash": bool(response.have_trash),
+        }
 
     def search_cards(self, query: str, offset: int, limit: int) -> dict[str, Any]:
         # Validate bounds before potentially expensive collection search.
@@ -1119,6 +1361,41 @@ class CollectionAdapter:
         self.collection.sched.unsuspend_cards([cast("CardId", card_id) for card_id in card_ids])
         return {"card_ids": card_ids, "suspended": False}
 
+    def set_card_flag(self, card_ids: list[int], flag: int) -> dict[str, Any]:
+        self._validate_card_ids(card_ids)
+        if not 0 <= flag <= 7:
+            raise ValueError("flag must be between 0 and 7")
+        changes = self.collection._backend.set_flag(  # pyright: ignore[reportPrivateUsage]
+            card_ids=card_ids, flag=flag
+        )
+        return {"card_ids": card_ids, "flag": flag, "updated": int(changes.count)}
+
+    def reposition_cards(
+        self,
+        card_ids: list[int],
+        starting_from: int,
+        step_size: int,
+        randomize: bool,
+        shift_existing: bool,
+    ) -> dict[str, Any]:
+        self._validate_card_ids(card_ids)
+        if starting_from < 1:
+            raise ValueError("starting_from must be at least 1")
+        if step_size < 1:
+            raise ValueError("step_size must be at least 1")
+        for card_id in card_ids:
+            card = self.collection.get_card(cast("CardId", card_id))
+            if int(card.type) != 0:
+                raise ValueError("card repositioning only supports new cards")
+        changes = self.collection.sched.reposition_new_cards(
+            [cast("CardId", card_id) for card_id in card_ids],
+            starting_from,
+            step_size,
+            randomize,
+            shift_existing,
+        )
+        return {"card_ids": card_ids, "repositioned": int(changes.count)}
+
     def sync_login(self, username: str, password: str, endpoint: str | None) -> dict[str, Any]:
         self._sync_auth = None
         self._configured_sync_endpoint = None
@@ -1135,6 +1412,34 @@ class CollectionAdapter:
             }
         )
         return {"authenticated": True, "endpoint_kind": "custom" if endpoint else "ankiweb"}
+
+    def _wait_for_media_sync(self) -> dict[str, Any]:
+        deadline = time.monotonic() + self.sync_timeout_seconds
+        while True:
+            status = self.collection._backend.media_sync_status()  # pyright: ignore[reportPrivateUsage]
+            progress = {
+                "checked": str(status.progress.checked),
+                "added": str(status.progress.added),
+                "removed": str(status.progress.removed),
+            }
+            if progress != self._media_sync_progress:
+                self._media_sync_progress = progress
+                self._save_operational_status()
+            if not status.active:
+                self._last_media_sync_at = datetime.now(UTC).isoformat()
+                self._save_operational_status()
+                return {"completed": True, **progress}
+            if time.monotonic() >= deadline:
+                try:
+                    self.collection.abort_media_sync()
+                except Exception as exc:
+                    raise MediaSyncFailedError(
+                        "media synchronization timed out and could not be aborted"
+                    ) from exc
+                raise MediaSyncFailedError(
+                    "media synchronization did not complete before the sync timeout"
+                )
+            time.sleep(0.05)
 
     def sync(self, sync_media: bool) -> dict[str, Any]:
         if self._sync_auth is None:
@@ -1163,6 +1468,7 @@ class CollectionAdapter:
             )
             self._save_operational_status()
             required = SYNC_REQUIRED_NAMES[output.required]
+            media_sync = self._wait_for_media_sync() if sync_media else None
             server_message, server_message_truncated = self._truncate_rendered(
                 output.server_message
             )
@@ -1172,10 +1478,11 @@ class CollectionAdapter:
                 "server_message_truncated": server_message_truncated,
                 "host_number": output.host_number,
                 "media_sync_requested": sync_media,
+                "media_sync": media_sync,
                 "endpoint_changed": endpoint_changed,
             }
         except Exception as exc:
-            if not isinstance(exc, NetworkError):
+            if not isinstance(exc, (NetworkError, TimeoutError)):
                 self._invalidate_sync_auth()
             raise
 
@@ -1238,6 +1545,7 @@ class CollectionExecutor:
         max_card_fields: int = 100,
         max_batch_size: int = 50,
         max_media_bytes: int = 1_048_576,
+        sync_timeout_seconds: float = 300,
         sync_on_read: bool = False,
         sync_on_write: bool = False,
     ) -> None:
@@ -1248,6 +1556,7 @@ class CollectionExecutor:
         self._max_card_fields = max_card_fields
         self._max_batch_size = max_batch_size
         self._max_media_bytes = max_media_bytes
+        self._sync_timeout_seconds = sync_timeout_seconds
         self._sync_on_read = sync_on_read
         self._sync_on_write = sync_on_write
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anki-collection")
@@ -1270,6 +1579,7 @@ class CollectionExecutor:
                 self._max_card_fields,
                 self._max_batch_size,
                 self._max_media_bytes,
+                self._sync_timeout_seconds,
                 self._sync_on_read,
                 self._sync_on_write,
             )
@@ -1308,6 +1618,7 @@ class AnkiCollectionService:
         max_card_fields: int = 100,
         max_batch_size: int = 50,
         max_media_bytes: int = 1_048_576,
+        sync_timeout_seconds: float = 300,
         sync_on_read: bool = False,
         sync_on_write: bool = False,
     ) -> None:
@@ -1319,6 +1630,7 @@ class AnkiCollectionService:
             max_card_fields,
             max_batch_size,
             max_media_bytes,
+            sync_timeout_seconds,
             sync_on_read,
             sync_on_write,
         )
@@ -1341,6 +1653,24 @@ class AnkiCollectionService:
 
     async def update_deck(self, deck_id: int, name: str) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.update_deck(deck_id, name))
+
+    async def update_deck_config(
+        self,
+        deck_id: int,
+        new_cards_per_day: int | None = None,
+        reviews_per_day: int | None = None,
+        max_answer_seconds: int | None = None,
+        desired_retention: float | None = None,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.update_deck_config(
+                deck_id,
+                new_cards_per_day,
+                reviews_per_day,
+                max_answer_seconds,
+                desired_retention,
+            )
+        )
 
     async def delete_deck(self, deck_id: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.delete_deck(deck_id))
@@ -1415,6 +1745,20 @@ class AnkiCollectionService:
             lambda adapter: adapter.update_note_type(note_type_id, name, fields, templates, css)
         )
 
+    async def update_note_type_fields(
+        self, note_type_id: int, mappings: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.update_note_type_fields(note_type_id, mappings)
+        )
+
+    async def update_templates(
+        self, note_type_id: int, mappings: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.update_templates(note_type_id, mappings)
+        )
+
     async def delete_note_type(self, note_type_id: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.delete_note_type(note_type_id))
 
@@ -1436,6 +1780,9 @@ class AnkiCollectionService:
 
     async def delete_media(self, filename: str) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.delete_media(filename))
+
+    async def check_media(self, offset: int, limit: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.check_media(offset, limit))
 
     async def search_cards(self, query: str, offset: int, limit: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.search_cards(query, offset, limit))
@@ -1465,6 +1812,23 @@ class AnkiCollectionService:
     async def unsuspend_cards(self, card_ids: list[int]) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.unsuspend_cards(card_ids))
 
+    async def set_card_flag(self, card_ids: list[int], flag: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.set_card_flag(card_ids, flag))
+
+    async def reposition_cards(
+        self,
+        card_ids: list[int],
+        starting_from: int,
+        step_size: int,
+        randomize: bool,
+        shift_existing: bool,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.reposition_cards(
+                card_ids, starting_from, step_size, randomize, shift_existing
+            )
+        )
+
     async def coordinated_read(
         self,
         read: Callable[[CollectionAdapter], T],
@@ -1491,6 +1855,15 @@ class AnkiCollectionService:
 
     async def status(self) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.status())
+
+    async def get_operation(self, idempotency_key: str) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.get_operation(idempotency_key))
+
+    async def list_operations(self, offset: int, limit: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.list_operations(offset, limit))
+
+    async def metrics(self) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.metrics())
 
     async def create_backup(self) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.create_backup())

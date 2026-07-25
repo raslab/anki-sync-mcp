@@ -16,3 +16,12 @@ def test_compose_keeps_private_mcp_network_and_allows_sync_egress() -> None:
     assert "ANKI_SYNC_PASSWORD" not in environment
     assert environment["ANKI_SYNC_PASSWORD_FILE"] == "/run/secrets/anki_sync_password"
     assert "anki_sync_password" in compose["services"]["anki-mcp"]["secrets"]
+
+
+def test_compose_restarts_with_the_same_persistent_data_volume() -> None:
+    compose = yaml.safe_load(Path("compose.yaml").read_text(encoding="utf-8"))
+    service = compose["services"]["anki-mcp"]
+
+    assert service["restart"] == "unless-stopped"
+    assert "anki_data:/data" in service["volumes"]
+    assert "anki_data" in compose["volumes"]
