@@ -321,7 +321,9 @@ A full sync is one-way and potentially destructive. The unattended policy is alw
 - Detect `FULL_SYNC`, `FULL_UPLOAD`, or `FULL_DOWNLOAD` requirements.
 - Stop the operation and mark readiness as degraded.
 - Return an actionable `FULL_SYNC_REQUIRED` error.
-- Require an operator to create a backup and explicitly choose direction through an administrative command outside normal agent tools.
+- Require an operator to create a backup, enable the full-sync maintenance flag, and explicitly
+  choose direction through the administrative tools. These tools are omitted during normal
+  operation.
 
 The AI must never choose a full-sync direction by itself.
 
@@ -438,8 +440,8 @@ Before production use, perform an end-to-end test with a disposable sync account
 
 ## 16. Delivery Phases
 
-The implementation is currently a working baseline rather than the original Phase 1 safe core.
-The phases below record that baseline explicitly and order the remaining work by operational
+The implementation now includes the authenticated baseline and the Phase 1 safe synchronized note
+core. The phases below record delivered behavior and order remaining work by operational
 dependency. A phase is complete only when its tools, safety semantics, and integration tests are
 all delivered.
 
@@ -462,13 +464,14 @@ all delivered.
 - Automated coverage for configuration, authentication, MCP schemas and calls, collection CRUD,
   serialization, response bounds, rollback behavior, sync safety, and Compose isolation.
 
-The baseline does **not** yet provide automatic sync around mutations, persisted sync
-authentication, operation idempotency, general note/tag workflows, scheduling controls, media
-file tools, scoped authorization, audit state, or the design's preview-token protection for
-destructive operations. Its delete and full-sync tools use strict `confirm=true`; treat them as a
-provisional private-deployment interface until the guarded administration phase is complete.
+The baseline did **not** provide automatic sync around mutations, persisted sync authentication,
+operation idempotency, general note/tag workflows, scheduling controls, media tools, scoped
+authorization, audit state, or preview-token protection. Phase 1 supplies the synchronization,
+note/tag, core card-control, scoped authorization, and durable operation pieces. Delete and
+full-sync tools still use strict `confirm=true`; treat them as a provisional private-deployment
+interface until the guarded administration phase is complete.
 
-### Phase 1 (next): safe synchronized note workflows
+### Delivered Phase 1: safe synchronized note workflows
 
 - Enforce internal read/write/admin/destructive scopes for the current shared credential and omit
   feature-gated tools from discovery when their scope or safety flag is disabled.
@@ -484,6 +487,11 @@ provisional private-deployment interface until the guarded administration phase 
 - Complete core card controls for arbitrary supported cards: change deck, suspend, and unsuspend.
 - Prove the complete write lifecycle, restart recovery, idempotency, and full-sync behavior against
   a disposable official self-hosted sync server.
+
+Phase 1 is covered by unit and MCP protocol tests plus an end-to-end test that launches the official
+self-hosted sync server from the pinned `anki` package. The test proves initial full-upload gating,
+operator-selected resolution, persisted host-key restart, receipt reconciliation and replay, a
+second client's full download, and a subsequent normal synchronized write/read lifecycle.
 
 ### Phase 2: complete non-destructive administration
 

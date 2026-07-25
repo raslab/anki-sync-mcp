@@ -4,18 +4,23 @@ import asyncio
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import UTC, datetime
+from importlib.metadata import version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
-from anki.collection import Collection
+from anki.collection import AddNoteRequest, Collection
 from anki.errors import NotFoundError
 from anki.sync import SyncAuth
 
 from anki_mcp.config import validate_sync_migration_endpoint
+from anki_mcp.state import PersistentState
 
 if TYPE_CHECKING:
     from anki.cards import CardId
     from anki.decks import DeckId
+    from anki.models import NotetypeId
+    from anki.notes import NoteId
 
 T = TypeVar("T")
 SYNC_REQUIRED_NAMES = (
@@ -31,6 +36,18 @@ class SyncLoginRequiredError(RuntimeError):
     """Raised when synchronization is requested before remote login."""
 
 
+class FullSyncRequiredError(RuntimeError):
+    """Raised when a normal operation encounters a one-way sync requirement."""
+
+
+class DuplicateNoteError(ValueError):
+    """Raised when a note request would create a duplicate."""
+
+
+class IdempotencyConflictError(ValueError):
+    """Raised when an idempotency key is reused with different content."""
+
+
 class CollectionAdapter:
     """Synchronous adapter; an instance must only be used by its owning thread."""
 
@@ -41,24 +58,200 @@ class CollectionAdapter:
         max_search_scan: int = 10_000,
         max_rendered_field_bytes: int = 262_144,
         max_card_fields: int = 100,
+        max_batch_size: int = 50,
+        sync_on_read: bool = False,
+        sync_on_write: bool = False,
     ) -> None:
         self.collection = Collection(str(path))
         self.max_page_size = max_page_size
         self.max_search_scan = max_search_scan
         self.max_rendered_field_bytes = max_rendered_field_bytes
         self.max_card_fields = max_card_fields
+        self.max_batch_size = max_batch_size
+        self.sync_on_read = sync_on_read
+        self.sync_on_write = sync_on_write
         self._backup_folder = Path(path).parent / "backups"
-        self._sync_auth: SyncAuth | None = None
-        self._configured_sync_endpoint: str | None = None
-        self._pending_full_sync: tuple[int, int | None] | None = None
+        self._state = PersistentState(path)
+        persisted_auth = self._state.load_sync_auth()
+        self._sync_auth = (
+            SyncAuth(
+                hkey=str(persisted_auth["hkey"]),
+                endpoint=str(persisted_auth.get("endpoint") or ""),
+            )
+            if persisted_auth
+            else None
+        )
+        self._configured_sync_endpoint = (
+            str(persisted_auth.get("configured_endpoint") or "") or None if persisted_auth else None
+        )
+        status = self._state.load_status()
+        pending = status.get("pending_full_sync")
+        self._pending_full_sync = (
+            (int(pending["required"]), pending.get("server_media_usn"))
+            if isinstance(pending, dict)
+            else None
+        )
+        self._last_sync_at = status.get("last_sync_at")
 
     def close(self) -> None:
-        self.collection.close()
+        try:
+            self.collection.close()
+        finally:
+            self._state.close()
 
     def check_ready(self) -> bool:
         if self.collection.db is None:
             return False
         return self.collection.db.scalar("select 1") == 1
+
+    def _save_operational_status(self) -> None:
+        pending = None
+        if self._pending_full_sync is not None:
+            pending = {
+                "required": self._pending_full_sync[0],
+                "server_media_usn": self._pending_full_sync[1],
+            }
+        self._state.save_status({"last_sync_at": self._last_sync_at, "pending_full_sync": pending})
+
+    def status(self) -> dict[str, Any]:
+        collection_ready = self.check_ready()
+        pending_name = (
+            SYNC_REQUIRED_NAMES[self._pending_full_sync[0]]
+            if self._pending_full_sync is not None
+            else None
+        )
+        authenticated = self._sync_auth is not None
+        ready = collection_ready and authenticated and pending_name is None
+        if not collection_ready:
+            reason = "collection_unavailable"
+        elif pending_name is not None:
+            reason = "full_sync_required"
+        elif not authenticated:
+            reason = "authentication_required"
+        else:
+            reason = None
+        return {
+            "anki_version": version("anki"),
+            "collection_ready": collection_ready,
+            "authenticated": authenticated,
+            "ready": ready,
+            "readiness_reason": reason,
+            "pending_full_sync": pending_name,
+            "last_sync_at": self._last_sync_at,
+            "pending_mutations": self._state.pending_receipt_count(),
+        }
+
+    def create_backup(self) -> dict[str, Any]:
+        self._backup_folder.mkdir(parents=True, exist_ok=True)
+        created = self.collection.create_backup(
+            backup_folder=str(self._backup_folder), force=True, wait_for_completion=True
+        )
+        return {"requested": True, "created": bool(created)}
+
+    def bootstrap(
+        self,
+        mode: str,
+        username: str,
+        password: str | None,
+        endpoint: str | None,
+    ) -> dict[str, Any]:
+        """Perform an explicitly configured, download-only initialization of an empty client."""
+        if mode == "disabled":
+            return {"bootstrapped": False, "reason": "disabled"}
+        if mode != "download_if_empty":
+            raise ValueError("unsupported bootstrap mode")
+        if self.collection.note_count() or self.collection.card_count():
+            raise ValueError("download_if_empty bootstrap requires an empty local collection")
+        if self._sync_auth is None:
+            if not username.strip() or password is None:
+                raise SyncLoginRequiredError(
+                    "bootstrap requires sync credentials or persisted authentication"
+                )
+            self.sync_login(username, password, endpoint)
+        sync_result = self.sync(sync_media=False)
+        required = sync_result["required"]
+        if required in {"FULL_SYNC", "FULL_DOWNLOAD"}:
+            result = self.full_sync(upload=False)
+            return {"bootstrapped": True, **result}
+        if required == "FULL_UPLOAD":
+            raise FullSyncRequiredError(
+                "FULL_UPLOAD cannot be resolved by download_if_empty bootstrap"
+            )
+        return {"bootstrapped": True, "direction": None, "sync": sync_result}
+
+    def coordinated_read(self, read: Callable[[CollectionAdapter], T], sync_before: bool) -> T:
+        if sync_before or self.sync_on_read:
+            self._sync_or_raise_full_sync(sync_media=False)
+        return read(self)
+
+    def coordinated_mutation(
+        self,
+        operation: str,
+        idempotency_key: str,
+        request: dict[str, Any],
+        mutate: Callable[[CollectionAdapter], dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not idempotency_key or len(idempotency_key.encode("utf-8")) > 128:
+            raise ValueError("idempotency_key must contain 1 to 128 UTF-8 bytes")
+        request_hash = self._state.request_hash(operation, request)
+        existing = self._state.get_receipt(idempotency_key)
+        if existing is not None:
+            recorded_operation, recorded_hash, receipt = existing
+            if recorded_operation != operation or recorded_hash != request_hash:
+                raise IdempotencyConflictError(
+                    "idempotency key was already used with different content"
+                )
+            if (
+                receipt.get("local_committed")
+                and not receipt.get("remote_synced")
+                and receipt.get("retryable")
+            ):
+                try:
+                    self._sync_or_raise_full_sync(sync_media=False)
+                except FullSyncRequiredError:
+                    receipt["retryable"] = False
+                    self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
+                    raise
+                receipt["remote_synced"] = True
+                receipt["retryable"] = False
+                self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
+            return receipt
+
+        if self.sync_on_write:
+            self._sync_or_raise_full_sync(sync_media=False)
+        result = mutate(self)
+        receipt: dict[str, Any] = {
+            "idempotency_key": idempotency_key,
+            "local_committed": True,
+            "remote_synced": not self.sync_on_write,
+            "media_synced": None,
+            "retryable": False,
+            "result": result,
+        }
+        self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
+        if self.sync_on_write:
+            try:
+                self._sync_or_raise_full_sync(sync_media=False)
+            except FullSyncRequiredError:
+                receipt["remote_synced"] = False
+                self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
+                raise
+            except Exception:
+                receipt["remote_synced"] = False
+                receipt["retryable"] = True
+                self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
+                return receipt
+            receipt["remote_synced"] = True
+            self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
+        return receipt
+
+    def _sync_or_raise_full_sync(self, sync_media: bool) -> dict[str, Any]:
+        result = self.sync(sync_media)
+        if result["required"] in {"FULL_SYNC", "FULL_DOWNLOAD", "FULL_UPLOAD"}:
+            raise FullSyncRequiredError(
+                f"{result['required']} requires operator-controlled full synchronization"
+            )
+        return result
 
     def _page(self, values: list[Any], offset: int, limit: int) -> dict[str, Any]:
         if offset < 0:
@@ -171,6 +364,196 @@ class CollectionAdapter:
                 operation_error, "deck", lambda: self.get_deck(deck_id)
             )
         return {"id": deck_id, "deleted": True}
+
+    def search_notes(self, query: str, offset: int, limit: int) -> dict[str, Any]:
+        self._page([], offset, limit)
+        if int(self.collection.note_count()) > self.max_search_scan:
+            raise ValueError(
+                "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        note_ids = [int(note_id) for note_id in self.collection.find_notes(query)]
+        result = self._page(note_ids, offset, limit)
+        result["items"] = [self._note_summary(note_id) for note_id in result["items"]]
+        return result
+
+    def _note_summary(self, note_id: int) -> dict[str, Any]:
+        try:
+            note = self.collection.get_note(cast("NoteId", note_id))
+        except NotFoundError as exc:
+            raise LookupError(f"note {note_id} not found") from exc
+        first_field, first_field_truncated = self._truncate_rendered(note.fields[0])
+        return {
+            "id": int(note.id),
+            "note_type_id": int(note.mid),
+            "first_field": first_field,
+            "first_field_truncated": first_field_truncated,
+            "tags": list(note.tags),
+        }
+
+    def get_note(self, note_id: int) -> dict[str, Any]:
+        try:
+            note = self.collection.get_note(cast("NoteId", note_id))
+        except NotFoundError as exc:
+            raise LookupError(f"note {note_id} not found") from exc
+        model = self.collection.models.get(note.mid)
+        if model is None:  # pragma: no cover - Anki preserves referenced note types
+            raise LookupError(f"note type for note {note_id} not found")
+        model_name, model_name_truncated = self._truncate_rendered(str(model["name"]))
+        fields: list[dict[str, Any]] = []
+        note_items = note.items()
+        for name, value in note_items[: self.max_card_fields]:
+            bounded_name, name_truncated = self._truncate_rendered(name)
+            bounded_value, value_truncated = self._truncate_rendered(value)
+            fields.append(
+                {
+                    "name": bounded_name,
+                    "name_truncated": name_truncated,
+                    "value": bounded_value,
+                    "value_truncated": value_truncated,
+                }
+            )
+        return {
+            "id": int(note.id),
+            "note_type_id": int(note.mid),
+            "note_type_name": model_name,
+            "note_type_name_truncated": model_name_truncated,
+            "fields": fields,
+            "fields_omitted": max(0, len(note_items) - self.max_card_fields),
+            "tags": list(note.tags),
+            "card_ids": [
+                int(card_id) for card_id in self.collection.find_cards(f"nid:{int(note.id)}")
+            ],
+            "modified": int(note.mod),
+        }
+
+    def _prepare_note(
+        self,
+        deck_id: int,
+        note_type_id: int,
+        fields: dict[str, str],
+        tags: list[str],
+    ) -> Any:
+        self.get_deck(deck_id)
+        model = self.collection.models.get(cast("NotetypeId", note_type_id))
+        if model is None:
+            raise LookupError(f"note type {note_type_id} not found")
+        expected_fields = self.collection.models.field_names(model)
+        if set(fields) != set(expected_fields):
+            raise ValueError(f"fields must exactly match note type fields: {expected_fields}")
+        note = self.collection.new_note(model)
+        for field_name in expected_fields:
+            note[field_name] = fields[field_name]
+        note.tags = self._normalize_tags(tags)
+        check = int(note.duplicate_or_empty())
+        if check == 1:
+            raise ValueError("the note's first field must not be empty")
+        if check == 2:
+            raise DuplicateNoteError("a note with the same first field already exists")
+        return note
+
+    def _normalize_tags(self, tags: list[str]) -> list[str]:
+        if any(not tag.strip() for tag in tags):
+            raise ValueError("tags must not contain blank values")
+        return list(dict.fromkeys(tags))
+
+    def create_note(
+        self,
+        deck_id: int,
+        note_type_id: int,
+        fields: dict[str, str],
+        tags: list[str],
+    ) -> dict[str, Any]:
+        note = self._prepare_note(deck_id, note_type_id, fields, tags)
+        self.collection.add_note(note, cast("DeckId", deck_id))
+        card_ids = [int(card_id) for card_id in self.collection.find_cards(f"nid:{int(note.id)}")]
+        if not card_ids:
+            self.collection.remove_notes([note.id])
+            raise ValueError("note did not generate any cards")
+        return {"note_id": int(note.id), "card_ids": card_ids, "created": True}
+
+    def create_notes_batch(self, requests: list[dict[str, Any]]) -> dict[str, Any]:
+        if not requests or len(requests) > self.max_batch_size:
+            raise ValueError(f"batch must contain between 1 and {self.max_batch_size} notes")
+        prepared: list[tuple[Any, int]] = []
+        fingerprints: set[tuple[int, str]] = set()
+        for request in requests:
+            note = self._prepare_note(
+                int(request["deck_id"]),
+                int(request["note_type_id"]),
+                dict(request["fields"]),
+                list(request.get("tags", [])),
+            )
+            fingerprint = (int(note.mid), note.fields[0].strip())
+            if fingerprint in fingerprints:
+                raise DuplicateNoteError("batch contains duplicate first fields")
+            fingerprints.add(fingerprint)
+            prepared.append((note, int(request["deck_id"])))
+        self.collection.add_notes(
+            [
+                AddNoteRequest(note=note, deck_id=cast("DeckId", deck_id))
+                for note, deck_id in prepared
+            ]
+        )
+        results = []
+        for note, _ in prepared:
+            card_ids = [
+                int(card_id) for card_id in self.collection.find_cards(f"nid:{int(note.id)}")
+            ]
+            if not card_ids:  # pragma: no cover - validated normal note types generate cards
+                raise RuntimeError("atomic note batch produced a note without cards")
+            results.append({"note_id": int(note.id), "card_ids": card_ids, "created": True})
+        return {"notes": results, "created": len(results)}
+
+    def update_note_fields(self, note_id: int, fields: dict[str, str]) -> dict[str, Any]:
+        if not fields:
+            raise ValueError("at least one field update is required")
+        try:
+            note = self.collection.get_note(cast("NoteId", note_id))
+        except NotFoundError as exc:
+            raise LookupError(f"note {note_id} not found") from exc
+        unknown = set(fields) - set(note.keys())
+        if unknown:
+            raise ValueError(f"unknown field: {', '.join(sorted(unknown))}")
+        for name, value in fields.items():
+            note[name] = value
+        check = int(note.duplicate_or_empty())
+        if check == 1:
+            raise ValueError("the note's first field must not be empty")
+        if check == 2:
+            raise DuplicateNoteError("a note with the same first field already exists")
+        self.collection.update_note(note)
+        return {"note_id": note_id, "updated": True}
+
+    def _update_note_tags(
+        self, note_ids: list[int], tags: list[str], *, remove: bool
+    ) -> dict[str, Any]:
+        if not note_ids or len(note_ids) > self.max_batch_size:
+            raise ValueError(
+                f"note_ids must contain between 1 and {self.max_batch_size} stable IDs"
+            )
+        normalized = self._normalize_tags(tags)
+        if not normalized:
+            raise ValueError("tags must not be empty")
+        notes = []
+        for note_id in note_ids:
+            try:
+                note = self.collection.get_note(cast("NoteId", note_id))
+            except NotFoundError as exc:
+                raise LookupError(f"note {note_id} not found") from exc
+            if remove:
+                remove_names = {tag.casefold() for tag in normalized}
+                note.tags = [tag for tag in note.tags if tag.casefold() not in remove_names]
+            else:
+                note.tags = list(dict.fromkeys([*note.tags, *normalized]))
+            notes.append(note)
+        self.collection.update_notes(notes)
+        return {"updated_note_ids": note_ids}
+
+    def add_note_tags(self, note_ids: list[int], tags: list[str]) -> dict[str, Any]:
+        return self._update_note_tags(note_ids, tags, remove=False)
+
+    def remove_note_tags(self, note_ids: list[int], tags: list[str]) -> dict[str, Any]:
+        return self._update_note_tags(note_ids, tags, remove=True)
 
     def search_cards(self, query: str, offset: int, limit: int) -> dict[str, Any]:
         # Validate bounds before potentially expensive collection search.
@@ -360,12 +743,45 @@ class CollectionAdapter:
             )
         return {"id": card_id, "deleted": True}
 
+    def _validate_card_ids(self, card_ids: list[int]) -> None:
+        if not card_ids or len(card_ids) > self.max_batch_size:
+            raise ValueError(
+                f"card_ids must contain between 1 and {self.max_batch_size} stable IDs"
+            )
+        for card_id in card_ids:
+            self.get_card(card_id)
+
+    def change_card_deck(self, card_ids: list[int], deck_id: int) -> dict[str, Any]:
+        self._validate_card_ids(card_ids)
+        self.get_deck(deck_id)
+        self.collection.set_deck([cast("CardId", card_id) for card_id in card_ids], deck_id)
+        return {"card_ids": card_ids, "deck_id": deck_id, "updated": True}
+
+    def suspend_cards(self, card_ids: list[int]) -> dict[str, Any]:
+        self._validate_card_ids(card_ids)
+        self.collection.sched.suspend_cards([cast("CardId", card_id) for card_id in card_ids])
+        return {"card_ids": card_ids, "suspended": True}
+
+    def unsuspend_cards(self, card_ids: list[int]) -> dict[str, Any]:
+        self._validate_card_ids(card_ids)
+        self.collection.sched.unsuspend_cards([cast("CardId", card_id) for card_id in card_ids])
+        return {"card_ids": card_ids, "suspended": False}
+
     def sync_login(self, username: str, password: str, endpoint: str | None) -> dict[str, Any]:
         self._sync_auth = None
         self._configured_sync_endpoint = None
         self._pending_full_sync = None
+        self._state.clear_sync_auth()
+        self._save_operational_status()
         self._sync_auth = self.collection.sync_login(username, password, endpoint)
         self._configured_sync_endpoint = endpoint or None
+        self._state.save_sync_auth(
+            {
+                "hkey": self._sync_auth.hkey,
+                "endpoint": self._sync_auth.endpoint or "",
+                "configured_endpoint": self._configured_sync_endpoint or "",
+            }
+        )
         return {"authenticated": True, "endpoint_kind": "custom" if endpoint else "ankiweb"}
 
     def sync(self, sync_media: bool) -> dict[str, Any]:
@@ -385,6 +801,15 @@ class CollectionAdapter:
                 )
             else:
                 self._pending_full_sync = None
+            self._last_sync_at = datetime.now(UTC).isoformat()
+            self._state.save_sync_auth(
+                {
+                    "hkey": self._sync_auth.hkey,
+                    "endpoint": self._sync_auth.endpoint or "",
+                    "configured_endpoint": self._configured_sync_endpoint or "",
+                }
+            )
+            self._save_operational_status()
             required = SYNC_REQUIRED_NAMES[output.required]
             server_message, server_message_truncated = self._truncate_rendered(
                 output.server_message
@@ -401,6 +826,7 @@ class CollectionAdapter:
             self._sync_auth = None
             self._configured_sync_endpoint = None
             self._pending_full_sync = None
+            self._save_operational_status()
             raise
 
     def full_sync(self, upload: bool) -> dict[str, Any]:
@@ -429,8 +855,13 @@ class CollectionAdapter:
             self._sync_auth = None
             self._configured_sync_endpoint = None
             self._pending_full_sync = None
+            self._save_operational_status()
             raise
         self._pending_full_sync = None
+        self._last_sync_at = datetime.now(UTC).isoformat()
+        if upload:
+            self._state.mark_all_remote_synced()
+        self._save_operational_status()
         return {
             "completed": True,
             "direction": "upload" if upload else "download",
@@ -455,12 +886,18 @@ class CollectionExecutor:
         max_search_scan: int = 10_000,
         max_rendered_field_bytes: int = 262_144,
         max_card_fields: int = 100,
+        max_batch_size: int = 50,
+        sync_on_read: bool = False,
+        sync_on_write: bool = False,
     ) -> None:
         self._path = path
         self._max_page_size = max_page_size
         self._max_search_scan = max_search_scan
         self._max_rendered_field_bytes = max_rendered_field_bytes
         self._max_card_fields = max_card_fields
+        self._max_batch_size = max_batch_size
+        self._sync_on_read = sync_on_read
+        self._sync_on_write = sync_on_write
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anki-collection")
         self._adapter: CollectionAdapter | None = None
         self._worker_id: int | None = None
@@ -479,6 +916,9 @@ class CollectionExecutor:
                 self._max_search_scan,
                 self._max_rendered_field_bytes,
                 self._max_card_fields,
+                self._max_batch_size,
+                self._sync_on_read,
+                self._sync_on_write,
             )
 
         self._pool.submit(open_collection).result()
@@ -513,9 +953,19 @@ class AnkiCollectionService:
         max_search_scan: int = 10_000,
         max_rendered_field_bytes: int = 262_144,
         max_card_fields: int = 100,
+        max_batch_size: int = 50,
+        sync_on_read: bool = False,
+        sync_on_write: bool = False,
     ) -> None:
         self.executor = CollectionExecutor(
-            path, max_page_size, max_search_scan, max_rendered_field_bytes, max_card_fields
+            path,
+            max_page_size,
+            max_search_scan,
+            max_rendered_field_bytes,
+            max_card_fields,
+            max_batch_size,
+            sync_on_read,
+            sync_on_write,
         )
 
     async def __aenter__(self) -> AnkiCollectionService:
@@ -540,6 +990,35 @@ class AnkiCollectionService:
     async def delete_deck(self, deck_id: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.delete_deck(deck_id))
 
+    async def search_notes(self, query: str, offset: int, limit: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.search_notes(query, offset, limit))
+
+    async def get_note(self, note_id: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.get_note(note_id))
+
+    async def create_note(
+        self,
+        deck_id: int,
+        note_type_id: int,
+        fields: dict[str, str],
+        tags: list[str],
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.create_note(deck_id, note_type_id, fields, tags)
+        )
+
+    async def create_notes_batch(self, requests: list[dict[str, Any]]) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.create_notes_batch(requests))
+
+    async def update_note_fields(self, note_id: int, fields: dict[str, str]) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.update_note_fields(note_id, fields))
+
+    async def add_note_tags(self, note_ids: list[int], tags: list[str]) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.add_note_tags(note_ids, tags))
+
+    async def remove_note_tags(self, note_ids: list[int], tags: list[str]) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.remove_note_tags(note_ids, tags))
+
     async def search_cards(self, query: str, offset: int, limit: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.search_cards(query, offset, limit))
 
@@ -558,6 +1037,50 @@ class AnkiCollectionService:
 
     async def delete_card(self, card_id: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.delete_card(card_id))
+
+    async def change_card_deck(self, card_ids: list[int], deck_id: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.change_card_deck(card_ids, deck_id))
+
+    async def suspend_cards(self, card_ids: list[int]) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.suspend_cards(card_ids))
+
+    async def unsuspend_cards(self, card_ids: list[int]) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.unsuspend_cards(card_ids))
+
+    async def coordinated_read(
+        self, read: Callable[[CollectionAdapter], T], sync_before: bool = False
+    ) -> T:
+        return await self.executor.run(lambda adapter: adapter.coordinated_read(read, sync_before))
+
+    async def coordinated_mutation(
+        self,
+        operation: str,
+        idempotency_key: str,
+        request: dict[str, Any],
+        mutate: Callable[[CollectionAdapter], dict[str, Any]],
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.coordinated_mutation(
+                operation, idempotency_key, request, mutate
+            )
+        )
+
+    async def status(self) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.status())
+
+    async def create_backup(self) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.create_backup())
+
+    async def bootstrap(
+        self,
+        mode: str,
+        username: str,
+        password: str | None,
+        endpoint: str | None,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.bootstrap(mode, username, password, endpoint)
+        )
 
     async def sync_login(
         self, username: str, password: str, endpoint: str | None

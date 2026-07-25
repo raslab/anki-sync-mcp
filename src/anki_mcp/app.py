@@ -10,7 +10,7 @@ from anki.errors import NetworkError, SyncError, SyncErrorKind
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import Field, StrictBool, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -18,7 +18,14 @@ from starlette.routing import Route
 from starlette.types import ASGIApp
 
 from anki_mcp.auth import BearerAuthMiddleware, RequestBodyLimitMiddleware
-from anki_mcp.collection import AnkiCollectionService, SyncLoginRequiredError
+from anki_mcp.collection import (
+    AnkiCollectionService,
+    CollectionAdapter,
+    DuplicateNoteError,
+    FullSyncRequiredError,
+    IdempotencyConflictError,
+    SyncLoginRequiredError,
+)
 from anki_mcp.config import Settings
 
 T = TypeVar("T")
@@ -30,6 +37,20 @@ SyncMedia = StrictBool
 DeckName = Annotated[StrictStr, Field(min_length=1, max_length=512)]
 SearchQuery = Annotated[StrictStr, Field(max_length=4096)]
 CardText = Annotated[StrictStr, Field(max_length=262_144)]
+IdempotencyKey = Annotated[StrictStr, Field(min_length=1, max_length=128)]
+Tag = Annotated[StrictStr, Field(min_length=1, max_length=512)]
+StableIds = Annotated[list[StableId], Field(min_length=1, max_length=500)]
+Tags = Annotated[list[Tag], Field(max_length=100)]
+NoteFields = dict[Annotated[StrictStr, Field(min_length=1, max_length=512)], CardText]
+
+
+class NoteCreateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    deck_id: StableId
+    note_type_id: StableId
+    fields: NoteFields
+    tags: Tags = Field(default_factory=list)
 
 
 class ResponseTooLargeError(RuntimeError):
@@ -45,6 +66,9 @@ def create_app(settings: Settings) -> ASGIApp:
         settings.max_search_scan,
         settings.max_rendered_field_bytes,
         settings.max_card_fields,
+        settings.max_batch_size,
+        settings.sync_on_read,
+        settings.sync_on_write,
     )
     mcp = FastMCP(
         "anki-mcp",
@@ -57,6 +81,18 @@ def create_app(settings: Settings) -> ASGIApp:
             allowed_origins=settings.allowed_origins,
         ),
     )
+    registered_tool_names: list[str] = []
+
+    def scoped_tool(
+        name: str, scope: str, *, enabled: bool = True
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def register(function: Callable[..., Any]) -> Callable[..., Any]:
+            if scope in settings.scopes and enabled:
+                mcp.tool(name=name)(function)
+                registered_tool_names.append(name)
+            return function
+
+        return register
 
     def raise_tool_error(code: str, message: str, cause: Exception) -> NoReturn:
         payload = {
@@ -76,6 +112,12 @@ def create_app(settings: Settings) -> ASGIApp:
             if len(encoded) > settings.max_response_bytes:
                 raise ResponseTooLargeError("tool response exceeds MCP_MAX_RESPONSE_BYTES")
             return result
+        except DuplicateNoteError as exc:
+            raise_tool_error("DUPLICATE_NOTE", str(exc), exc)
+        except IdempotencyConflictError as exc:
+            raise_tool_error("CONFLICT", str(exc), exc)
+        except FullSyncRequiredError as exc:
+            raise_tool_error("FULL_SYNC_REQUIRED", str(exc), exc)
         except LookupError as exc:
             raise_tool_error("NOT_FOUND", str(exc), exc)
         except ValueError as exc:
@@ -92,11 +134,31 @@ def create_app(settings: Settings) -> ASGIApp:
         except Exception as exc:
             raise_tool_error("INTERNAL_ERROR", "internal collection operation failed", exc)
 
-    @mcp.tool(name="anki_sync_login")
+    async def mutate(
+        operation: str,
+        idempotency_key: str | None,
+        request: dict[str, Any],
+        function: Callable[[CollectionAdapter], dict[str, Any]],
+    ) -> dict[str, Any]:
+        key = idempotency_key or str(uuid4())
+        result = await execute(service.coordinated_mutation(operation, key, request, function))
+        if not isinstance(result, dict):  # pragma: no cover - coordinator always returns a receipt
+            raise RuntimeError("mutation coordinator returned an invalid receipt")
+        return result
+
+    @scoped_tool(name="anki_status", scope="read")
+    async def status() -> dict[str, Any]:
+        """Return actionable local collection, authentication, sync, and recovery status."""
+        return await execute(service.status())
+
+    @scoped_tool(name="anki_sync_login", scope="admin")
     async def sync_login() -> dict[str, Any]:
         """Authenticate to the configured AnkiWeb or self-hosted sync endpoint."""
         if not settings.sync_username.strip():
             cause = ValueError("ANKI_SYNC_USERNAME is not configured")
+            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+        if settings.sync_password is None:
+            cause = ValueError("ANKI_SYNC_PASSWORD is not configured")
             raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
         return await execute(
             service.sync_login(
@@ -106,12 +168,12 @@ def create_app(settings: Settings) -> ASGIApp:
             )
         )
 
-    @mcp.tool(name="anki_sync")
+    @scoped_tool(name="anki_sync", scope="write")
     async def sync(sync_media: SyncMedia = True) -> dict[str, Any]:
         """Synchronize the collection with the authenticated remote server."""
         return await execute(service.sync(sync_media))
 
-    @mcp.tool(name="anki_sync_full_download")
+    @scoped_tool(name="anki_sync_full_download", scope="admin", enabled=settings.allow_full_sync)
     async def sync_full_download(confirm: Confirmation = False) -> dict[str, Any]:
         """Replace local data after the server requires a full download and confirmation is true."""
         if not confirm:
@@ -119,7 +181,7 @@ def create_app(settings: Settings) -> ASGIApp:
             raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
         return await execute(service.full_sync(upload=False))
 
-    @mcp.tool(name="anki_sync_full_upload")
+    @scoped_tool(name="anki_sync_full_upload", scope="admin", enabled=settings.allow_full_sync)
     async def sync_full_upload(confirm: Confirmation = False) -> dict[str, Any]:
         """Replace remote data after the server requires a full upload and confirmation is true."""
         if not confirm:
@@ -127,113 +189,295 @@ def create_app(settings: Settings) -> ASGIApp:
             raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
         return await execute(service.full_sync(upload=True))
 
-    @mcp.tool(name="anki_decks_list")
+    @scoped_tool(name="anki_backup_create", scope="admin")
+    async def backup_create() -> dict[str, Any]:
+        """Create an explicit local collection backup in persistent storage."""
+        return await execute(service.create_backup())
+
+    @scoped_tool(name="anki_decks_list", scope="read")
     async def decks_list(
-        offset: Offset = 0, limit: PageLimit = settings.max_page_size
+        offset: Offset = 0,
+        limit: PageLimit = settings.max_page_size,
+        sync_before: SyncMedia = False,
     ) -> dict[str, Any]:
         """List decks with stable IDs and hierarchy, using bounded offset pagination."""
-        return await execute(service.list_decks(offset=offset, limit=limit))
+        return await execute(
+            service.coordinated_read(
+                lambda adapter: adapter.list_decks(offset=offset, limit=limit), sync_before
+            )
+        )
 
-    @mcp.tool(name="anki_decks_get")
-    async def decks_get(deck_id: StableId) -> dict[str, Any]:
+    @scoped_tool(name="anki_decks_get", scope="read")
+    async def decks_get(deck_id: StableId, sync_before: SyncMedia = False) -> dict[str, Any]:
         """Get metadata for one deck by stable Anki deck ID."""
-        return await execute(service.get_deck(deck_id))
+        return await execute(
+            service.coordinated_read(lambda adapter: adapter.get_deck(deck_id), sync_before)
+        )
 
-    @mcp.tool(name="anki_decks_create")
-    async def decks_create(name: DeckName) -> dict[str, Any]:
+    @scoped_tool(name="anki_decks_create", scope="write")
+    async def decks_create(
+        name: DeckName, idempotency_key: IdempotencyKey | None = None
+    ) -> dict[str, Any]:
         """Create a deck by name, or return the existing deck with that name."""
-        return await execute(
-            service.create_deck(name),
-            lambda result: {
-                "id": result["id"],
-                "created": result["created"],
-            },
+        return await mutate(
+            "anki_decks_create",
+            idempotency_key,
+            {"name": name},
+            lambda adapter: adapter.create_deck(name),
         )
 
-    @mcp.tool(name="anki_decks_update")
-    async def decks_update(deck_id: StableId, name: DeckName) -> dict[str, Any]:
+    @scoped_tool(name="anki_decks_update", scope="write")
+    async def decks_update(
+        deck_id: StableId,
+        name: DeckName,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
         """Rename a deck by stable Anki deck ID."""
-        return await execute(
-            service.update_deck(deck_id, name),
-            lambda result: {"id": result["id"], "updated": True},
+        return await mutate(
+            "anki_decks_update",
+            idempotency_key,
+            {"deck_id": deck_id, "name": name},
+            lambda adapter: adapter.update_deck(deck_id, name),
         )
 
-    @mcp.tool(name="anki_decks_delete")
-    async def decks_delete(deck_id: StableId, confirm: Confirmation = False) -> dict[str, Any]:
+    @scoped_tool(
+        name="anki_decks_delete",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def decks_delete(
+        deck_id: StableId,
+        confirm: Confirmation = False,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
         """Delete a deck and its cards when confirm is explicitly true."""
         if not confirm:
             cause = ValueError("confirm must be true for deck deletion")
             raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
-        return await execute(service.delete_deck(deck_id))
-
-    @mcp.tool(name="anki_cards_search")
-    async def cards_search(
-        query: SearchQuery = "", offset: Offset = 0, limit: PageLimit = settings.max_page_size
-    ) -> dict[str, Any]:
-        """Search cards with Anki search syntax and bounded offset pagination."""
-        return await execute(service.search_cards(query=query, offset=offset, limit=limit))
-
-    @mcp.tool(name="anki_cards_get")
-    async def cards_get(card_id: StableId) -> dict[str, Any]:
-        """Get card content, deck identity, and scheduling state by stable card ID."""
-        return await execute(service.get_card(card_id))
-
-    @mcp.tool(name="anki_cards_create")
-    async def cards_create(deck_id: StableId, front: CardText, back: CardText) -> dict[str, Any]:
-        """Create one Basic note/card in a deck."""
-        return await execute(
-            service.create_card(deck_id, front, back),
-            lambda result: {
-                "id": result["id"],
-                "note_id": result["note_id"],
-                "deck_id": result["deck_id"],
-                "created": True,
-            },
+        return await mutate(
+            "anki_decks_delete",
+            idempotency_key,
+            {"deck_id": deck_id, "confirm": confirm},
+            lambda adapter: adapter.delete_deck(deck_id),
         )
 
-    @mcp.tool(name="anki_cards_update")
+    @scoped_tool(name="anki_notes_search", scope="read")
+    async def notes_search(
+        query: SearchQuery = "",
+        offset: Offset = 0,
+        limit: PageLimit = settings.max_page_size,
+        sync_before: SyncMedia = False,
+    ) -> dict[str, Any]:
+        """Search notes with Anki search syntax and bounded offset pagination."""
+        return await execute(
+            service.coordinated_read(
+                lambda adapter: adapter.search_notes(query, offset, limit), sync_before
+            )
+        )
+
+    @scoped_tool(name="anki_notes_get", scope="read")
+    async def notes_get(note_id: StableId, sync_before: SyncMedia = False) -> dict[str, Any]:
+        """Get general note fields, tags, note type, cards, and metadata by stable ID."""
+        return await execute(
+            service.coordinated_read(lambda adapter: adapter.get_note(note_id), sync_before)
+        )
+
+    @scoped_tool(name="anki_notes_create", scope="write")
+    async def notes_create(
+        deck_id: StableId,
+        note_type_id: StableId,
+        fields: NoteFields,
+        tags: Tags | None = None,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Create one validated, duplicate-checked note with a durable idempotent receipt."""
+        normalized_tags = tags or []
+        request = {
+            "deck_id": deck_id,
+            "note_type_id": note_type_id,
+            "fields": fields,
+            "tags": normalized_tags,
+        }
+        return await mutate(
+            "anki_notes_create",
+            idempotency_key,
+            request,
+            lambda adapter: adapter.create_note(deck_id, note_type_id, fields, normalized_tags),
+        )
+
+    @scoped_tool(name="anki_notes_create_batch", scope="write")
+    async def notes_create_batch(
+        notes: list[NoteCreateInput], idempotency_key: IdempotencyKey | None = None
+    ) -> dict[str, Any]:
+        """Create a bounded atomic batch of validated notes with one idempotency key."""
+        if not notes or len(notes) > settings.max_batch_size:
+            cause = ValueError(f"notes must contain between 1 and {settings.max_batch_size} items")
+            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+        requests = [note.model_dump() for note in notes]
+        return await mutate(
+            "anki_notes_create_batch",
+            idempotency_key,
+            {"notes": requests},
+            lambda adapter: adapter.create_notes_batch(requests),
+        )
+
+    @scoped_tool(name="anki_notes_update_fields", scope="write")
+    async def notes_update_fields(
+        note_id: StableId,
+        fields: NoteFields,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Patch named fields on a general note after note-type validation."""
+        return await mutate(
+            "anki_notes_update_fields",
+            idempotency_key,
+            {"note_id": note_id, "fields": fields},
+            lambda adapter: adapter.update_note_fields(note_id, fields),
+        )
+
+    @scoped_tool(name="anki_notes_add_tags", scope="write")
+    async def notes_add_tags(
+        note_ids: StableIds,
+        tags: Tags,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Add normalized tags to a bounded set of notes."""
+        return await mutate(
+            "anki_notes_add_tags",
+            idempotency_key,
+            {"note_ids": note_ids, "tags": tags},
+            lambda adapter: adapter.add_note_tags(note_ids, tags),
+        )
+
+    @scoped_tool(name="anki_notes_remove_tags", scope="write")
+    async def notes_remove_tags(
+        note_ids: StableIds,
+        tags: Tags,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Remove normalized tags from a bounded set of notes."""
+        return await mutate(
+            "anki_notes_remove_tags",
+            idempotency_key,
+            {"note_ids": note_ids, "tags": tags},
+            lambda adapter: adapter.remove_note_tags(note_ids, tags),
+        )
+
+    @scoped_tool(name="anki_cards_search", scope="read")
+    async def cards_search(
+        query: SearchQuery = "",
+        offset: Offset = 0,
+        limit: PageLimit = settings.max_page_size,
+        sync_before: SyncMedia = False,
+    ) -> dict[str, Any]:
+        """Search cards with Anki search syntax and bounded offset pagination."""
+        return await execute(
+            service.coordinated_read(
+                lambda adapter: adapter.search_cards(query=query, offset=offset, limit=limit),
+                sync_before,
+            )
+        )
+
+    @scoped_tool(name="anki_cards_get", scope="read")
+    async def cards_get(card_id: StableId, sync_before: SyncMedia = False) -> dict[str, Any]:
+        """Get card content, deck identity, and scheduling state by stable card ID."""
+        return await execute(
+            service.coordinated_read(lambda adapter: adapter.get_card(card_id), sync_before)
+        )
+
+    @scoped_tool(name="anki_cards_create", scope="write")
+    async def cards_create(
+        deck_id: StableId,
+        front: CardText,
+        back: CardText,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Create one Basic note/card in a deck."""
+        return await mutate(
+            "anki_cards_create",
+            idempotency_key,
+            {"deck_id": deck_id, "front": front, "back": back},
+            lambda adapter: adapter.create_card(deck_id, front, back),
+        )
+
+    @scoped_tool(name="anki_cards_update", scope="write")
     async def cards_update(
         card_id: StableId,
         front: CardText | None = None,
         back: CardText | None = None,
         deck_id: StableId | None = None,
+        idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
         """Update a Basic card's Front/Back fields and/or move it to another deck."""
-        return await execute(
-            service.update_card(card_id, front, back, deck_id),
-            lambda result: {
-                "id": result["id"],
-                "deck_id": result["deck_id"],
-                "updated": True,
-            },
+        return await mutate(
+            "anki_cards_update",
+            idempotency_key,
+            {"card_id": card_id, "front": front, "back": back, "deck_id": deck_id},
+            lambda adapter: adapter.update_card(card_id, front, back, deck_id),
         )
 
-    @mcp.tool(name="anki_cards_delete")
-    async def cards_delete(card_id: StableId, confirm: Confirmation = False) -> dict[str, Any]:
+    @scoped_tool(name="anki_cards_change_deck", scope="write")
+    async def cards_change_deck(
+        card_ids: StableIds,
+        deck_id: StableId,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Move arbitrary supported cards to another deck by stable IDs."""
+        return await mutate(
+            "anki_cards_change_deck",
+            idempotency_key,
+            {"card_ids": card_ids, "deck_id": deck_id},
+            lambda adapter: adapter.change_card_deck(card_ids, deck_id),
+        )
+
+    @scoped_tool(name="anki_cards_suspend", scope="write")
+    async def cards_suspend(
+        card_ids: StableIds, idempotency_key: IdempotencyKey | None = None
+    ) -> dict[str, Any]:
+        """Suspend arbitrary supported cards by stable IDs."""
+        return await mutate(
+            "anki_cards_suspend",
+            idempotency_key,
+            {"card_ids": card_ids},
+            lambda adapter: adapter.suspend_cards(card_ids),
+        )
+
+    @scoped_tool(name="anki_cards_unsuspend", scope="write")
+    async def cards_unsuspend(
+        card_ids: StableIds, idempotency_key: IdempotencyKey | None = None
+    ) -> dict[str, Any]:
+        """Unsuspend arbitrary supported cards by stable IDs."""
+        return await mutate(
+            "anki_cards_unsuspend",
+            idempotency_key,
+            {"card_ids": card_ids},
+            lambda adapter: adapter.unsuspend_cards(card_ids),
+        )
+
+    @scoped_tool(
+        name="anki_cards_delete",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def cards_delete(
+        card_id: StableId,
+        confirm: Confirmation = False,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
         """Delete one card and any orphaned note when confirm is explicitly true."""
         if not confirm:
             cause = ValueError("confirm must be true for card deletion")
             raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
-        return await execute(service.delete_card(card_id))
+        return await mutate(
+            "anki_cards_delete",
+            idempotency_key,
+            {"card_id": card_id, "confirm": confirm},
+            lambda adapter: adapter.delete_card(card_id),
+        )
 
     # FastMCP currently generates argument models with Pydantic's extra="ignore".
     # Tighten both runtime validation and the JSON schemas advertised to clients.
-    for tool_name in (
-        "anki_sync_login",
-        "anki_sync",
-        "anki_sync_full_download",
-        "anki_sync_full_upload",
-        "anki_decks_list",
-        "anki_decks_get",
-        "anki_decks_create",
-        "anki_decks_update",
-        "anki_decks_delete",
-        "anki_cards_search",
-        "anki_cards_get",
-        "anki_cards_create",
-        "anki_cards_update",
-        "anki_cards_delete",
-    ):
+    for tool_name in registered_tool_names:
         registered = mcp._tool_manager.get_tool(tool_name)  # pyright: ignore[reportPrivateUsage]
         if registered is None:  # pragma: no cover
             raise RuntimeError(f"failed to register {tool_name}")
@@ -249,7 +493,7 @@ def create_app(settings: Settings) -> ASGIApp:
         if limit_schema is not None:
             limit_schema["minimum"] = 1
             limit_schema["maximum"] = settings.max_page_size
-        for id_name in ("deck_id", "card_id"):
+        for id_name in ("deck_id", "card_id", "note_id", "note_type_id"):
             id_schema = properties.get(id_name)
             if id_schema is not None:
                 id_schema["minimum"] = 1
@@ -261,16 +505,34 @@ def create_app(settings: Settings) -> ASGIApp:
 
     async def ready(_: Request) -> Response:
         try:
-            is_ready = await service.check_ready()
+            current_status = await service.status()
         except Exception:
-            is_ready = False
-        if not is_ready:
-            return JSONResponse({"status": "not_ready"}, status_code=503)
+            current_status = {"ready": False, "readiness_reason": "collection_unavailable"}
+        if not current_status["ready"]:
+            return JSONResponse(
+                {
+                    "status": "not_ready",
+                    "reason": current_status["readiness_reason"],
+                },
+                status_code=503,
+            )
         return JSONResponse({"status": "ready"})
 
     @asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncGenerator[None]:
         async with service, mcp_app.router.lifespan_context(mcp_app):
+            if settings.bootstrap_mode != "disabled":
+                password = (
+                    settings.sync_password.get_secret_value()
+                    if settings.sync_password is not None
+                    else None
+                )
+                await service.bootstrap(
+                    settings.bootstrap_mode,
+                    settings.sync_username,
+                    password,
+                    settings.sync_endpoint,
+                )
             yield
 
     routes = [

@@ -5,38 +5,40 @@ A small, production-shaped sidecar based on
 collection through authenticated Streamable HTTP MCP and synchronizes it through Anki's official
 sync client API.
 
-The service exposes explicit remote login/sync operations and CRUD tools for decks and Basic
-cards. All collection and sync calls run on one dedicated owner thread.
+The service exposes safe synchronized note, deck, tag, and card workflows. All collection and sync
+calls—including automatic synchronization around operations—run on one dedicated owner thread.
 
 ## Included surface
 
 Endpoint: `http://<host>:8000/mcp`
 
-| Tool | Purpose |
-| --- | --- |
-| `anki_sync_login` | Authenticate with configured sync credentials and retain the host key in memory. |
-| `anki_sync` | Synchronize collection changes and optionally media. |
-| `anki_sync_full_download` | After `anki_sync` reports `FULL_SYNC`/`FULL_DOWNLOAD`, back up and replace local data with `confirm=true`. |
-| `anki_sync_full_upload` | After `anki_sync` reports `FULL_SYNC`/`FULL_UPLOAD`, back up and replace remote data with `confirm=true`. |
-| `anki_decks_list` | List deck IDs, names, and hierarchy with bounded pagination. |
-| `anki_decks_get` | Read one deck by stable ID. |
-| `anki_decks_create` | Create a deck by name. |
-| `anki_decks_update` | Rename a deck by stable ID. |
-| `anki_decks_delete` | Delete a deck and its contained cards with `confirm=true`. |
-| `anki_cards_search` | Search cards with Anki search syntax and bounded offset pagination. |
-| `anki_cards_get` | Read rendered card content, deck identity, flags, and scheduling state. |
-| `anki_cards_create` | Create a Basic Front/Back note and its card in a deck. |
-| `anki_cards_update` | Update Front/Back and/or move a Basic card to another deck. |
-| `anki_cards_delete` | Delete a card and its orphaned note with `confirm=true`. |
+| Tools | Scope | Purpose |
+| --- | --- | --- |
+| `anki_status` | read | Report package, collection, authentication, last-sync, pending mutation, and pending full-sync state. |
+| `anki_sync_login` | admin | Authenticate and persist the sync host key. |
+| `anki_sync` | write | Synchronize collection changes and optionally media. |
+| `anki_backup_create` | admin | Request an explicit persistent local backup. |
+| `anki_sync_full_download`, `anki_sync_full_upload` | admin + flag | Perform a confirmed, server-requested full sync in the operator-selected direction. |
+| `anki_decks_list`, `anki_decks_get` | read | Read bounded deck metadata by stable IDs. |
+| `anki_decks_create`, `anki_decks_update` | write | Create or rename decks through durable mutation receipts. |
+| `anki_decks_delete` | destructive + flag | Delete a deck and its cards with `confirm=true`. |
+| `anki_notes_search`, `anki_notes_get` | read | Search and read arbitrary note types with bounded fields and stable IDs. |
+| `anki_notes_create`, `anki_notes_create_batch` | write | Duplicate-checked, field-validated, idempotent note creation. Batches are bounded and atomic. |
+| `anki_notes_update_fields` | write | Patch validated named fields on an arbitrary note type. |
+| `anki_notes_add_tags`, `anki_notes_remove_tags` | write | Apply normalized tag changes to bounded note-ID sets. |
+| `anki_cards_search`, `anki_cards_get` | read | Search and read rendered card and scheduling state. |
+| `anki_cards_create`, `anki_cards_update` | write | Compatibility workflows for built-in single-card Basic notes. |
+| `anki_cards_change_deck`, `anki_cards_suspend`, `anki_cards_unsuspend` | write | Control arbitrary supported cards by stable IDs. |
+| `anki_cards_delete` | destructive + flag | Delete a card and its orphaned note with `confirm=true`. |
 
 Public, content-free probes:
 
 - `GET /health/live`
 - `GET /health/ready`
 
-Not included: arbitrary note types/fields, automatic sync around each mutation, persisted sync host
-keys, automatic full-sync direction selection, Basic HTTP auth, or multi-user support. The server never opens
-Anki Desktop and never writes directly to SQLite.
+Tools are omitted from discovery when their configured scope or feature flag is disabled. The
+service never chooses a full-sync direction itself, never opens Anki Desktop, and never writes
+directly to Anki's SQLite schema. Basic HTTP auth and multi-user MCP credentials are not included.
 
 ## Requirements
 
@@ -56,10 +58,10 @@ uv run pyright
 uv build
 ```
 
-The tests create disposable collections through the official `anki` Python API. They cover
-configuration and secret-file behavior, bearer rejection without secret leakage, MCP
-initialization and exact tool inventory, deck/card CRUD through JSON-RPC, mocked remote login/sync
-without credential leakage, pagination, not-found behavior, and real collection mutations.
+The tests create disposable collections through the official `anki` Python API and launch the
+official self-hosted sync server shipped by the pinned package. They cover scoped discovery,
+configuration and secret files, authentication, note/deck/card workflows, strict bounds,
+sync-before/write/sync-after, full-sync gating, persisted restart recovery, and idempotent replay.
 
 ## Run locally
 
@@ -70,6 +72,8 @@ export ANKI_COLLECTION_PATH="$PWD/.local-data/collection.anki2"
 export ANKI_SYNC_USERNAME="your-sync-username"
 export ANKI_SYNC_PASSWORD="your-sync-password"
 export ANKI_SYNC_HOST="" # empty selects AnkiWeb; otherwise use an HTTPS custom sync base URL
+export MCP_SCOPES="read,write,admin"
+export ANKI_SYNC_ON_WRITE="true"
 uv run anki-mcp
 ```
 
@@ -78,12 +82,18 @@ Configure the MCP client for Streamable HTTP at `http://127.0.0.1:8000/mcp` with
 Supply an `Authorization` header using the Bearer scheme and the configured token.
 
 Do not use an AnkiWeb password as the MCP token. MCP authentication and remote Anki sync
-authentication are separate. Call `anki_sync_login` after each service restart, then call
-`anki_sync` explicitly before reading remote changes or after local mutations. The returned sync
-payload never contains the configured password, Anki host key, or endpoint. When it reports
-`FULL_SYNC`, `FULL_DOWNLOAD`, or `FULL_UPLOAD`, call the matching confirmed full-sync tool. Both
-directions request a local backup first; Anki may reuse the current backup when the collection is
-unchanged, reported as `backup_created=false`. The service never chooses a destructive direction itself.
+authentication are separate. Call `anki_sync_login` once; the host key is persisted under
+`state/sync-auth` with owner-only permissions and is reused after restart, so the plaintext sync
+password can be removed when manual reauthentication is acceptable. Writes synchronize before and
+after the local commit by default. Reads use the local snapshot unless `sync_before=true` or
+`ANKI_SYNC_ON_READ=true`.
+
+When status or a tool reports `FULL_SYNC_REQUIRED`, normal synchronized operations stop and
+readiness reports `full_sync_required`. Create a backup, inspect which direction the server
+requires, and enable `ANKI_ALLOW_FULL_SYNC=true` only for the operator-controlled maintenance
+window. Call the compatible confirmed administrative tool, then disable the flag again. Both
+directions request a local backup; an upload reconciles pending local mutation receipts as remotely
+synchronized. The service never chooses a destructive direction itself.
 
 ## Run as the OpenClaw sidecar
 
@@ -122,10 +132,17 @@ Exactly one token source is required. Setting both is a startup error.
 | --- | --- | --- |
 | `MCP_AUTH_TOKEN` | — | Bearer token supplied directly. |
 | `MCP_AUTH_TOKEN_FILE` | — | File containing the bearer token; preferred in containers. |
-| `ANKI_SYNC_USERNAME` | empty | Remote sync account username. The service can start without it, but `anki_sync_login` rejects calls until it is configured. |
-| `ANKI_SYNC_PASSWORD` | — | Remote sync password supplied directly; intended for local development only. |
-| `ANKI_SYNC_PASSWORD_FILE` | — | File containing the remote sync password; used by Compose and preferred in containers. |
+| `ANKI_SYNC_USERNAME` | empty | Remote sync username used by login and controlled bootstrap. |
+| `ANKI_SYNC_PASSWORD` | — | Optional remote sync password supplied directly; intended for local development only. |
+| `ANKI_SYNC_PASSWORD_FILE` | — | Optional password file; preferred in containers. It is unnecessary at restart when persisted host-key authentication is sufficient. |
 | `ANKI_SYNC_HOST` | empty | Empty selects AnkiWeb; otherwise an HTTPS self-hosted sync base URL. HTTP is accepted only for loopback development. User-info, query strings, and fragments are rejected. |
+| `MCP_SCOPES` | `read,write,admin` | Enabled internal scopes from `read`, `write`, `admin`, and `destructive`. Tools outside these scopes are omitted. |
+| `ANKI_SYNC_ON_READ` | `false` | Sync before every read; each read can also request `sync_before=true`. |
+| `ANKI_SYNC_ON_WRITE` | `true` | Sync before and after every mutation through the durable coordinator. |
+| `ANKI_ALLOW_DESTRUCTIVE` | `false` | Register provisional confirmed deck/card deletion tools when the destructive scope is also enabled. |
+| `ANKI_ALLOW_FULL_SYNC` | `false` | Register confirmed full upload/download maintenance tools when the admin scope is enabled. |
+| `ANKI_BOOTSTRAP_MODE` | `disabled` | `download_if_empty` explicitly permits startup login and download-only full sync, but refuses a nonempty local collection or server-required upload. |
+| `ANKI_MAX_BATCH_SIZE` | `50` | Maximum note-create, note-tag, and card-control batch size; range 1–500. |
 | `MCP_HOST` | `0.0.0.0` | Bind address. |
 | `MCP_PORT` | `8000` | Bind port. |
 | `MCP_PATH` | `/mcp` | Absolute, non-root MCP path. |
@@ -140,12 +157,12 @@ Exactly one token source is required. Setting both is a startup error.
 | `MCP_ALLOWED_ORIGINS` | local HTTP origins | Comma-separated exact origins or `origin:*` patterns; browser requests with other origins are rejected. |
 | `LOG_LEVEL` | `INFO` | Uvicorn log level. |
 
-Exactly one of `ANKI_SYNC_PASSWORD` and `ANKI_SYNC_PASSWORD_FILE` is also required. Secret files and
-sync credentials are read at startup. Routine health, authentication, and
-tool errors do not return credentials or the collection path. Every HTTP method under the MCP path
-is authenticated with a constant-time token comparison. The sync host key is retained only in
-process memory and is cleared before re-login or after a failed sync, so `anki_sync_login` must be
-called after a restart or sync authentication/network failure before `anki_sync`.
+At most one of `ANKI_SYNC_PASSWORD` and `ANKI_SYNC_PASSWORD_FILE` may be set. One is needed for a
+new login or `download_if_empty` bootstrap unless persisted host-key authentication already exists.
+Routine health, authentication, and tool errors do not return credentials or the collection path.
+Every HTTP method under the MCP path is authenticated with a constant-time token comparison. Sync
+host keys, pending full-sync state, and mutation receipts persist under `/data/state`; `sync-auth`
+is written with mode `0600`.
 Server-directed migrations are accepted only within the configured custom origin, or to an HTTPS
 `ankiweb.net` host when using AnkiWeb.
 
@@ -158,10 +175,11 @@ error response.
 
 ```text
 src/anki_mcp/
-  app.py          ASGI composition and fourteen FastMCP tools
+  app.py          ASGI composition, scoped discovery, and FastMCP tool contracts
   auth.py         bearer authentication middleware
-  collection.py   official Anki CRUD/sync adapter and dedicated single-thread executor
+  collection.py   official Anki workflows, operation coordinator, and owner-thread executor
   config.py       strict environment and secret-file settings
+  state.py        durable sync authentication, status, and idempotency receipts
   healthcheck.py  container readiness command
   __main__.py     one-worker Uvicorn entry point
 tests/             config, collection, auth, health, and MCP integration tests
@@ -173,20 +191,21 @@ uv.lock            reproducible dependency lock
 
 ## Current safety boundary
 
-The collection executor owns the `anki.collection.Collection` object on exactly one dedicated
-worker thread. All tool calls, including remote login and sync, are serialized through that thread.
-Sync is explicit rather than automatic: callers should use `sync -> mutate -> sync`. Full sync
-requires a preceding server requirement, a direction-compatible tool, strict confirmation, and a
-local backup request under the collection's `backups/` directory. Anki may reuse an existing current
-backup when no local data changed. Delete tools
-require a strict JSON boolean `confirm=true`; the Default deck cannot be deleted, and deleting any
-other deck removes its contained cards. Card creation, field updates, and moves support only Anki's
-built-in single-card Basic note type (`Front` and `Back`). Back up the persistent volume before
-destructive operations, and do not mount one collection into multiple live Anki processes.
+The collection executor owns `anki.collection.Collection` on exactly one dedicated worker thread.
+Reads optionally synchronize first. Mutations use `sync → validate/idempotency check → local commit
+→ durable receipt → sync`; a retry after a post-commit network failure performs only the sync step.
+Receipts report `local_committed`, `remote_synced`, `media_synced`, and `retryable` and retain stable
+result IDs across restart.
 
-Mutation tools return concise receipts so a successful side effect cannot be hidden by a large
-rendered response. Card reads represent note fields as bounded `{name, value, ...truncated}` items
-instead of using unbounded field names as JSON object keys.
-Deck creation is idempotent and reports `created=false` when the exact deck name already exists.
-Deck mutation receipts are ID-only; use `anki_decks_get` to read Anki's canonicalized or
-conflict-suffixed name.
+Full-sync requirements persist, degrade readiness, and fail closed. Full-sync tools require the
+admin scope, an explicit safety flag, a preceding compatible server requirement, strict
+confirmation, and a local backup. `download_if_empty` is the only automatic full-sync direction and
+must be selected in process configuration; it refuses nonempty local data and server-required
+uploads. Delete tools independently require the destructive scope, safety flag, and strict
+`confirm=true`.
+
+General note workflows validate exact create fields against the note type, validate patched field
+names, reject empty/duplicate first fields, bound batches, and use stable note/card IDs. Legacy card
+create/update remains limited to built-in single-card Basic notes, while deck changes and
+suspend/unsuspend support arbitrary cards. Back up the persistent volume before maintenance and
+never mount one collection into multiple live Anki processes.

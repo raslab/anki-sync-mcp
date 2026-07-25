@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -85,6 +85,15 @@ class Settings(BaseSettings):
     sync_password_input: SecretStr | None = Field(None, alias="ANKI_SYNC_PASSWORD")
     sync_password_file: Path | None = Field(None, alias="ANKI_SYNC_PASSWORD_FILE")
     sync_host: str = Field("", alias="ANKI_SYNC_HOST")
+    scopes_csv: str = Field("read,write,admin", alias="MCP_SCOPES")
+    sync_on_read: bool = Field(False, alias="ANKI_SYNC_ON_READ")
+    sync_on_write: bool = Field(True, alias="ANKI_SYNC_ON_WRITE")
+    allow_destructive: bool = Field(False, alias="ANKI_ALLOW_DESTRUCTIVE")
+    allow_full_sync: bool = Field(False, alias="ANKI_ALLOW_FULL_SYNC")
+    bootstrap_mode: Literal["disabled", "download_if_empty"] = Field(
+        "disabled", alias="ANKI_BOOTSTRAP_MODE"
+    )
+    max_batch_size: int = Field(50, ge=1, le=500, alias="ANKI_MAX_BATCH_SIZE")
     max_page_size: int = Field(100, ge=1, le=1000, alias="MCP_MAX_PAGE_SIZE")
     max_search_scan: int = Field(10_000, ge=1, le=1_000_000, alias="MCP_MAX_SEARCH_SCAN")
     max_rendered_field_bytes: int = Field(
@@ -104,14 +113,7 @@ class Settings(BaseSettings):
         "http://localhost:*,http://127.0.0.1:*", alias="MCP_ALLOWED_ORIGINS"
     )
     auth_token: SecretStr = Field(default=SecretStr(""), exclude=True)
-    sync_password: SecretStr = Field(default=SecretStr(""), exclude=True)
-
-    @field_validator("sync_password")
-    @classmethod
-    def valid_sync_password(cls, value: SecretStr) -> SecretStr:
-        if not value.get_secret_value():
-            raise ValueError("ANKI_SYNC_PASSWORD must not be empty")
-        return value
+    sync_password: SecretStr | None = Field(default=None, exclude=True)
 
     @property
     def sync_endpoint(self) -> str | None:
@@ -145,6 +147,19 @@ class Settings(BaseSettings):
     def allowed_origins(self) -> list[str]:
         return [item.strip() for item in self.allowed_origins_csv.split(",") if item.strip()]
 
+    @property
+    def scopes(self) -> frozenset[str]:
+        return frozenset(item.strip() for item in self.scopes_csv.split(",") if item.strip())
+
+    @field_validator("scopes_csv")
+    @classmethod
+    def valid_scopes(cls, value: str) -> str:
+        scopes = {item.strip() for item in value.split(",") if item.strip()}
+        unknown = scopes - {"read", "write", "admin", "destructive"}
+        if unknown:
+            raise ValueError(f"unknown MCP scope: {', '.join(sorted(unknown))}")
+        return value
+
     @model_validator(mode="after")
     def validate_response_budget(self) -> Self:
         minimum = self.max_rendered_field_bytes + 4096
@@ -167,9 +182,12 @@ class Settings(BaseSettings):
             file_alias: str,
             file_field: str,
             description: str,
-        ) -> SecretStr:
+            required: bool = True,
+        ) -> SecretStr | None:
             direct = values.get(direct_alias, values.get(direct_field))
             file_value = values.get(file_alias, values.get(file_field))
+            if direct is None and file_value is None and not required:
+                return None
             if (direct is not None) == (file_value is not None):
                 raise ValueError(f"exactly one of {direct_alias} and {file_alias} is required")
             if direct is not None:
@@ -196,5 +214,6 @@ class Settings(BaseSettings):
             "ANKI_SYNC_PASSWORD_FILE",
             "sync_password_file",
             "Anki sync password",
+            required=False,
         )
         return values
