@@ -143,7 +143,7 @@ Schema-changing note-type tools were correctly absent because schema changes are
 
 - Classification: server/API contract defect
 - Severity: Medium
-- Status: Reproducible
+- Status: Fixed in the subsequent Phase 3 implementation
 - Affected tools: any argument rejected by the generated Pydantic/FastMCP argument model; directly reproduced with `anki_cards_set_flag` and `anki_cards_reposition`
 
 Reproduction A:
@@ -175,11 +175,15 @@ Recommendation:
 
 Normalize FastMCP/Pydantic argument-validation failures at the MCP call boundary into the same safe `INVALID_ARGUMENT` JSON envelope, and add protocol-level tests for both constrained scalar failures and forbidden extra inputs.
 
+Resolution: FastMCP argument-validation failures are now adapted at the tool-call boundary to the
+stable `INVALID_ARGUMENT` envelope. Protocol regressions cover invalid constrained scalars and
+forbidden extra inputs without exposing Pydantic details, input values, or documentation URLs.
+
 ### BUG-02 — Connected Hermes MCP client treats expected tool errors as transport failures
 
 - Classification: connected-client/integration defect; not reproduced as an Anki server process failure
 - Severity: Medium for agents that perform validation-heavy workflows
-- Status: Reproducible in this session
+- Status: External Hermes connector defect; not fixable in this repository
 
 Reproduction:
 

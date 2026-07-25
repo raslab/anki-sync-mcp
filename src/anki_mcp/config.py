@@ -91,6 +91,10 @@ class Settings(BaseSettings):
     allow_destructive: bool = Field(False, alias="ANKI_ALLOW_DESTRUCTIVE")
     allow_full_sync: bool = Field(False, alias="ANKI_ALLOW_FULL_SYNC")
     allow_schema_changes: bool = Field(False, alias="ANKI_ALLOW_SCHEMA_CHANGES")
+    allow_review_answers: bool = Field(False, alias="ANKI_ALLOW_REVIEW_ANSWERS")
+    confirmation_ttl_seconds: int = Field(
+        300, ge=30, le=3600, alias="ANKI_CONFIRMATION_TTL_SECONDS"
+    )
     bootstrap_mode: Literal["disabled", "download_if_empty"] = Field(
         "disabled", alias="ANKI_BOOTSTRAP_MODE"
     )

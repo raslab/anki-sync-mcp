@@ -111,6 +111,12 @@ window. Call the compatible confirmed administrative tool, then disable the flag
 directions request a local backup; an upload reconciles pending local mutation receipts as remotely
 synchronized. The service never chooses a destructive direction itself.
 
+Destructive operations use a two-step flow. Call the matching `*_delete_preview` tool, inspect its
+bounded impact, then pass the returned one-time `confirmation_token` to the delete tool before it
+expires. The service creates and verifies a collection backup immediately before every deletion.
+Schema mutations use `anki_note_types_change_preview` in the same way and are exposed only during a
+maintenance window with both `ANKI_ALLOW_SCHEMA_CHANGES=true` and `ANKI_ALLOW_FULL_SYNC=true`.
+
 ## Run as the OpenClaw sidecar
 
 Create the Compose secret and build the image:
@@ -155,9 +161,11 @@ Exactly one token source is required. Setting both is a startup error.
 | `MCP_SCOPES` | `read,write,admin` | Enabled internal scopes from `read`, `write`, `admin`, and `destructive`. Tools outside these scopes are omitted. |
 | `ANKI_SYNC_ON_READ` | `false` | Sync before every read; each read can also request `sync_before=true`. |
 | `ANKI_SYNC_ON_WRITE` | `true` | Sync before and after every mutation through the durable coordinator. |
-| `ANKI_ALLOW_DESTRUCTIVE` | `false` | Register confirmed deck, note, tag, card, note-type, and media deletion tools when the destructive scope is also enabled. |
-| `ANKI_ALLOW_SCHEMA_CHANGES` | `false` | Register note-type, field, and template mutation tools; note-type deletion additionally requires the destructive gate. |
+| `ANKI_ALLOW_DESTRUCTIVE` | `false` | Register preview-token-guarded deck, note, tag, card, note-type, and media deletion tools when the destructive scope is also enabled. |
+| `ANKI_ALLOW_SCHEMA_CHANGES` | `false` | Register note-type, field, and template mutation tools only when full-sync maintenance is also enabled; note-type deletion additionally requires the destructive gate. |
 | `ANKI_ALLOW_FULL_SYNC` | `false` | Register confirmed full upload/download maintenance tools when the admin scope is enabled. |
+| `ANKI_ALLOW_REVIEW_ANSWERS` | `false` | Register the administrative `anki_cards_answer` tool for recording real reviews. |
+| `ANKI_CONFIRMATION_TTL_SECONDS` | `300` | Lifetime of one-time destructive/schema confirmation tokens; range 30–3600 seconds. |
 | `ANKI_BOOTSTRAP_MODE` | `disabled` | `download_if_empty` explicitly permits startup login and download-only full sync, but refuses a nonempty local collection or server-required upload. |
 | `ANKI_MAX_BATCH_SIZE` | `50` | Maximum note-create, note-tag, and card-control batch size; range 1–500. |
 | `MCP_HOST` | `0.0.0.0` | Bind address. |
@@ -185,10 +193,10 @@ is written with mode `0600`.
 Server-directed migrations are accepted only within the configured custom origin, or to an HTTPS
 `ankiweb.net` host when using AnkiWeb.
 
-Missing IDs and invalid pagination return MCP tool errors whose text ends with a compact JSON
-object containing a stable `code` (`NOT_FOUND` or `INVALID_ARGUMENT`), a safe message, and a
-request correlation ID. FastMCP prefixes this JSON with the tool name when serializing the MCP
-error response.
+Missing IDs, invalid pagination, generated-schema failures, and forbidden extra arguments return
+MCP tool errors containing a compact JSON object with a stable `code` (`NOT_FOUND` or
+`INVALID_ARGUMENT`), a safe message, and a request correlation ID. Pydantic details, input values,
+and documentation URLs are not exposed.
 
 ## Project layout
 

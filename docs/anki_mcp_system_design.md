@@ -362,7 +362,7 @@ With a single token, enabled scopes are configured at startup. Destructive and s
 - Cap page sizes, batch sizes, media sizes, and search result counts.
 - Validate note fields against the selected note type.
 - Return an impact preview before note-type, template, deck, or bulk destructive changes.
-- Require `confirm=true` plus a short-lived confirmation token derived from the impact preview for destructive tools.
+- Require a short-lived, one-time confirmation token derived from the impact preview for destructive tools.
 - Sanitize filenames and prevent path traversal in media operations.
 - Do not place collection content, sync credentials, MCP tokens, or media bytes in routine logs.
 
@@ -455,8 +455,8 @@ Before production use, perform an end-to-end test with a disposable sync account
 
 ## 16. Delivery Phases
 
-The implementation now includes the authenticated baseline and the Phase 1 safe synchronized note
-core. The phases below record delivered behavior and order remaining work by operational
+The implementation now includes the authenticated baseline through Phase 3 guarded administration.
+The phases below record delivered behavior and order remaining work by operational
 dependency. A phase is complete only when its tools, safety semantics, and integration tests are
 all delivered.
 
@@ -482,9 +482,9 @@ all delivered.
 The baseline did **not** provide automatic sync around mutations, persisted sync authentication,
 operation idempotency, general note/tag workflows, scheduling controls, media tools, scoped
 authorization, audit state, or preview-token protection. Phase 1 supplies the synchronization,
-note/tag, core card-control, scoped authorization, and durable operation pieces. Delete and
-full-sync tools still use strict `confirm=true`; treat them as a provisional private-deployment
-interface until the guarded administration phase is complete.
+note/tag, core card-control, scoped authorization, and durable operation pieces. At that baseline
+stage, delete and full-sync tools still used strict `confirm=true`; Phase 3 replaced the provisional
+deletion interface.
 
 ### Delivered Phase 1: safe synchronized note workflows
 
@@ -533,17 +533,17 @@ second client's full download, and a subsequent normal synchronized write/read l
 - Covered every new collection operation through disposable official Anki collections and every
   exposed tool through authenticated MCP JSON-RPC calls.
 
-### Phase 3: guarded advanced administration
+### Delivered Phase 3: guarded advanced administration
 
-- Harden schema mutations already gated by `ANKI_ALLOW_SCHEMA_CHANGES` with impact previews,
-  required backups, and explicit full-sync maintenance handling.
-- Replace provisional confirmation-only deletion with impact previews, short-lived confirmation
-  tokens, backups where required, feature-gated registration, and tests proving rejected operations
-  leave the collection unchanged.
-- Add guarded note, note-type, and media deletion; retain deck/card deletion under the same model.
-- Add optional review answering only behind an explicit feature flag and administrative scope.
-- Add multiple MCP credentials mapped to the established read/write/admin/destructive scopes if
-  deployment requirements justify them; add HTTP Basic only if a concrete client requires it.
+- Hardened schema mutations with bounded impact previews, one-time confirmation tokens, verified
+  pre-operation backups, and an explicit full-sync maintenance gate.
+- Replaced provisional confirmation-only deletion with feature-gated preview tools and request-bound,
+  short-lived tokens for deck, note, tag, card, note-type, and media deletion. Rejected operations
+  leave the collection unchanged; accepted operations include the backup receipt.
+- Added optional real review answering behind `ANKI_ALLOW_REVIEW_ANSWERS` and the administrative
+  scope, with bounded ratings and answer time.
+- Retained one bearer credential because no deployment requirement currently justifies multiple
+  credentials or HTTP Basic authentication.
 
 ## 17. Key Decisions
 
