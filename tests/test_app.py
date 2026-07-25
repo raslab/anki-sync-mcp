@@ -28,6 +28,10 @@ def settings(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Settings:
     monkeypatch.setenv("ANKI_SYNC_USERNAME", "sync-user")
     monkeypatch.setenv("ANKI_SYNC_PASSWORD", "sync-password")
     monkeypatch.setenv("ANKI_SYNC_HOST", "https://sync.example.test/")
+    monkeypatch.setenv("ANKI_SYNC_ON_WRITE", "false")
+    monkeypatch.setenv("MCP_SCOPES", "read,write,admin,destructive")
+    monkeypatch.setenv("ANKI_ALLOW_DESTRUCTIVE", "true")
+    monkeypatch.setenv("ANKI_ALLOW_FULL_SYNC", "true")
     return Settings(_env_file=None)
 
 
@@ -40,8 +44,8 @@ def client(settings: Settings) -> Iterator[TestClient]:
 def test_health_endpoints_are_public_and_safe(client: TestClient) -> None:
     assert client.get("/health/live").json() == {"status": "ok"}
     ready = client.get("/health/ready")
-    assert ready.status_code == 200
-    assert ready.json() == {"status": "ready"}
+    assert ready.status_code == 503
+    assert ready.json() == {"status": "not_ready", "reason": "authentication_required"}
     assert "token" not in ready.text.lower()
     assert "collection.anki2" not in ready.text
 
@@ -51,7 +55,7 @@ def test_readiness_degrades_when_collection_is_unusable(client: TestClient) -> N
     service.executor.submit(lambda adapter: adapter.close()).result()
     response = client.get("/health/ready")
     assert response.status_code == 503
-    assert response.json() == {"status": "not_ready"}
+    assert response.json() == {"status": "not_ready", "reason": "collection_unavailable"}
 
 
 def test_mcp_rejects_missing_or_invalid_bearer_token(client: TestClient) -> None:
@@ -185,19 +189,31 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     tools = listed.json()["result"]["tools"]
     names = [tool["name"] for tool in tools]
     assert names == [
+        "anki_status",
         "anki_sync_login",
         "anki_sync",
         "anki_sync_full_download",
         "anki_sync_full_upload",
+        "anki_backup_create",
         "anki_decks_list",
         "anki_decks_get",
         "anki_decks_create",
         "anki_decks_update",
         "anki_decks_delete",
+        "anki_notes_search",
+        "anki_notes_get",
+        "anki_notes_create",
+        "anki_notes_create_batch",
+        "anki_notes_update_fields",
+        "anki_notes_add_tags",
+        "anki_notes_remove_tags",
         "anki_cards_search",
         "anki_cards_get",
         "anki_cards_create",
         "anki_cards_update",
+        "anki_cards_change_deck",
+        "anki_cards_suspend",
+        "anki_cards_unsuspend",
         "anki_cards_delete",
     ]
     assert all(tool["inputSchema"]["additionalProperties"] is False for tool in tools)
@@ -259,24 +275,26 @@ def test_deck_and_card_crud_tools_work_through_json_rpc(client: TestClient) -> N
 
     deck = call("anki_decks_create", {"name": "CRUD"})
     existing_deck = call("anki_decks_create", {"name": "CRUD"})
-    renamed = call("anki_decks_update", {"deck_id": deck["id"], "name": "CRUD Updated"})
+    deck_id = deck["result"]["id"]
+    renamed = call("anki_decks_update", {"deck_id": deck_id, "name": "CRUD Updated"})
     card = call(
         "anki_cards_create",
-        {"deck_id": deck["id"], "front": "question", "back": "answer"},
+        {"deck_id": deck_id, "front": "question", "back": "answer"},
     )
+    card_id = card["result"]["id"]
     changed = call(
         "anki_cards_update",
-        {"card_id": card["id"], "front": "new question", "back": "new answer"},
+        {"card_id": card_id, "front": "new question", "back": "new answer"},
     )
-    card_deleted = call("anki_cards_delete", {"card_id": card["id"], "confirm": True})
-    deck_deleted = call("anki_decks_delete", {"deck_id": deck["id"], "confirm": True})
+    card_deleted = call("anki_cards_delete", {"card_id": card_id, "confirm": True})
+    deck_deleted = call("anki_decks_delete", {"deck_id": deck_id, "confirm": True})
 
-    assert renamed == {"id": deck["id"], "updated": True}
-    assert deck["created"] is True
-    assert existing_deck == {"id": deck["id"], "created": False}
-    assert changed["updated"] is True
-    assert card_deleted["deleted"] is True
-    assert deck_deleted["deleted"] is True
+    assert renamed["result"] == {"id": deck_id, "updated": True}
+    assert deck["result"]["created"] is True
+    assert existing_deck["result"] == {"id": deck_id, "created": False}
+    assert changed["result"]["updated"] is True
+    assert card_deleted["result"]["deleted"] is True
+    assert deck_deleted["result"]["deleted"] is True
 
 
 def test_sync_tools_use_server_configuration_without_exposing_credentials(
@@ -608,7 +626,7 @@ def test_aggregate_tool_response_budget_is_enforced(settings: Settings) -> None:
 
 
 def test_mutation_returns_concise_receipt_before_response_budget_check(settings: Settings) -> None:
-    custom = settings.model_copy(update={"max_response_bytes": 128})
+    custom = settings.model_copy(update={"max_response_bytes": 512})
     headers = {
         "Authorization": "Bearer correct-token",
         "Accept": "application/json, text/event-stream",
@@ -642,10 +660,11 @@ def test_mutation_returns_concise_receipt_before_response_budget_check(settings:
     result = response.json()["result"]
     assert result.get("isError") is not True
     receipt = json.loads(result["content"][0]["text"])
-    assert receipt["created"] is True
+    assert receipt["local_committed"] is True
+    assert receipt["result"]["created"] is True
     collection = Collection(str(settings.collection_path))
     try:
-        assert collection.decks.id_for_name("Receipt") == receipt["id"]
+        assert collection.decks.id_for_name("Receipt") == receipt["result"]["id"]
     finally:
         collection.close()
 

@@ -35,6 +35,13 @@ def test_direct_token_and_defaults(tmp_path: Path) -> None:
     assert settings.sync_username == "sync-user"
     assert settings.sync_password.get_secret_value() == "sync-password"
     assert settings.sync_host == "https://sync.example.test/"
+    assert settings.scopes == frozenset({"read", "write", "admin"})
+    assert settings.sync_on_read is False
+    assert settings.sync_on_write is True
+    assert settings.allow_destructive is False
+    assert settings.allow_full_sync is False
+    assert settings.bootstrap_mode == "disabled"
+    assert settings.max_batch_size == 50
 
 
 def test_sync_username_can_be_empty_until_login(tmp_path: Path) -> None:
@@ -43,11 +50,10 @@ def test_sync_username_can_be_empty_until_login(tmp_path: Path) -> None:
     assert settings.sync_username == ""
 
 
-def test_sync_password_is_required_from_environment(tmp_path: Path) -> None:
+def test_sync_password_can_be_omitted_for_persisted_auth(tmp_path: Path) -> None:
     values = env(tmp_path)
     del values["ANKI_SYNC_PASSWORD"]
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None, **values)
+    assert Settings(_env_file=None, **values).sync_password is None
 
 
 def test_sync_password_can_be_loaded_from_secret_file(tmp_path: Path) -> None:
@@ -214,3 +220,33 @@ def test_mcp_path_must_be_a_static_url_path(tmp_path: Path, mcp_path: str) -> No
 def test_unknown_configuration_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **env(tmp_path), SURPRISE="nope")
+
+
+def test_scopes_and_phase_one_safety_settings_are_validated(tmp_path: Path) -> None:
+    configured = Settings(
+        _env_file=None,
+        **env(
+            tmp_path,
+            MCP_SCOPES="read,write,admin,destructive",
+            ANKI_ALLOW_DESTRUCTIVE="true",
+            ANKI_ALLOW_FULL_SYNC="true",
+            ANKI_SYNC_ON_READ="true",
+            ANKI_SYNC_ON_WRITE="false",
+            ANKI_BOOTSTRAP_MODE="download_if_empty",
+            ANKI_MAX_BATCH_SIZE="5",
+        ),
+    )
+    assert configured.scopes == frozenset({"read", "write", "admin", "destructive"})
+    assert configured.allow_destructive is True
+    assert configured.allow_full_sync is True
+    assert configured.sync_on_read is True
+    assert configured.sync_on_write is False
+    assert configured.bootstrap_mode == "download_if_empty"
+    assert configured.max_batch_size == 5
+
+    with pytest.raises(ValidationError, match="scope"):
+        Settings(_env_file=None, **env(tmp_path, MCP_SCOPES="read,root"))
+    with pytest.raises(ValidationError, match="ANKI_BOOTSTRAP_MODE"):
+        Settings(_env_file=None, **env(tmp_path, ANKI_BOOTSTRAP_MODE="upload"))
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **env(tmp_path, ANKI_MAX_BATCH_SIZE="0"))
