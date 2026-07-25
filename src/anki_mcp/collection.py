@@ -125,6 +125,13 @@ class CollectionAdapter:
             return False
         return self.collection.db.scalar("select 1") == 1
 
+    @staticmethod
+    def _impact_fingerprint(value: Any) -> str:
+        encoded = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
     def _save_operational_status(self) -> None:
         pending = None
         if self._pending_full_sync is not None:
@@ -229,8 +236,8 @@ class CollectionAdapter:
         """Create a verified backup immediately before a guarded mutation."""
         backup = self.create_backup()
         path = backup.get("path")
-        if not backup.get("created") or not isinstance(path, str) or not Path(path).is_file():
-            raise RuntimeError("required pre-operation backup was not created")
+        if not isinstance(path, str) or not Path(path).is_file():
+            raise RuntimeError("required pre-operation backup is unavailable")
         return {**mutation(), "backup": backup}
 
     def bootstrap(
@@ -573,6 +580,13 @@ class CollectionAdapter:
             "decks": len(affected_deck_ids),
             "cards": len(card_ids),
             "notes_at_risk": len(note_ids),
+            "state_fingerprint": self._impact_fingerprint(
+                {
+                    "deck_ids": sorted(affected_deck_ids),
+                    "card_ids": sorted(card_ids),
+                    "note_ids": sorted(note_ids),
+                }
+            ),
         }
 
     def search_notes(self, query: str, offset: int, limit: int) -> dict[str, Any]:
@@ -785,9 +799,16 @@ class CollectionAdapter:
         if len(set(note_ids)) != len(note_ids):
             raise ValueError("note_ids must not contain duplicates")
         cards = 0
+        card_ids_by_note: dict[int, list[int]] = {}
         for note_id in note_ids:
-            cards += len(self.get_note(note_id)["card_ids"])
-        return {"notes": len(note_ids), "cards": cards}
+            card_ids = self.get_note(note_id)["card_ids"]
+            cards += len(card_ids)
+            card_ids_by_note[note_id] = card_ids
+        return {
+            "notes": len(note_ids),
+            "cards": cards,
+            "state_fingerprint": self._impact_fingerprint(card_ids_by_note),
+        }
 
     def list_tags(self, offset: int, limit: int) -> dict[str, Any]:
         tags = self.collection.tags.all()
@@ -832,12 +853,20 @@ class CollectionAdapter:
     def preview_tag_delete(self, name: str) -> dict[str, Any]:
         if name not in self.collection.tags.all():
             raise LookupError(f"tag {name} not found")
-        note_count = sum(
-            1
+        if int(self.collection.note_count()) > self.max_search_scan:
+            raise ValueError(
+                "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        note_ids = [
+            int(note_id)
             for note_id in self.collection.find_notes("")
             if name in self.collection.get_note(note_id).tags
-        )
-        return {"notes": note_count, "tag": name}
+        ]
+        return {
+            "notes": len(note_ids),
+            "tag": name,
+            "state_fingerprint": self._impact_fingerprint(sorted(note_ids)),
+        }
 
     def list_note_types(self, offset: int, limit: int) -> dict[str, Any]:
         models = self.collection.models.all_names_and_ids()
@@ -1080,12 +1109,41 @@ class CollectionAdapter:
             note_count = int(self.get_note_type(note_type_id)["note_count"])
         elif note_type_id is not None:
             raise ValueError("note_type_id must be omitted for create")
+        models = sorted(
+            (
+                {"id": int(model.id), "name": model.name}
+                for model in self.collection.models.all_names_and_ids()
+            ),
+            key=lambda model: model["id"],
+        )
+        current_model = None
+        if note_type_id is not None:
+            model = self.collection.models.get(cast("NotetypeId", note_type_id))
+            if model is None:  # pragma: no cover - get_note_type above validates this
+                raise LookupError(f"note type {note_type_id} not found")
+            current_model = {
+                "name": str(model["name"]),
+                "css": str(model.get("css", "")),
+                "fields": [str(field["name"]) for field in model.get("flds", [])],
+                "templates": [
+                    {
+                        "name": str(template["name"]),
+                        "question_format": str(template["qfmt"]),
+                        "answer_format": str(template["afmt"]),
+                    }
+                    for template in model.get("tmpls", [])
+                ],
+                "note_count": note_count,
+            }
         return {
             "operation": operation,
             "note_type_id": note_type_id,
             "affected_notes": note_count,
             "backup_required": True,
             "full_sync_required": True,
+            "state_fingerprint": self._impact_fingerprint(
+                {"models": models, "current_model": current_model}
+            ),
         }
 
     def _media_path(self, filename: str, *, require_exists: bool) -> Path:
@@ -1204,7 +1262,14 @@ class CollectionAdapter:
 
     def preview_media_delete(self, filename: str) -> dict[str, Any]:
         path = self._media_path(filename, require_exists=True)
-        return {"filename": filename, "bytes": path.stat().st_size}
+        stat = path.stat()
+        return {
+            "filename": filename,
+            "bytes": stat.st_size,
+            "state_fingerprint": self._impact_fingerprint(
+                {"size": stat.st_size, "modified_ns": stat.st_mtime_ns}
+            ),
+        }
 
     def check_media(self, offset: int, limit: int) -> dict[str, Any]:
         self._page([], offset, limit)
@@ -1416,11 +1481,14 @@ class CollectionAdapter:
 
     def preview_card_delete(self, card_id: int) -> dict[str, Any]:
         card = self.get_card(card_id)
-        sibling_count = len(self.collection.find_cards(f"nid:{card['note_id']}"))
+        sibling_ids = [
+            int(sibling_id) for sibling_id in self.collection.find_cards(f"nid:{card['note_id']}")
+        ]
         return {
             "cards": 1,
             "note_id": card["note_id"],
-            "orphaned_note_deleted": sibling_count == 1,
+            "orphaned_note_deleted": len(sibling_ids) == 1,
+            "state_fingerprint": self._impact_fingerprint(sorted(sibling_ids)),
         }
 
     def answer_card(self, card_id: int, rating: int, answer_seconds: int) -> dict[str, Any]:

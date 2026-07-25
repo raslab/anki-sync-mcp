@@ -345,7 +345,15 @@ def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -
     )
     fields_preview = call(
         "anki_note_types_change_preview",
-        {"operation": "fields_update", "note_type_id": note_type_id},
+        {
+            "operation": "fields_update",
+            "note_type_id": note_type_id,
+            "field_mappings": [
+                {"name": "Back", "source_ordinal": 1},
+                {"name": "Hint", "source_ordinal": None},
+                {"name": "Front", "source_ordinal": 0},
+            ],
+        },
     )
     fields = call(
         "anki_note_type_fields_update",
@@ -362,7 +370,18 @@ def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -
     )
     templates_preview = call(
         "anki_note_types_change_preview",
-        {"operation": "templates_update", "note_type_id": note_type_id},
+        {
+            "operation": "templates_update",
+            "note_type_id": note_type_id,
+            "template_mappings": [
+                {
+                    "name": "Card 1",
+                    "source_ordinal": 0,
+                    "question_format": "{{Front}}",
+                    "answer_format": "{{FrontSide}}<hr id=answer>{{Back}}",
+                }
+            ],
+        },
     )
     templates = call(
         "anki_templates_update",
@@ -456,9 +475,21 @@ def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) 
     deck_token = call("anki_decks_delete_preview", {"deck_id": deck_id})["confirmation_token"]
     deck_deleted = call("anki_decks_delete", {"deck_id": deck_id, "confirmation_token": deck_token})
 
-    create_token = call("anki_note_types_change_preview", {"operation": "create"})[
-        "confirmation_token"
-    ]
+    create_token = call(
+        "anki_note_types_change_preview",
+        {
+            "operation": "create",
+            "name": "Protocol Type",
+            "fields": ["Question", "Answer"],
+            "templates": [
+                {
+                    "name": "Card 1",
+                    "question_format": "{{Question}}",
+                    "answer_format": "{{Answer}}",
+                }
+            ],
+        },
+    )["confirmation_token"]
     note_type = call(
         "anki_note_types_create",
         {
@@ -479,7 +510,19 @@ def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) 
     assert call("anki_note_types_list", {"limit": 100})["total"] >= 1
     update_token = call(
         "anki_note_types_change_preview",
-        {"operation": "update", "note_type_id": note_type_id},
+        {
+            "operation": "update",
+            "note_type_id": note_type_id,
+            "name": "Protocol Type Updated",
+            "fields": ["Prompt", "Response"],
+            "templates": [
+                {
+                    "name": "Prompt Card",
+                    "question_format": "{{Prompt}}",
+                    "answer_format": "{{Response}}",
+                }
+            ],
+        },
     )["confirmation_token"]
     call(
         "anki_note_types_update",

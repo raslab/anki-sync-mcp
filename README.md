@@ -114,7 +114,10 @@ synchronized. The service never chooses a destructive direction itself.
 Destructive operations use a two-step flow. Call the matching `*_delete_preview` tool, inspect its
 bounded impact, then pass the returned one-time `confirmation_token` to the delete tool before it
 expires. The service creates and verifies a collection backup immediately before every deletion.
-Schema mutations use `anki_note_types_change_preview` in the same way and are exposed only during a
+Tokens bind both the exact request and an opaque fingerprint of the previewed state, so altered
+requests and stale previews are rejected. Schema mutations use `anki_note_types_change_preview` in
+the same way: the preview call must contain the exact proposed create/update payload, or
+`field_mappings`/`template_mappings` for those operations. Schema tools are exposed only during a
 maintenance window with both `ANKI_ALLOW_SCHEMA_CHANGES=true` and `ANKI_ALLOW_FULL_SYNC=true`.
 
 ## Run as the OpenClaw sidecar

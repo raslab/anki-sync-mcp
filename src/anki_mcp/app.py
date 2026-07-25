@@ -219,7 +219,9 @@ def create_app(settings: Settings) -> ASGIApp:
         return {
             "operation": operation,
             "impact": impact,
-            "confirmation_token": confirmations.issue(operation, request),
+            "confirmation_token": confirmations.issue(
+                operation, {"request": request, "impact": impact}
+            ),
             "expires_in_seconds": settings.confirmation_ttl_seconds,
         }
 
@@ -229,13 +231,19 @@ def create_app(settings: Settings) -> ASGIApp:
         request: dict[str, Any],
         confirmation_token: str,
         guard_request: dict[str, Any],
+        preview_function: Callable[[CollectionAdapter], dict[str, Any]],
         function: Callable[[CollectionAdapter], dict[str, Any]],
         *,
         sync_media: bool = False,
     ) -> dict[str, Any]:
         def guarded(adapter: CollectionAdapter) -> dict[str, Any]:
+            current_impact = preview_function(adapter)
             try:
-                confirmations.consume(confirmation_token, operation, guard_request)
+                confirmations.consume(
+                    confirmation_token,
+                    operation,
+                    {"request": guard_request, "impact": current_impact},
+                )
             except ValueError as exc:
                 raise ConfirmationRequiredError(str(exc)) from exc
             return adapter.backup_before(lambda: function(adapter))
@@ -419,6 +427,7 @@ def create_app(settings: Settings) -> ASGIApp:
             request,
             confirmation_token,
             request,
+            lambda adapter: adapter.preview_deck_delete(deck_id),
             lambda adapter: adapter.delete_deck(deck_id),
         )
 
@@ -554,6 +563,7 @@ def create_app(settings: Settings) -> ASGIApp:
             request,
             confirmation_token,
             request,
+            lambda adapter: adapter.preview_notes_delete(note_ids),
             lambda adapter: adapter.delete_notes(note_ids),
         )
 
@@ -612,6 +622,7 @@ def create_app(settings: Settings) -> ASGIApp:
             request,
             confirmation_token,
             request,
+            lambda adapter: adapter.preview_tag_delete(name),
             lambda adapter: adapter.delete_tag(name),
         )
 
@@ -795,6 +806,7 @@ def create_app(settings: Settings) -> ASGIApp:
             request,
             confirmation_token,
             request,
+            lambda adapter: adapter.preview_card_delete(card_id),
             lambda adapter: adapter.delete_card(card_id),
         )
 
@@ -830,8 +842,14 @@ def create_app(settings: Settings) -> ASGIApp:
     async def note_types_change_preview(
         operation: SchemaChangeOperation,
         note_type_id: StableId | None = None,
+        name: ResourceName | None = None,
+        fields: list[ResourceName] | None = None,
+        templates: list[NoteTypeTemplateInput] | None = None,
+        css: CardText = "",
+        field_mappings: FieldMappings | None = None,
+        template_mappings: TemplateMappings | None = None,
     ) -> dict[str, Any]:
-        """Preview a schema mutation and issue a short-lived maintenance token."""
+        """Preview an exact proposed schema mutation and issue a maintenance token."""
         operation_names = {
             "create": "anki_note_types_create",
             "update": "anki_note_types_update",
@@ -839,10 +857,109 @@ def create_app(settings: Settings) -> ASGIApp:
             "templates_update": "anki_templates_update",
             "delete": "anki_note_types_delete",
         }
-        request = {"operation": operation, "note_type_id": note_type_id}
+        template_values = (
+            [template.model_dump() for template in templates] if templates is not None else None
+        )
+        field_mapping_values = (
+            [mapping.model_dump() for mapping in field_mappings]
+            if field_mappings is not None
+            else None
+        )
+        template_mapping_values = (
+            [mapping.model_dump() for mapping in template_mappings]
+            if template_mappings is not None
+            else None
+        )
+        if operation == "create":
+            if (
+                note_type_id is not None
+                or name is None
+                or fields is None
+                or template_values is None
+                or field_mapping_values is not None
+                or template_mapping_values is not None
+            ):
+                cause = ValueError("create preview requires only name, fields, templates, and css")
+                raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+            mutation_request = {
+                "name": name,
+                "fields": fields,
+                "templates": template_values,
+                "css": css,
+            }
+        elif operation == "update":
+            if (
+                note_type_id is None
+                or name is None
+                or fields is None
+                or template_values is None
+                or field_mapping_values is not None
+                or template_mapping_values is not None
+            ):
+                cause = ValueError(
+                    "update preview requires note_type_id, name, fields, templates, and css"
+                )
+                raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+            mutation_request = {
+                "note_type_id": note_type_id,
+                "name": name,
+                "fields": fields,
+                "templates": template_values,
+                "css": css,
+            }
+        elif operation == "fields_update":
+            if (
+                note_type_id is None
+                or field_mapping_values is None
+                or name is not None
+                or fields is not None
+                or template_values is not None
+                or template_mapping_values is not None
+                or css
+            ):
+                cause = ValueError(
+                    "fields_update preview requires only note_type_id and field_mappings"
+                )
+                raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+            mutation_request = {
+                "note_type_id": note_type_id,
+                "mappings": field_mapping_values,
+            }
+        elif operation == "templates_update":
+            if (
+                note_type_id is None
+                or template_mapping_values is None
+                or name is not None
+                or fields is not None
+                or template_values is not None
+                or field_mapping_values is not None
+                or css
+            ):
+                cause = ValueError(
+                    "templates_update preview requires only note_type_id and template_mappings"
+                )
+                raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+            mutation_request = {
+                "note_type_id": note_type_id,
+                "mappings": template_mapping_values,
+            }
+        else:
+            if (
+                note_type_id is None
+                or name is not None
+                or fields is not None
+                or template_values is not None
+                or field_mapping_values is not None
+                or template_mapping_values is not None
+                or css
+            ):
+                cause = ValueError("delete preview requires only note_type_id")
+                raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+            mutation_request = {"note_type_id": note_type_id}
+        guard_request = {"operation": operation, "request": mutation_request}
         return await preview(
             operation_names[operation],
-            request,
+            guard_request,
             lambda adapter: adapter.preview_note_type_change(operation, note_type_id),
         )
 
@@ -867,7 +984,8 @@ def create_app(settings: Settings) -> ASGIApp:
             idempotency_key,
             request,
             confirmation_token,
-            {"operation": "create", "note_type_id": None},
+            {"operation": "create", "request": request},
+            lambda adapter: adapter.preview_note_type_change("create", None),
             lambda adapter: adapter.create_note_type(name, fields, template_values, css),
         )
 
@@ -899,7 +1017,8 @@ def create_app(settings: Settings) -> ASGIApp:
             idempotency_key,
             request,
             confirmation_token,
-            {"operation": "update", "note_type_id": note_type_id},
+            {"operation": "update", "request": request},
+            lambda adapter: adapter.preview_note_type_change("update", note_type_id),
             lambda adapter: adapter.update_note_type(
                 note_type_id, name, fields, template_values, css
             ),
@@ -924,7 +1043,8 @@ def create_app(settings: Settings) -> ASGIApp:
             idempotency_key,
             request,
             confirmation_token,
-            {"operation": "fields_update", "note_type_id": note_type_id},
+            {"operation": "fields_update", "request": request},
+            lambda adapter: adapter.preview_note_type_change("fields_update", note_type_id),
             lambda adapter: adapter.update_note_type_fields(note_type_id, mapping_values),
         )
 
@@ -947,7 +1067,8 @@ def create_app(settings: Settings) -> ASGIApp:
             idempotency_key,
             request,
             confirmation_token,
-            {"operation": "templates_update", "note_type_id": note_type_id},
+            {"operation": "templates_update", "request": request},
+            lambda adapter: adapter.preview_note_type_change("templates_update", note_type_id),
             lambda adapter: adapter.update_templates(note_type_id, mapping_values),
         )
 
@@ -972,7 +1093,8 @@ def create_app(settings: Settings) -> ASGIApp:
             idempotency_key,
             request,
             confirmation_token,
-            {"operation": "delete", "note_type_id": note_type_id},
+            {"operation": "delete", "request": request},
+            lambda adapter: adapter.preview_note_type_change("delete", note_type_id),
             lambda adapter: adapter.delete_note_type(note_type_id),
         )
 
@@ -1075,6 +1197,7 @@ def create_app(settings: Settings) -> ASGIApp:
             request,
             confirmation_token,
             request,
+            lambda adapter: adapter.preview_media_delete(filename),
             lambda adapter: adapter.delete_media(filename),
             sync_media=True,
         )

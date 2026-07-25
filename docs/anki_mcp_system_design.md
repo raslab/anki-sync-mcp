@@ -535,11 +535,12 @@ second client's full download, and a subsequent normal synchronized write/read l
 
 ### Delivered Phase 3: guarded advanced administration
 
-- Hardened schema mutations with bounded impact previews, one-time confirmation tokens, verified
-  pre-operation backups, and an explicit full-sync maintenance gate.
+- Hardened schema mutations with exact-payload, state-fingerprinted impact previews, one-time
+  confirmation tokens, verified pre-operation backups, and an explicit full-sync maintenance gate.
 - Replaced provisional confirmation-only deletion with feature-gated preview tools and request-bound,
-  short-lived tokens for deck, note, tag, card, note-type, and media deletion. Rejected operations
-  leave the collection unchanged; accepted operations include the backup receipt.
+  state-fingerprinted, short-lived tokens for deck, note, tag, card, note-type, and media deletion.
+  Changed impacts invalidate stale previews. Rejected operations leave the collection unchanged;
+  accepted operations include the verified current backup receipt.
 - Added optional real review answering behind `ANKI_ALLOW_REVIEW_ANSWERS` and the administrative
   scope, with bounded ratings and answer time.
 - Retained one bearer credential because no deployment requirement currently justifies multiple

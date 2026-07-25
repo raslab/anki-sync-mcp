@@ -24,6 +24,7 @@ def phase3_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator
         note = collection.new_note(collection.models.current())
         note["Front"] = "guarded note"
         note["Back"] = "answer"
+        note.tags = ["guarded-tag"]
         collection.add_note(note, deck_id)
     finally:
         collection.close()
@@ -118,9 +119,15 @@ def test_guarded_note_deletion_requires_matching_preview_and_creates_backup(
         assert failed is False
         assert unchanged["id"] == note_id
 
+        failed, explicit_backup = call("anki_backup_create", {})
+        assert failed is False
+        assert Path(explicit_backup["path"]).is_file()
+
         failed, preview = call("anki_notes_delete_preview", {"note_ids": [note_id]})
         assert failed is False
-        assert preview["impact"] == {"notes": 1, "cards": 1}
+        assert preview["impact"]["notes"] == 1
+        assert preview["impact"]["cards"] == 1
+        assert len(preview["impact"]["state_fingerprint"]) == 64
         assert preview["expires_in_seconds"] == phase3_settings.confirmation_ttl_seconds
 
         failed, receipt = call(
@@ -160,13 +167,24 @@ def test_schema_tools_require_full_sync_maintenance_and_preview(
         _, call = _session(client)
         failed, preview = call(
             "anki_note_types_change_preview",
-            {"operation": "create"},
+            {
+                "operation": "create",
+                "name": "Guarded Type",
+                "fields": ["Front", "Back"],
+                "templates": [
+                    {
+                        "name": "Card 1",
+                        "question_format": "{{Front}}",
+                        "answer_format": "{{Back}}",
+                    }
+                ],
+            },
         )
         assert failed is False
         assert preview["impact"]["full_sync_required"] is True
         assert preview["impact"]["backup_required"] is True
 
-        arguments = {
+        arguments: dict[str, object] = {
             "name": "Guarded Type",
             "fields": ["Front", "Back"],
             "templates": [
@@ -179,9 +197,57 @@ def test_schema_tools_require_full_sync_maintenance_and_preview(
             "confirmation_token": preview["confirmation_token"],
             "idempotency_key": "guarded-schema-create",
         }
+        changed_arguments = {**arguments, "name": "Different Type"}
+        failed, error = call("anki_note_types_create", changed_arguments)
+        assert failed is True
+        assert error["code"] == "DESTRUCTIVE_CONFIRMATION_REQUIRED"
+
         failed, receipt = call("anki_note_types_create", arguments)
         assert failed is False
-        assert receipt["result"]["backup"]["created"] is True
+        assert Path(receipt["result"]["backup"]["path"]).is_file()
+
+
+def test_confirmation_rejects_stale_deck_impact(phase3_settings: Settings) -> None:
+    with TestClient(create_app(phase3_settings)) as client:
+        _, call = _session(client)
+        failed, deck = call("anki_decks_create", {"name": "Stale Preview"})
+        assert failed is False
+        deck_id = deck["result"]["id"]
+
+        failed, preview = call("anki_decks_delete_preview", {"deck_id": deck_id})
+        assert failed is False
+        assert preview["impact"]["cards"] == 0
+
+        failed, _ = call(
+            "anki_cards_create",
+            {"deck_id": deck_id, "front": "created later", "back": "answer"},
+        )
+        assert failed is False
+        failed, error = call(
+            "anki_decks_delete",
+            {
+                "deck_id": deck_id,
+                "confirmation_token": preview["confirmation_token"],
+            },
+        )
+        assert failed is True
+        assert error["code"] == "DESTRUCTIVE_CONFIRMATION_REQUIRED"
+
+
+@pytest.mark.anyio
+async def test_tag_delete_preview_honors_search_scan_bound(
+    phase3_settings: Settings,
+) -> None:
+    async with AnkiCollectionService(
+        phase3_settings.collection_path,
+        max_page_size=100,
+        max_search_scan=0,
+        sync_on_write=False,
+    ) as service:
+        with pytest.raises(ValueError, match="MCP_MAX_SEARCH_SCAN"):
+            await service.coordinated_read(
+                lambda adapter: adapter.preview_tag_delete("guarded-tag")
+            )
 
 
 def test_review_answer_tool_is_omitted_unless_explicitly_enabled(
