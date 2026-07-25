@@ -5,6 +5,7 @@ from collections.abc import Iterator
 
 import pytest
 from anki.collection import Collection
+from anki.errors import NetworkError, SyncError, SyncErrorKind
 from anki.sync import SyncAuth, SyncOutput
 from starlette.testclient import TestClient
 
@@ -66,6 +67,24 @@ def test_mcp_rejects_missing_or_invalid_bearer_token(client: TestClient) -> None
         assert invalid.status_code == 401
         assert missing.headers["www-authenticate"] == "Bearer"
         assert "wrong-token" not in invalid.text
+
+
+def test_bearer_token_comparison_runs_for_missing_and_malformed_headers(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[bytes, bytes]] = []
+
+    def compare(supplied: bytes, expected: bytes) -> bool:
+        calls.append((supplied, expected))
+        return False
+
+    monkeypatch.setattr("anki_mcp.auth.hmac.compare_digest", compare)
+    assert client.post("/mcp", json={}).status_code == 401
+    assert (
+        client.post("/mcp", headers={"Authorization": "Basic malformed"}, json={}).status_code
+        == 401
+    )
+    assert calls == [(b"", b"correct-token"), (b"malformed", b"correct-token")]
 
 
 def test_mcp_accepts_valid_bearer_token(client: TestClient) -> None:
@@ -168,6 +187,8 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     assert names == [
         "anki_sync_login",
         "anki_sync",
+        "anki_sync_full_download",
+        "anki_sync_full_upload",
         "anki_decks_list",
         "anki_decks_get",
         "anki_decks_create",
@@ -183,6 +204,15 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     paginated = [tool for tool in tools if "limit" in tool["inputSchema"]["properties"]]
     assert all(tool["inputSchema"]["properties"]["limit"]["minimum"] == 1 for tool in paginated)
     assert all(tool["inputSchema"]["properties"]["limit"]["maximum"] == 100 for tool in paginated)
+    by_name = {tool["name"]: tool for tool in tools}
+    assert by_name["anki_sync"]["inputSchema"]["properties"]["sync_media"]["type"] == "boolean"
+    for name in (
+        "anki_sync_full_download",
+        "anki_sync_full_upload",
+        "anki_decks_delete",
+        "anki_cards_delete",
+    ):
+        assert by_name[name]["inputSchema"]["properties"]["confirm"]["type"] == "boolean"
 
 
 def test_deck_and_card_crud_tools_work_through_json_rpc(client: TestClient) -> None:
@@ -228,6 +258,7 @@ def test_deck_and_card_crud_tools_work_through_json_rpc(client: TestClient) -> N
         return parsed
 
     deck = call("anki_decks_create", {"name": "CRUD"})
+    existing_deck = call("anki_decks_create", {"name": "CRUD"})
     renamed = call("anki_decks_update", {"deck_id": deck["id"], "name": "CRUD Updated"})
     card = call(
         "anki_cards_create",
@@ -240,8 +271,10 @@ def test_deck_and_card_crud_tools_work_through_json_rpc(client: TestClient) -> N
     card_deleted = call("anki_cards_delete", {"card_id": card["id"], "confirm": True})
     deck_deleted = call("anki_decks_delete", {"deck_id": deck["id"], "confirm": True})
 
-    assert renamed["name"] == "CRUD Updated"
-    assert changed["fields"] == {"Front": "new question", "Back": "new answer"}
+    assert renamed == {"id": deck["id"], "updated": True}
+    assert deck["created"] is True
+    assert existing_deck == {"id": deck["id"], "created": False}
+    assert changed["updated"] is True
     assert card_deleted["deleted"] is True
     assert deck_deleted["deleted"] is True
 
@@ -250,6 +283,7 @@ def test_sync_tools_use_server_configuration_without_exposing_credentials(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     login_calls: list[tuple[str, str, str | None]] = []
+    full_sync_calls: list[tuple[int | None, bool]] = []
 
     def login(_: Collection, username: str, password: str, endpoint: str | None) -> SyncAuth:
         login_calls.append((username, password, endpoint))
@@ -258,10 +292,18 @@ def test_sync_tools_use_server_configuration_without_exposing_credentials(
     def sync(_: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
         assert auth.hkey == "secret-host-key"
         assert sync_media is False
-        return SyncOutput(required=0, server_message="done", host_number=2)
+        return SyncOutput(
+            required=3, server_message="full download required", host_number=2, server_media_usn=7
+        )
+
+    def full_sync(_: Collection, *, auth: SyncAuth, server_usn: int | None, upload: bool) -> None:
+        assert auth.hkey == "secret-host-key"
+        full_sync_calls.append((server_usn, upload))
 
     monkeypatch.setattr(Collection, "sync_login", login)
     monkeypatch.setattr(Collection, "sync_collection", sync)
+    monkeypatch.setattr(Collection, "full_upload_or_download", full_sync)
+    monkeypatch.setattr(Collection, "create_backup", lambda *args, **kwargs: True)
     headers = {
         "Authorization": "Bearer correct-token",
         "Accept": "application/json, text/event-stream",
@@ -299,12 +341,313 @@ def test_sync_tools_use_server_configuration_without_exposing_credentials(
 
     logged_in = call(2, "anki_sync_login", {})
     synced = call(3, "anki_sync", {"sync_media": False})
+    downloaded = call(4, "anki_sync_full_download", {"confirm": True})
 
     assert login_calls == [("sync-user", "sync-password", "https://sync.example.test/")]
-    assert logged_in == {"authenticated": True, "endpoint": "https://sync.example.test/"}
+    assert logged_in == {"authenticated": True, "endpoint_kind": "custom"}
     assert "sync-password" not in repr(logged_in)
     assert "secret-host-key" not in repr(logged_in)
-    assert synced["required"] == "NO_CHANGES"
+    assert synced["required"] == "FULL_DOWNLOAD"
+    assert downloaded == {"completed": True, "direction": "download", "backup_created": True}
+    assert full_sync_calls == [(None, False)]
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (NetworkError("network secret", None, None, None), "NETWORK_ERROR"),
+        (
+            SyncError("authentication secret", None, None, None, SyncErrorKind.AUTH),
+            "AUTHENTICATION_FAILED",
+        ),
+    ],
+)
+def test_sync_failures_have_safe_machine_readable_codes(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    expected_code: str,
+) -> None:
+    def fail_login(*args: object, **kwargs: object) -> SyncAuth:
+        raise failure
+
+    monkeypatch.setattr(Collection, "sync_login", fail_login)
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    initialized = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1"},
+            },
+        },
+    )
+    headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+    response = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "anki_sync_login", "arguments": {}},
+        },
+    )
+    result = response.json()["result"]
+    text = result["content"][0]["text"]
+    payload = json.loads(text[text.index("{") :])
+    assert result["isError"] is True
+    assert payload["code"] == expected_code
+    assert "secret" not in payload["message"]
+
+
+def test_sync_login_rejects_an_unconfigured_username_before_contacting_remote(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    custom = settings.model_copy(update={"sync_username": ""})
+
+    def unexpected_login(*args: object, **kwargs: object) -> SyncAuth:
+        pytest.fail("sync backend must not be called without a configured username")
+
+    monkeypatch.setattr(Collection, "sync_login", unexpected_login)
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(create_app(custom)) as custom_client:
+        initialized = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                },
+            },
+        )
+        headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+        response = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "anki_sync_login", "arguments": {}},
+            },
+        )
+
+    result = response.json()["result"]
+    text = result["content"][0]["text"]
+    payload = json.loads(text[text.index("{") :])
+    assert result["isError"] is True
+    assert payload["code"] == "INVALID_ARGUMENT"
+    assert payload["message"] == "ANKI_SYNC_USERNAME is not configured"
+    assert payload["correlation_id"]
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("anki_decks_delete", {"deck_id": 1, "confirm": 1}),
+        ("anki_decks_delete", {"deck_id": 1, "confirm": "true"}),
+        ("anki_cards_delete", {"card_id": 1, "confirm": 1}),
+        ("anki_sync", {"sync_media": 1}),
+        ("anki_sync_full_download", {"confirm": 1}),
+        ("anki_sync_full_upload", {"confirm": "true"}),
+    ],
+)
+def test_boolean_tool_inputs_are_strict(
+    client: TestClient, tool: str, arguments: dict[str, object]
+) -> None:
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    initialized = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1"},
+            },
+        },
+    )
+    headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+    response = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments},
+        },
+    )
+    result = response.json()["result"]
+    assert result["isError"] is True
+    assert "validation error" in result["content"][0]["text"].lower()
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("anki_decks_get", {"deck_id": 0}),
+        ("anki_cards_get", {"card_id": -1}),
+        ("anki_decks_create", {"name": "x" * 513}),
+        ("anki_cards_search", {"query": "x" * 4097}),
+        ("anki_cards_create", {"deck_id": 1, "front": "x" * 262_145, "back": "ok"}),
+    ],
+)
+def test_tool_ids_and_strings_are_runtime_bounded(
+    client: TestClient, tool: str, arguments: dict[str, object]
+) -> None:
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    initialized = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1"},
+            },
+        },
+    )
+    headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+    response = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments},
+        },
+    )
+    result = response.json()["result"]
+    assert result["isError"] is True
+    assert "validation error" in result["content"][0]["text"].lower()
+
+
+def test_mcp_request_body_budget_is_enforced(settings: Settings) -> None:
+    custom = settings.model_copy(update={"max_request_bytes": 1024})
+    with TestClient(create_app(custom)) as custom_client:
+        response = custom_client.post(
+            "/mcp",
+            headers={
+                "Authorization": "Bearer correct-token",
+                "Content-Type": "application/json",
+            },
+            content=b"x" * 1025,
+        )
+    assert response.status_code == 413
+    assert response.json() == {"error": "request_too_large"}
+
+
+def test_aggregate_tool_response_budget_is_enforced(settings: Settings) -> None:
+    custom = settings.model_copy(update={"max_response_bytes": 128})
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(create_app(custom)) as custom_client:
+        initialized = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                },
+            },
+        )
+        headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+        response = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "anki_decks_list", "arguments": {"limit": 100}},
+            },
+        )
+    result = response.json()["result"]
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    payload = json.loads(text[text.index("{") :])
+    assert payload["code"] == "RESPONSE_TOO_LARGE"
+
+
+def test_mutation_returns_concise_receipt_before_response_budget_check(settings: Settings) -> None:
+    custom = settings.model_copy(update={"max_response_bytes": 128})
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(create_app(custom)) as custom_client:
+        initialized = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                },
+            },
+        )
+        headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+        response = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "anki_decks_create", "arguments": {"name": "Receipt"}},
+            },
+        )
+    result = response.json()["result"]
+    assert result.get("isError") is not True
+    receipt = json.loads(result["content"][0]["text"])
+    assert receipt["created"] is True
+    collection = Collection(str(settings.collection_path))
+    try:
+        assert collection.decks.id_for_name("Receipt") == receipt["id"]
+    finally:
+        collection.close()
 
 
 def test_configured_page_max_is_the_tool_default(settings: Settings) -> None:

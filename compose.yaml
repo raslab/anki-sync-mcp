@@ -10,21 +10,28 @@ services:
       MCP_AUTH_TOKEN_FILE: "/run/secrets/anki_mcp_token"
       ANKI_COLLECTION_PATH: "/data/collection.anki2"
       ANKI_SYNC_USERNAME: "${ANKI_SYNC_USERNAME:-}"
-      ANKI_SYNC_PASSWORD: "${ANKI_SYNC_PASSWORD:-}"
+      ANKI_SYNC_PASSWORD_FILE: "/run/secrets/anki_sync_password"
       ANKI_SYNC_HOST: "${ANKI_SYNC_HOST:-}"
       MCP_MAX_PAGE_SIZE: "100"
+      MCP_MAX_CARD_FIELDS: "100"
+      MCP_MAX_RESPONSE_BYTES: "1048576"
+      MCP_MAX_REQUEST_BYTES: "1048576"
     secrets:
       - anki_mcp_token
+      - anki_sync_password
     volumes:
       - anki_data:/data
     networks:
       - assistant
+      - egress
     expose:
       - "8000"
 
 secrets:
   anki_mcp_token:
     file: ./secrets/anki_mcp_token
+  anki_sync_password:
+    file: ./secrets/anki_sync_password
 
 volumes:
   anki_data:
@@ -32,3 +39,4 @@ volumes:
 networks:
   assistant:
     internal: true
+  egress: {}
