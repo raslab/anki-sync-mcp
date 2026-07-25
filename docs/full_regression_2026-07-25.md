@@ -2,7 +2,7 @@
 
 ## Executive summary
 
-Recommendation: **conditionally ready for a limited/canary production rollout of the 37 tools exposed by the tested deployment; not yet an unconditional broad-production approval.**
+Recommendation: **conditionally ready for a limited/canary production rollout of the 37 tools exposed by the tested deployment, after deployment provenance and basic operational smoke checks are established; not yet an unconditional broad-production approval.**
 
 The connected `anki_mcp_dev` server was tested live against its authenticated AnkiWeb-backed collection. Every exposed Anki tool completed a positive path, mutations were read back, shared deck configuration was restored, and the final collection/media sync completed with no pending or outcome-unknown work. The repository regression suite, Ruff, and Pyright also passed.
 
@@ -14,7 +14,8 @@ The latest source also contains guarded destructive/schema/review administration
 
 | Item | Result |
 | --- | --- |
-| Source commit | `e48026ecf2bf1a185e4ab5dee4c3e96ac13e7b10` (`master` at test start) |
+| Repository source baseline | `e48026ecf2bf1a185e4ab5dee4c3e96ac13e7b10` (`master` at test start) |
+| Connected server provenance | Not independently attested: no build/version endpoint or deployed image digest was exposed |
 | Anki version | `26.5` |
 | Connected Anki tools | 37 |
 | Live happy-path coverage | 37/37 |
@@ -27,10 +28,27 @@ The latest source also contains guarded destructive/schema/review administration
 | Static checks | `uv run ruff check .` passed; `uv run pyright` passed with 0 errors/warnings |
 | Final collection sync | `2026-07-25T19:38:08.541055+00:00` |
 | Final media sync | `2026-07-25T19:38:08.544210+00:00` |
+| Durable operation baseline | 21 committed before this run |
+| Fresh run delta | +21 committed |
 | Final operation state | 42 committed, 0 pending, 0 outcome-unknown |
 | Final readiness | `ready=true`, authenticated, no pending full sync, no pending mutations |
 
 Testing used the actual connected MCP functions rather than direct database access. Positive calls covered defaults and explicit options; negative calls covered representative schema, domain, not-found, duplicate, atomicity, path-safety, and idempotency failures. This is broad regression/exploratory coverage, not a proof of every combinatorial input value.
+
+The checked-out repository parent of this report is the stated source baseline, but the connected process did not expose a build SHA, image digest, or equivalent attestation. The live tool inventory and behavior are consistent with the default 37-tool configuration, but this report cannot cryptographically prove that the deployed binary was built from that commit. Before production rollout, record the immutable image digest and effective configuration/scopes and verify them against the tested artifact.
+
+## Operational coverage not demonstrated live
+
+The following production concerns were not exercised end to end against the connected deployment:
+
+- process/container restart and crash recovery with pending or outcome-unknown receipts;
+- restoration from the generated `.colpkg` backup;
+- HTTP bearer-authentication rejection, Host/Origin allowlists, request-size limits, and external readiness routing;
+- sustained load, rate limits, and multi-client concurrency beyond a small burst of independently submitted mutations;
+- production image build, Compose startup, persistent-volume ownership/permissions, and deployment rollback;
+- monitoring/alert delivery for readiness, pending mutations, sync failures, disk exhaustion, or backup failure.
+
+Repository tests cover several related code paths, but they are not a substitute for deployment acceptance. These items are rollout gates or canary checks, not evidence of a defect in the live tool behavior tested here.
 
 ## Safety and restoration
 
@@ -50,7 +68,7 @@ Destructive tools were not exposed, so namespaced test fixtures could not be del
 | `anki_backup_create` | Explicit backup with returned durable path | Failure behavior covered by automated tests | PASS |
 | `anki_operations_list` | Defaults and explicit offset/limit; later page; total/`has_more`; ordering | Rejected mutations verified absent | PASS |
 | `anki_operations_get` | Existing committed receipt | Missing/rejected idempotency key returned `NOT_FOUND` | PASS |
-| `anki_metrics` | Per-operation counts, sync timestamps, pending/unknown totals | Rejected calls did not increment durable writes | PASS |
+| `anki_metrics` | Per-operation counts, sync timestamps, pending/unknown totals; baseline 21 and final 42 | Rejected calls did not increment durable writes; fresh run delta was exactly +21 | PASS |
 
 ### Decks
 
@@ -119,7 +137,7 @@ Destructive tools were not exposed, so namespaced test fixtures could not be del
 | X-06 | Generated-schema failure | Stable safe envelope | Flag 8 returned `INVALID_ARGUMENT`, generic safe message, correlation ID; no Pydantic URL/input leak | PASS |
 | X-07 | Runtime/domain validation | Stable safe envelope | Pagination, media path, and base64 errors returned `INVALID_ARGUMENT` with correlation IDs | PASS |
 | X-08 | Not-found handling | Safe `NOT_FOUND` | Deck/note/card/operation cases behaved as expected | PASS |
-| X-09 | Durable observability | Successful writes tracked; failures absent | 42/42 committed, 0 pending/unknown; rejected batch operation absent | PASS |
+| X-09 | Durable observability | Successful writes tracked; failures absent | Baseline 21, run delta +21, final 42/42 committed, 0 pending/unknown; rejected batch operation absent | PASS |
 | X-10 | Shared configuration restoration | Exact original values restored | `20/200/60/0.90` verified after restore | PASS |
 | X-11 | Card state restoration | Unsuspended and unflagged | Queue 0 and flag 0 verified; due remains intentionally repositioned | PASS |
 | X-12 | Final sync/readiness | Fully synced and ready | `NO_CHANGES`; media completed; no pending mutation/full sync | PASS |
@@ -183,6 +201,6 @@ The main and first batch cards remain repositioned at due positions 200 and 203.
 
 ## Production decision
 
-For the exact tested 37-tool configuration, the server showed strong reliability: every tool's happy path worked, durable mutation/idempotency behavior held, invalid requests did not produce partial writes or durable receipts, media round trips were exact, shared state was restored, and synchronization ended cleanly. A canary production rollout is reasonable with backups, metrics/readiness monitoring, and explicit awareness of the Hermes client circuit-breaker defect.
+For the observed 37-tool configuration, the server showed strong functional reliability: every tool's happy path worked, durable mutation/idempotency behavior held, invalid requests did not produce partial writes or durable receipts, media round trips were exact, shared state was restored, and synchronization ended cleanly. A canary production rollout is reasonable only after pinning and recording the tested image digest/configuration and completing restart, restore, HTTP security/readiness, container startup, and basic load smoke checks. Operate the canary with backups, metrics/readiness monitoring, and explicit awareness of the Hermes client circuit-breaker defect.
 
 Do not yet claim equivalent live reliability for feature-gated guarded administration tools. If those tools are part of the intended production configuration, complete their staging/live acceptance test before enabling them for production traffic.
