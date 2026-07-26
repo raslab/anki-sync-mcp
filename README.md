@@ -61,6 +61,70 @@ Do not run two sidecars, Anki Desktop, or any other process against the same col
 Keep destructive, schema, and full-sync feature flags disabled except during deliberate
 maintenance.
 
+## Configuration
+
+Configuration is read from environment variables when the service starts. `compose.yaml`
+supplies safe defaults and mounts the authentication token and initial sync password as Docker
+secrets. Variables written as `${NAME:-default}` can be overridden through the shell or a
+Compose `.env` file. To change a fixed value, or use one of the settings not present in the
+Compose file, add it under `services.anki-mcp.environment`.
+
+### Server and access
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MCP_HOST` | `0.0.0.0` | Address on which the HTTP server listens. |
+| `MCP_PORT` | `8000` | HTTP listen port (`1`-`65535`). Keep this consistent with `expose`, any `ports` mapping, and the client URL. |
+| `MCP_PATH` | `/mcp` | MCP endpoint path. It must be an absolute, static, non-root path and must not overlap `/health`. |
+| `MCP_AUTH_TOKEN` | required alternative | Bearer token supplied directly. Use exactly one of this setting and `MCP_AUTH_TOKEN_FILE`; the Compose setup uses the file variant. |
+| `MCP_AUTH_TOKEN_FILE` | required alternative | Path to a file containing the bearer token. One trailing newline is ignored. Compose mounts `./secrets/anki_mcp_token` at `/run/secrets/anki_mcp_token`. |
+| `MCP_SCOPES` | `read,write,admin` | Comma-separated tool groups to register. Allowed values are `read`, `write`, `admin`, and `destructive`. Destructive tools require both the `destructive` scope and their feature flag. |
+| `MCP_ALLOWED_HOSTS` | `testserver,localhost,localhost:*,127.0.0.1,127.0.0.1:*,anki-mcp,anki-mcp:*` | Comma-separated HTTP `Host` patterns accepted by MCP DNS-rebinding protection. Add the service name or hostname used by remote clients. |
+| `MCP_ALLOWED_ORIGINS` | `http://localhost:*,http://127.0.0.1:*` | Comma-separated browser origins accepted by MCP transport security. Add explicit trusted origins when using a browser-based client. |
+| `LOG_LEVEL` | `INFO` | Uvicorn log level, such as `debug`, `info`, `warning`, or `error`. |
+
+The `/health/live` and `/health/ready` endpoints are not bearer-authenticated. The supplied
+Compose network keeps them private unless you publish the container port.
+
+### Collection and synchronization
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ANKI_COLLECTION_PATH` | `/data/collection.anki2` | Local Anki collection file. Compose persists its parent directory in the `anki_data` volume; do not point multiple processes at the same file. |
+| `ANKI_SYNC_USERNAME` | empty | AnkiWeb username or self-hosted sync username. Required for `anki_sync_login` and for bootstrap when no persisted authentication exists. |
+| `ANKI_SYNC_PASSWORD` | optional alternative | Sync password supplied directly. It is optional after authentication has been persisted; do not set it together with `ANKI_SYNC_PASSWORD_FILE`. |
+| `ANKI_SYNC_PASSWORD_FILE` | optional alternative | Path to the sync-password file. Compose mounts `./secrets/anki_sync_password` at `/run/secrets/anki_sync_password`. Remove the setting and secret after login if automatic reauthentication is not needed. |
+| `ANKI_SYNC_HOST` | empty (AnkiWeb) | Custom sync-server HTTP(S) base URL. Non-loopback servers require HTTPS; credentials, query strings, and fragments are rejected. |
+| `ANKI_SYNC_ON_READ` | `false` | Synchronize before coordinated reads. Individual read tools can still request a sync with `sync_before=true`. |
+| `ANKI_SYNC_ON_WRITE` | `true` | Synchronize before and after coordinated mutations. Disabling this permits local changes to remain unsynchronized. |
+| `ANKI_SYNC_TIMEOUT_SECONDS` | `300` | Maximum wait for media synchronization (`> 0`, up to `3600` seconds). |
+| `ANKI_BOOTSTRAP_MODE` | `disabled` | Startup behavior: `disabled`, or `download_if_empty` to authenticate and perform a download-only initialization when the local collection is empty. Startup fails rather than uploading if the server requests a full upload. |
+
+The persisted `anki_data` volume also contains synchronization authentication state, mutation
+receipts, and backups. Preserve the volume across container recreation.
+
+### Safety and resource limits
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ANKI_ALLOW_DESTRUCTIVE` | `false` | Registers delete tools when `MCP_SCOPES` also includes `destructive`. Delete operations require a preview token and create a backup. |
+| `ANKI_ALLOW_FULL_SYNC` | `false` | Registers explicit full-download and full-upload recovery tools. It must also be enabled for schema-changing tools. |
+| `ANKI_ALLOW_SCHEMA_CHANGES` | `false` | Registers note-type and template mutation tools when `ANKI_ALLOW_FULL_SYNC` is also enabled. Note-type deletion additionally requires destructive access. |
+| `ANKI_ALLOW_REVIEW_ANSWERS` | `false` | Registers the administrative card-answering tool, which changes scheduling state. |
+| `ANKI_CONFIRMATION_TTL_SECONDS` | `300` | Lifetime of destructive-operation preview tokens (`30`-`3600` seconds). Tokens are single-use. |
+| `ANKI_MAX_BATCH_SIZE` | `50` | Maximum notes accepted by one atomic batch-create operation (`1`-`500`). |
+| `MCP_MAX_PAGE_SIZE` | `100` | Maximum `limit` accepted by paginated tools (`1`-`1000`). |
+| `MCP_MAX_SEARCH_SCAN` | `10000` | Maximum collection items that bounded list/search and tag operations may scan (`1`-`1000000`). |
+| `MCP_MAX_RENDERED_FIELD_BYTES` | `262144` | UTF-8 byte limit for each rendered text field in responses (`1`-`4194304`); oversized values are truncated and marked. |
+| `MCP_MAX_CARD_FIELDS` | `100` | Maximum fields or templates returned for a note or note type (`1`-`1000`); omitted counts are reported. |
+| `ANKI_MAX_MEDIA_BYTES` | `1048576` | Maximum decoded size of a media file read, written, or renamed (`1`-`16777216` bytes). |
+| `MCP_MAX_RESPONSE_BYTES` | `1048576` | Maximum serialized tool-result size (`1024`-`16777216` bytes). It must be at least `MCP_MAX_RENDERED_FIELD_BYTES + 4096`. |
+| `MCP_MAX_REQUEST_BYTES` | `1048576` | Maximum MCP request-body size (`1024`-`16777216` bytes); larger requests receive HTTP 413. |
+
+Boolean values accept the forms supported by Pydantic settings, including `true`/`false`,
+`1`/`0`, and `yes`/`no`. Invalid or unknown configuration causes startup to fail instead of
+silently falling back to a default.
+
 ## Development
 
 Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).

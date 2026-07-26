@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,18 @@ def env(tmp_path: Path, **values: str) -> dict[str, str]:
     }
     base.update(values)
     return base
+
+
+def test_readme_documents_every_environment_setting() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    documented = set(re.findall(r"\| `([A-Z][A-Z0-9_]*)` \|", readme))
+    configured = {
+        field.alias
+        for field in Settings.model_fields.values()
+        if isinstance(field.alias, str) and field.alias[:1].isupper()
+    }
+
+    assert documented == configured
 
 
 def test_direct_token_and_defaults(tmp_path: Path) -> None:
