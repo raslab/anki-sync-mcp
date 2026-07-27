@@ -8,6 +8,8 @@ import pytest
 from anki import scheduler_pb2
 from anki._backend_generated import RustBackendGenerated
 from anki.collection import Collection
+from anki.config_pb2 import ConfigKey
+from anki.decks import DeckManager
 
 from anki_mcp.collection import AnkiCollectionService
 
@@ -51,6 +53,39 @@ def fsrs_collection(tmp_path: Path) -> Iterator[tuple[str, int]]:
     finally:
         collection.close()
     yield path, deck_id
+
+
+def _add_review_state_card(
+    path: str, deck_id: int, front: str, *, with_revlog: bool = False
+) -> int:
+    collection = Collection(path)
+    try:
+        note = collection.new_note(collection.models.current())
+        note["Front"] = front
+        note["Back"] = "answer"
+        collection.add_note(note, deck_id)
+        card_id = int(collection.find_cards(f"nid:{int(note.id)}")[0])
+        card = collection.get_card(card_id)
+        card.type = 2
+        card.queue = 2
+        card.due = collection.sched.today + 10
+        card.ivl = 10
+        card.reps = 1
+        collection.update_card(card)
+        if with_revlog:
+            db = collection.db
+            assert db is not None
+            db.execute(
+                """
+                insert into revlog(id, cid, usn, ease, ivl, lastIvl, factor, time, type)
+                values (?, ?, -1, 3, 10, 1, 2500, 1000, 1)
+                """,
+                int(db.scalar("select coalesce(max(id), 0) + 1 from revlog")),
+                card_id,
+            )
+        return card_id
+    finally:
+        collection.close()
 
 
 @pytest.mark.anyio
@@ -245,6 +280,396 @@ async def test_fsrs_reschedule_fingerprint_tracks_card_eligibility(
     assert before["cards"] == 1
     assert after["cards"] == 0
     assert after["state_fingerprint"] != before["state_fingerprint"]
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_fingerprint_tracks_ordered_review_history(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    path, _ = fsrs_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        before = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+        def swap_review_payloads(adapter):  # type: ignore[no-untyped-def]
+            db = adapter.collection.db
+            assert db is not None
+            rows = db.all(
+                "select id, ease, ivl, lastIvl, factor, time, type "
+                "from revlog order by id limit 2"
+            )
+            assert len(rows) == 2
+            first, second = rows
+            db.execute(
+                "update revlog set ease=?, ivl=?, lastIvl=?, factor=?, time=?, type=? "
+                "where id=?",
+                *second[1:],
+                first[0],
+            )
+            db.execute(
+                "update revlog set ease=?, ivl=?, lastIvl=?, factor=?, time=?, type=? "
+                "where id=?",
+                *first[1:],
+                second[0],
+            )
+
+        await service.executor.run(swap_review_payloads)
+        after = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+    assert after["state_fingerprint"] != before["state_fingerprint"]
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_fingerprint_ignores_history_before_configured_date(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    path, _ = fsrs_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        await service.update_deck_preset(
+            1, None, {"ignore_revlogs_before_date": "2026-06-01"}
+        )
+        before = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+        def change_ignored_review(adapter):  # type: ignore[no-untyped-def]
+            db = adapter.collection.db
+            assert db is not None
+            db.execute(
+                "update revlog set time = time + 1 "
+                "where id = (select min(id) from revlog)"
+            )
+
+        await service.executor.run(change_ignored_review)
+        after = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+    assert after["state_fingerprint"] == before["state_fingerprint"]
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_fingerprint_tracks_scheduler_day(
+    fsrs_collection: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _ = fsrs_collection
+    day = [100]
+
+    def sched_timing_today(self):  # type: ignore[no-untyped-def]
+        return scheduler_pb2.SchedTimingTodayResponse(
+            days_elapsed=day[0], next_day_at=1_000_000 + day[0] * 86_400
+        )
+
+    monkeypatch.setattr(RustBackendGenerated, "sched_timing_today", sched_timing_today)
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        before = await service.preview_fsrs_reschedule(1, 0.91, None)
+        day[0] += 1
+        after = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+    assert after["state_fingerprint"] != before["state_fingerprint"]
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_fingerprint_tracks_reset_markers(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    path, _ = fsrs_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        before = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+        def insert_reset_marker(adapter):  # type: ignore[no-untyped-def]
+            db = adapter.collection.db
+            assert db is not None
+            card_id = int(db.scalar("select cid from revlog limit 1"))
+            timestamps = [int(value) for value in db.list("select id from revlog order by id")]
+            reset_at = timestamps[-2] + 1
+            db.execute(
+                """
+                insert into revlog(id, cid, usn, ease, ivl, lastIvl, factor, time, type)
+                values (?, ?, -1, 0, 0, 0, 0, 0, 4)
+                """,
+                reset_at,
+                card_id,
+            )
+
+        await service.executor.run(insert_reset_marker)
+        after = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+    assert after["state_fingerprint"] != before["state_fingerprint"]
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_fingerprint_tracks_load_balancer_candidate_state(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    path, deck_id = fsrs_collection
+    excluded_card_id = _add_review_state_card(path, deck_id, "No FSRS history")
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        await service.executor.run(
+            lambda adapter: adapter.collection.set_config_bool(
+                ConfigKey.Bool.LOAD_BALANCER_ENABLED, True
+            )
+        )
+        before = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+        def change_excluded_due(adapter):  # type: ignore[no-untyped-def]
+            card = adapter.collection.get_card(excluded_card_id)
+            card.due += 1
+            adapter.collection.update_card(card)
+
+        await service.executor.run(change_excluded_due)
+        after = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+    assert before["cards"] == after["cards"] == 1
+    assert after["state_fingerprint"] != before["state_fingerprint"]
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_fingerprint_tracks_load_balancer_reviewed_today(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    path, _ = fsrs_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        await service.executor.run(
+            lambda adapter: adapter.collection.set_config_bool(
+                ConfigKey.Bool.LOAD_BALANCER_ENABLED, True
+            )
+        )
+        new_card_id = (await service.search_cards("deck:FSRS is:new", 0, 1))["items"][0]["id"]
+        before = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+        def add_review_today(adapter):  # type: ignore[no-untyped-def]
+            db = adapter.collection.db
+            assert db is not None
+            db.execute(
+                """
+                insert into revlog(id, cid, usn, ease, ivl, lastIvl, factor, time, type)
+                values (?, ?, -1, 3, 1, 0, 2500, 1000, 1)
+                """,
+                int(time.time() * 1000),
+                new_card_id,
+            )
+
+        await service.executor.run(add_review_today)
+        after = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+    assert before["cards"] == after["cards"] == 1
+    assert after["state_fingerprint"] != before["state_fingerprint"]
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_deck_discovery_avoids_unbounded_legacy_load(
+    fsrs_collection: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _ = fsrs_collection
+
+    def reject_unbounded_load(self):  # type: ignore[no-untyped-def]
+        raise AssertionError("DeckManager.all() must not be used")
+
+    monkeypatch.setattr(DeckManager, "all", reject_unbounded_load)
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        preview = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+    assert preview["decks"] == 2
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_candidate_discovery_accepts_exact_limit_across_decks(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    path, deck_id = fsrs_collection
+    _add_review_state_card(path, deck_id, "Second eligible card", with_revlog=True)
+
+    async with AnkiCollectionService(
+        path, max_page_size=100, max_search_scan=2
+    ) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        preview = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+    assert preview["cards"] == 2
+    assert preview["decks"] == 2
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_candidate_discovery_rejects_one_over_limit_before_loading(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    path, deck_id = fsrs_collection
+    _add_review_state_card(path, deck_id, "Ineligible review-state card 1")
+    _add_review_state_card(path, deck_id, "Ineligible review-state card 2")
+
+    async with AnkiCollectionService(
+        path, max_page_size=100, max_search_scan=2
+    ) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        with pytest.raises(
+            ValueError,
+            match=r"preset 1 across 2 decks exceeds MCP_MAX_SEARCH_SCAN=2 candidate cards",
+        ):
+            await service.preview_fsrs_reschedule(1, 0.91, None)
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_rejects_preset_deck_scope_over_limit(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    path, _ = fsrs_collection
+
+    async with AnkiCollectionService(
+        path, max_page_size=100, max_search_scan=1
+    ) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        with pytest.raises(
+            ValueError,
+            match=r"preset 1 exceeds MCP_MAX_SEARCH_SCAN=1 decks",
+        ):
+            await service.preview_fsrs_reschedule(1, 0.91, None)
+
+
+@pytest.mark.anyio
+async def test_backup_before_rejects_native_false_with_old_backup(
+    fsrs_collection: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _ = fsrs_collection
+    backup_folder = Path(path).parent / "backups"
+    backup_folder.mkdir()
+    (backup_folder / "old.colpkg").write_bytes(b"old backup")
+    mutation_called = False
+
+    def create_backup(self, **kwargs):  # type: ignore[no-untyped-def]
+        return False
+
+    def mutation() -> dict[str, bool]:
+        nonlocal mutation_called
+        mutation_called = True
+        return {"mutated": True}
+
+    monkeypatch.setattr(Collection, "create_backup", create_backup)
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        with pytest.raises(RuntimeError, match="newly created"):
+            await service.executor.run(lambda adapter: adapter.backup_before(mutation))
+
+    assert mutation_called is False
+
+
+@pytest.mark.anyio
+async def test_backup_before_rejects_native_success_without_new_file(
+    fsrs_collection: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _ = fsrs_collection
+    backup_folder = Path(path).parent / "backups"
+    backup_folder.mkdir()
+    (backup_folder / "old.colpkg").write_bytes(b"old backup")
+    mutation_called = False
+
+    def create_backup(self, **kwargs):  # type: ignore[no-untyped-def]
+        return True
+
+    def mutation() -> dict[str, bool]:
+        nonlocal mutation_called
+        mutation_called = True
+        return {"mutated": True}
+
+    monkeypatch.setattr(Collection, "create_backup", create_backup)
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        with pytest.raises(RuntimeError, match="newly created"):
+            await service.executor.run(lambda adapter: adapter.backup_before(mutation))
+
+    assert mutation_called is False
+
+
+@pytest.mark.anyio
+async def test_backup_before_propagates_native_failure_without_mutating(
+    fsrs_collection: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _ = fsrs_collection
+    mutation_called = False
+
+    def create_backup(self, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("native backup failed")
+
+    def mutation() -> dict[str, bool]:
+        nonlocal mutation_called
+        mutation_called = True
+        return {"mutated": True}
+
+    monkeypatch.setattr(Collection, "create_backup", create_backup)
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        with pytest.raises(RuntimeError, match="native backup failed"):
+            await service.executor.run(lambda adapter: adapter.backup_before(mutation))
+
+    assert mutation_called is False
+
+
+@pytest.mark.anyio
+async def test_backup_before_returns_new_nonempty_backup_receipt(
+    fsrs_collection: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _ = fsrs_collection
+
+    def create_backup(
+        self, *, backup_folder: str, force: bool, wait_for_completion: bool
+    ) -> bool:  # type: ignore[no-untyped-def]
+        assert force is True
+        assert wait_for_completion is True
+        (Path(backup_folder) / "fresh.colpkg").write_bytes(b"fresh backup")
+        return True
+
+    monkeypatch.setattr(Collection, "create_backup", create_backup)
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        result = await service.executor.run(
+            lambda adapter: adapter.backup_before(lambda: {"mutated": True})
+        )
+
+    assert result["mutated"] is True
+    assert result["backup"]["created"] is True
+    assert Path(result["backup"]["path"]).name == "fresh.colpkg"
+
+
+@pytest.mark.anyio
+async def test_backup_failure_keeps_idempotent_mutation_retryable(
+    fsrs_collection: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _ = fsrs_collection
+    attempts = 0
+
+    def create_backup(
+        self, *, backup_folder: str, force: bool, wait_for_completion: bool
+    ) -> bool:  # type: ignore[no-untyped-def]
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("native backup failed")
+        (Path(backup_folder) / "retry.colpkg").write_bytes(b"retry backup")
+        return True
+
+    monkeypatch.setattr(Collection, "create_backup", create_backup)
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        with pytest.raises(RuntimeError, match="native backup failed"):
+            await service.coordinated_mutation(
+                "test_guarded",
+                "backup-retry",
+                {"value": 1},
+                lambda adapter: adapter.backup_before(lambda: {"mutated": True}),
+            )
+        receipt = await service.coordinated_mutation(
+            "test_guarded",
+            "backup-retry",
+            {"value": 1},
+            lambda adapter: adapter.backup_before(lambda: {"mutated": True}),
+        )
+
+    assert attempts == 2
+    assert receipt["state"] == "committed"
+    assert receipt["result"]["mutated"] is True
 
 
 @pytest.mark.anyio
