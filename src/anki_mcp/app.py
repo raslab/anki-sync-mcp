@@ -538,7 +538,12 @@ def create_app(settings: Settings) -> ASGIApp:
         except MediaSyncFailedError as exc:
             raise_tool_error("MEDIA_SYNC_FAILED", str(exc), exc)
         except BackupFailedError as exc:
-            raise_tool_error("BACKUP_FAILED", str(exc), exc, log_cause=True)
+            raise_tool_error(
+                "BACKUP_FAILED",
+                "required collection backup could not be created",
+                exc,
+                log_cause=True,
+            )
         except ResponseTooLargeError as exc:
             raise_tool_error("RESPONSE_TOO_LARGE", str(exc), exc)
         except NetworkError as exc:

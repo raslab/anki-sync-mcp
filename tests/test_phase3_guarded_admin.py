@@ -252,7 +252,7 @@ def test_schema_apply_reports_backup_gate_failure_and_logs_correlation(
 
         assert failed is True
         assert error["code"] == "BACKUP_FAILED"
-        assert "newly created pre-operation backup" in error["message"]
+        assert error["message"] == "required collection backup could not be created"
         assert error["correlation_id"] in caplog.text
         assert "BackupFailedError" in caplog.text
 
@@ -264,6 +264,31 @@ def test_schema_apply_reports_backup_gate_failure_and_logs_correlation(
         failed, after = call("anki_note_types_get", {"note_type_id": note_type_id})
         assert failed is False
         assert after["templates"] == before["templates"]
+
+
+def test_native_backup_failure_is_redacted_from_client(
+    phase3_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sensitive_detail = f"failed to write {phase3_settings.collection_path}"
+
+    def fail_backup(*args: object, **kwargs: object) -> bool:
+        raise RuntimeError(sensitive_detail)
+
+    monkeypatch.setattr(Collection, "create_backup", fail_backup)
+
+    with TestClient(create_app(phase3_settings)) as client:
+        _, call = _session(client)
+        with caplog.at_level("ERROR", logger="anki_mcp.app"):
+            failed, error = call("anki_backup_create", {})
+
+    assert failed is True
+    assert error["code"] == "BACKUP_FAILED"
+    assert error["message"] == "required collection backup could not be created"
+    assert sensitive_detail not in error["message"]
+    assert error["correlation_id"] in caplog.text
+    assert sensitive_detail in caplog.text
 
 
 def test_confirmation_rejects_stale_deck_impact(phase3_settings: Settings) -> None:
