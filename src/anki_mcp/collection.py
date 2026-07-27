@@ -6,6 +6,7 @@ import binascii
 import hashlib
 import json
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -108,6 +109,10 @@ class DuplicateNoteError(ValueError):
 
 class IdempotencyConflictError(ValueError):
     """Raised when an idempotency key is reused with different content."""
+
+
+class ResourceLimitError(ValueError):
+    """Raised when a bounded operation proves its configured work limit was exceeded."""
 
 
 class MediaSyncFailedError(TimeoutError):
@@ -886,7 +891,11 @@ class CollectionAdapter:
         except SearchError as exc:
             raise ValueError(f"invalid FSRS search: {exc}") from exc
         if len(selected_cards) > self.max_search_scan:
-            raise ValueError(f"FSRS {operation} exceeds MCP_MAX_SEARCH_SCAN")
+            raise ResourceLimitError(
+                f"FSRS {operation}: maximum={self.max_search_scan}, "
+                f"observed_at_least={len(selected_cards)}; narrow search or raise "
+                "MCP_MAX_SEARCH_SCAN"
+            )
         return selected
 
     @staticmethod
@@ -907,10 +916,10 @@ class CollectionAdapter:
                 return [float(value) for value in values]
         return [float(value) for value in defaults.fsrs_params_6]
 
-    def optimize_fsrs(
+    def preview_fsrs_optimization(
         self, config_id: int, search: str | None, health_check: bool
     ) -> dict[str, Any]:
-        state, entry = self._preset_entry(config_id)
+        _, entry = self._preset_entry(config_id)
         config = entry.config.config
         selected_search = self._bounded_fsrs_search(entry, search, "optimization")
         previous = [float(value) for value in config.fsrs_params_6]
@@ -929,19 +938,93 @@ class CollectionAdapter:
         parameters = [float(value) for value in response.params]
         if not parameters:
             raise ValueError("not enough review history to optimize FSRS parameters")
+        self._validate_fsrs_parameters(parameters)
+        if health_check and not bool(response.health_check_passed):
+            raise ValueError("FSRS optimizer health check failed; preset was not changed")
+        return {
+            "config_id": config_id,
+            "search": selected_search,
+            "training_items": int(response.fsrs_items),
+            "health_check_requested": health_check,
+            "health_check_passed": bool(response.health_check_passed),
+            "current_parameters": previous,
+            "candidate_parameters": parameters,
+            "affected_decks": int(entry.use_count),
+            "state_fingerprint": self._impact_fingerprint(
+                {
+                    "config_id": config_id,
+                    "search": selected_search,
+                    "training_items": int(response.fsrs_items),
+                    "current_parameters": previous,
+                    "candidate_parameters": parameters,
+                    "affected_decks": int(entry.use_count),
+                }
+            ),
+        }
+
+    def apply_fsrs_optimization(
+        self,
+        config_id: int,
+        search: str | None,
+        health_check: bool,
+        impact: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        selected_impact = impact or self.preview_fsrs_optimization(config_id, search, health_check)
+        state, entry = self._preset_entry(config_id)
+        config = entry.config.config
         del config.fsrs_params_6[:]
-        config.fsrs_params_6.extend(parameters)
+        config.fsrs_params_6.extend(selected_impact["candidate_parameters"])
         self._update_deck_config_state(1, state)
         return {
             "config_id": config_id,
             "optimized": True,
-            "search": selected_search,
-            "training_items": int(response.fsrs_items),
-            "health_check_passed": bool(response.health_check_passed),
-            "previous_parameters": previous,
-            "parameters": parameters,
+            "search": selected_impact["search"],
+            "training_items": selected_impact["training_items"],
+            "health_check_requested": selected_impact["health_check_requested"],
+            "health_check_passed": selected_impact["health_check_passed"],
+            "previous_parameters": selected_impact["current_parameters"],
+            "parameters": selected_impact["candidate_parameters"],
             "affected_decks": int(entry.use_count),
         }
+
+    def optimize_fsrs(
+        self, config_id: int, search: str | None, health_check: bool
+    ) -> dict[str, Any]:
+        """Internal compatibility wrapper; public MCP callers use preview/apply."""
+        return self.apply_fsrs_optimization(config_id, search, health_check)
+
+    @staticmethod
+    def _validate_fsrs_parameters(parameters: Sequence[float]) -> list[float]:
+        values = [float(value) for value in parameters]
+        if len(values) != 21:
+            raise ValueError("FSRS parameters must contain exactly 21 values")
+        for index, value in enumerate(values):
+            if not math.isfinite(value):
+                raise ValueError(f"FSRS parameter {index} must be finite")
+            if value < 0:
+                raise ValueError(
+                    f"invalid FSRS parameters: parameter {index} is below the Anki 26.5 bound"
+                )
+        return values
+
+    def _validate_native_fsrs_parameters(
+        self, config_id: int, parameters: Sequence[float], desired_retention: float
+    ) -> None:
+        request, _ = self._fsrs_simulation_request(
+            config_id,
+            deck_size=1,
+            days_to_simulate=1,
+            desired_retention=desired_retention,
+            search="nid:0",
+        )
+        del request.params[:]
+        request.params.extend(parameters)
+        try:
+            self.collection._backend.simulate_fsrs_review(  # pyright: ignore[reportPrivateUsage]
+                request
+            )
+        except InvalidInput as exc:
+            raise ValueError(f"invalid FSRS parameters: {exc}") from exc
 
     def _fsrs_simulation_request(
         self,
@@ -1000,7 +1083,7 @@ class CollectionAdapter:
             "mode": mode,
             "config_id": config_id,
             "search": selected_search,
-            "days": days_to_simulate,
+            "days_to_simulate": days_to_simulate,
             "deck_size": deck_size,
         }
         backend = self.collection._backend  # pyright: ignore[reportPrivateUsage]
@@ -1019,7 +1102,7 @@ class CollectionAdapter:
                 raise ValueError(f"invalid FSRS simulation input: {exc}") from exc
             result["retention"] = {
                 "cost_seconds": {str(key): float(value) for key, value in response.cost.items()},
-                "memorized": {
+                "memorized_cards": {
                     str(key): float(value) for key, value in response.memorized.items()
                 },
                 "review_count": {
@@ -1037,6 +1120,11 @@ class CollectionAdapter:
         daily_new = [int(value) for value in response.daily_new_count]
         daily_time = [float(value) for value in response.daily_time_cost]
         knowledge = [float(value) for value in response.accumulated_knowledge_acquisition]
+        lengths = {len(daily_reviews), len(daily_new), len(daily_time), len(knowledge)}
+        if lengths != {days_to_simulate}:
+            raise RuntimeError(
+                "Anki 26.5 FSRS simulator returned incompatible daily array lengths"
+            )
         result["summary"] = {
             "total_reviews": sum(daily_reviews),
             "total_new_cards": sum(daily_new),
@@ -1069,13 +1157,16 @@ class CollectionAdapter:
             current_retention if desired_retention is None else round(desired_retention, 6)
         )
         current_parameters = [float(value) for value in config.fsrs_params_6]
-        target_parameters = current_parameters if parameters is None else list(parameters)
+        target_parameters = (
+            current_parameters if parameters is None else self._validate_fsrs_parameters(parameters)
+        )
+        if parameters is not None:
+            self._validate_native_fsrs_parameters(config_id, target_parameters, target_retention)
         if target_retention == current_retention and target_parameters == current_parameters:
             raise ValueError("FSRS rescheduling must change desired retention or parameters")
         if not state.fsrs:
             raise ValueError("FSRS must be enabled before cards can be rescheduled")
-        if parameters is not None and len(parameters) != 21:
-            raise ValueError("FSRS parameters must contain exactly 21 values")
+
         db = self.collection.db
         assert db is not None
         bounded_deck_ids = [
@@ -1085,9 +1176,10 @@ class CollectionAdapter:
             )
         ]
         if len(bounded_deck_ids) > self.max_search_scan:
-            raise ValueError(
-                f"FSRS reschedule for preset {config_id} exceeds "
-                f"MCP_MAX_SEARCH_SCAN={self.max_search_scan} decks"
+            raise ResourceLimitError(
+                f"FSRS reschedule for preset {config_id}: maximum={self.max_search_scan}, "
+                f"observed_at_least={len(bounded_deck_ids)} decks; split preset scope or raise "
+                "MCP_MAX_SEARCH_SCAN"
             )
         decks = []
         for deck_id in bounded_deck_ids:
@@ -1097,11 +1189,18 @@ class CollectionAdapter:
                 and not bool(deck.get("dyn", 0))
                 and int(deck.get("conf", 1)) == config_id
             ):
+                limits = self.collection.decks.get_deck_configs_for_update(
+                    cast("DeckId", deck_id)
+                ).current_deck.limits
                 decks.append(
                     {
                         "id": deck_id,
                         "config_id": int(deck.get("conf", 1)),
-                        "desired_retention": deck.get("desiredRetention"),
+                        "desired_retention": (
+                            float(limits.desired_retention)
+                            if limits.HasField("desired_retention")
+                            else None
+                        ),
                     }
                 )
         deck_ids_json = json.dumps([deck["id"] for deck in decks])
@@ -1123,9 +1222,10 @@ class CollectionAdapter:
             self.max_search_scan + 1,
         )
         if len(candidate_rows) > self.max_search_scan:
-            raise ValueError(
-                f"FSRS reschedule for preset {config_id} across {len(decks)} decks exceeds "
-                f"MCP_MAX_SEARCH_SCAN={self.max_search_scan} candidate cards"
+            raise ResourceLimitError(
+                f"FSRS reschedule for preset {config_id} across {len(decks)} decks: "
+                f"maximum={self.max_search_scan}, observed_at_least={len(candidate_rows)} "
+                "candidate cards; split preset scope or raise MCP_MAX_SEARCH_SCAN"
             )
         candidate_ids = [int(row[0]) for row in candidate_rows]
         ignore_before = self._ignore_revlogs_before_ms(str(config.ignore_revlogs_before_date))
@@ -3112,6 +3212,20 @@ class AnkiCollectionService:
     ) -> dict[str, Any]:
         return await self.executor.run(
             lambda adapter: adapter.optimize_fsrs(config_id, search, health_check)
+        )
+
+    async def preview_fsrs_optimization(
+        self, config_id: int, search: str | None, health_check: bool
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.preview_fsrs_optimization(config_id, search, health_check)
+        )
+
+    async def apply_fsrs_optimization(
+        self, config_id: int, search: str | None, health_check: bool
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.apply_fsrs_optimization(config_id, search, health_check)
         )
 
     async def simulate_fsrs(
