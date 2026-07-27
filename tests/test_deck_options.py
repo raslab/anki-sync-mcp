@@ -56,17 +56,31 @@ async def test_deck_options_are_compact_by_default_and_expand_requested_sections
             },
         },
         "effective_limits": {
-            "new_cards_per_day": {"value": 20, "source": "preset"},
-            "reviews_per_day": {"value": 200, "source": "preset"},
-            "desired_retention": {"value": 0.9, "source": "preset"},
+            "new_cards_per_day": {
+                "value": 20,
+                "source": "preset",
+                "source_deck_id": child_id,
+                "inherited": False,
+            },
+            "reviews_per_day": {
+                "value": 200,
+                "source": "preset",
+                "source_deck_id": child_id,
+                "inherited": False,
+            },
+            "desired_retention": {
+                "value": 0.9,
+                "source": "preset",
+                "source_deck_id": child_id,
+                "inherited": False,
+            },
         },
         "apply_all_parent_limits": False,
     }
     assert "sections" not in compact
-    assert expanded["sections"]["parents"] == {
-        "deck_ids": [parent_id],
-        "preset_ids": [1],
-    }
+    assert expanded["sections"]["parents"]["deck_ids"] == [parent_id]
+    assert expanded["sections"]["parents"]["preset_ids"] == [1]
+    assert expanded["sections"]["parents"]["limits_applied"] is False
     assert expanded["sections"]["counts"] == {
         "new": 0,
         "review": 0,
@@ -177,6 +191,10 @@ async def test_scoped_limits_can_be_set_and_cleared_without_changing_the_preset(
     path, _, child_id = deck_options_collection
 
     async with AnkiCollectionService(path, max_page_size=100) as service:
+        scheduler_settings = await service.update_deck_scheduler_settings(
+            apply_all_parent_limits=True,
+            new_cards_ignore_review_limit=True,
+        )
         this_deck = await service.update_deck_limits(
             child_id,
             scope="this_deck",
@@ -186,8 +204,6 @@ async def test_scoped_limits_can_be_set_and_cleared_without_changing_the_preset(
                 "desired_retention": 0.92,
             },
             clear_fields=(),
-            apply_all_parent_limits=True,
-            new_cards_ignore_review_limit=True,
         )
         today = await service.update_deck_limits(
             child_id,
@@ -202,8 +218,24 @@ async def test_scoped_limits_can_be_set_and_cleared_without_changing_the_preset(
             values={},
             clear_fields=("new_cards_per_day", "reviews_per_day"),
         )
+        cleared_this_deck = await service.update_deck_limits(
+            child_id,
+            scope="this_deck",
+            values={},
+            clear_fields=(
+                "new_cards_per_day",
+                "reviews_per_day",
+                "desired_retention",
+            ),
+        )
         final = await service.get_deck_options(child_id)
 
+    assert scheduler_settings == {
+        "scope": "collection",
+        "updated": True,
+        "apply_all_parent_limits": True,
+        "new_cards_ignore_review_limit": True,
+    }
     assert this_deck == {"deck_id": child_id, "scope": "this_deck", "updated": True}
     assert today == {"deck_id": child_id, "scope": "today", "updated": True}
     assert configured["preset"]["new_cards_per_day"] == 20
@@ -216,22 +248,92 @@ async def test_scoped_limits_can_be_set_and_cleared_without_changing_the_preset(
         "today": {"new_cards_per_day": 7, "reviews_per_day": 70},
     }
     assert configured["effective_limits"] == {
-        "new_cards_per_day": {"value": 7, "source": "today"},
-        "reviews_per_day": {"value": 70, "source": "today"},
-        "desired_retention": {"value": 0.92, "source": "this_deck"},
+        "new_cards_per_day": {
+            "value": 7,
+            "source": "today",
+            "source_deck_id": child_id,
+            "inherited": False,
+        },
+        "reviews_per_day": {
+            "value": 70,
+            "source": "today",
+            "source_deck_id": child_id,
+            "inherited": False,
+        },
+        "desired_retention": {
+            "value": 0.92,
+            "source": "this_deck",
+            "source_deck_id": child_id,
+            "inherited": False,
+        },
     }
     assert configured["apply_all_parent_limits"] is True
     assert configured["sections"]["global_settings"]["new_cards_ignore_review_limit"] is True
     assert cleared == {"deck_id": child_id, "scope": "today", "updated": True}
+    assert cleared_this_deck == {
+        "deck_id": child_id,
+        "scope": "this_deck",
+        "updated": True,
+    }
     assert final["limits"]["today"] == {
         "new_cards_per_day": None,
         "reviews_per_day": None,
     }
     assert final["effective_limits"] == {
-        "new_cards_per_day": {"value": 30, "source": "this_deck"},
-        "reviews_per_day": {"value": 300, "source": "this_deck"},
-        "desired_retention": {"value": 0.92, "source": "this_deck"},
+        "new_cards_per_day": {
+            "value": 20,
+            "source": "preset",
+            "source_deck_id": child_id,
+            "inherited": False,
+        },
+        "reviews_per_day": {
+            "value": 200,
+            "source": "preset",
+            "source_deck_id": child_id,
+            "inherited": False,
+        },
+        "desired_retention": {
+            "value": 0.9,
+            "source": "preset",
+            "source_deck_id": child_id,
+            "inherited": False,
+        },
     }
+
+
+@pytest.mark.anyio
+async def test_effective_limits_include_enabled_parent_constraints(
+    deck_options_collection: tuple[str, int, int],
+) -> None:
+    path, parent_id, child_id = deck_options_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.update_deck_limits(
+            parent_id,
+            scope="this_deck",
+            values={"new_cards_per_day": 5, "reviews_per_day": 50},
+            clear_fields=(),
+        )
+        await service.update_deck_scheduler_settings(
+            apply_all_parent_limits=True,
+            new_cards_ignore_review_limit=None,
+        )
+        options = await service.get_deck_options(child_id, include_sections=("parents",))
+
+    assert options["effective_limits"]["new_cards_per_day"] == {
+        "value": 5,
+        "source": "this_deck",
+        "source_deck_id": parent_id,
+        "inherited": True,
+    }
+    assert options["effective_limits"]["reviews_per_day"] == {
+        "value": 50,
+        "source": "this_deck",
+        "source_deck_id": parent_id,
+        "inherited": True,
+    }
+    assert options["sections"]["parents"]["limits_applied"] is True
+    assert options["sections"]["parents"]["limit_chain"][0]["deck_id"] == parent_id
 
 
 @pytest.mark.anyio

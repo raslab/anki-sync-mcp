@@ -211,6 +211,7 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_decks_update",
         "anki_decks_update_config",
         "anki_deck_limits_update",
+        "anki_scheduler_settings_update",
         "anki_deck_presets_create",
         "anki_deck_presets_update",
         "anki_deck_presets_assign",
@@ -269,6 +270,36 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "parents",
         "global_settings",
     ]
+    limits_schema = by_name["anki_deck_limits_update"]["inputSchema"]
+    assert set(limits_schema["properties"]) == {
+        "deck_id",
+        "update",
+        "idempotency_key",
+    }
+    update_schema = limits_schema["properties"]["update"]
+    assert update_schema["discriminator"]["propertyName"] == "scope"
+    update_models = {
+        limits_schema["$defs"][option["$ref"].rsplit("/", 1)[-1]]["properties"]["scope"][
+            "const"
+        ]: limits_schema["$defs"][option["$ref"].rsplit("/", 1)[-1]]
+        for option in update_schema["oneOf"]
+    }
+    today_values_ref = update_models["today"]["properties"]["values"]["anyOf"][0]["$ref"]
+    today_values = limits_schema["$defs"][today_values_ref.rsplit("/", 1)[-1]]["properties"]
+    assert set(today_values) == {"new_cards_per_day", "reviews_per_day"}
+    this_values_ref = update_models["this_deck"]["properties"]["values"]["anyOf"][0]["$ref"]
+    this_values = limits_schema["$defs"][this_values_ref.rsplit("/", 1)[-1]]["properties"]
+    assert set(this_values) == {
+        "new_cards_per_day",
+        "reviews_per_day",
+        "desired_retention",
+    }
+    scheduler_settings = by_name["anki_scheduler_settings_update"]["inputSchema"]["properties"]
+    assert set(scheduler_settings) == {
+        "apply_all_parent_limits",
+        "new_cards_ignore_review_limit",
+        "idempotency_key",
+    }
     preset_get = by_name["anki_deck_presets_get"]["inputSchema"]["properties"]
     assert preset_get["include_sections"]["items"]["enum"] == [
         "learning",
@@ -525,10 +556,18 @@ def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -
         "anki_deck_limits_update",
         {
             "deck_id": deck_id,
-            "scope": "this_deck",
-            "values": {"new_cards_per_day": 5, "desired_retention": 0.91},
-            "apply_all_parent_limits": True,
+            "update": {
+                "scope": "this_deck",
+                "values": {"new_cards_per_day": 5, "desired_retention": 0.91},
+            },
             "idempotency_key": "phase2-deck-limits",
+        },
+    )
+    scheduler_settings = call(
+        "anki_scheduler_settings_update",
+        {
+            "apply_all_parent_limits": True,
+            "idempotency_key": "phase2-scheduler-settings",
         },
     )
     preset_patch = call(
@@ -654,6 +693,7 @@ def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -
         "easy_days",
     }
     assert scoped_limits["result"]["scope"] == "this_deck"
+    assert scheduler_settings["result"]["scope"] == "collection"
     assert preset_patch["result"]["changed_fields"] == 2
     assert updated_options["limits"]["this_deck"]["new_cards_per_day"] == 5
     assert updated_options["apply_all_parent_limits"] is True
@@ -668,9 +708,9 @@ def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -
     assert fields["result"]["field_count"] == 3
     assert templates["result"]["template_count"] == 1
     assert media["missing_total"] == 0
-    assert operations["total"] == 9
+    assert operations["total"] == 10
     assert operation["operation"] == "anki_decks_update_config"
-    assert metrics["mutations"]["total"] == 9
+    assert metrics["mutations"]["total"] == 10
 
 
 def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) -> None:

@@ -104,9 +104,12 @@ DeckPresetSection = Literal[
     "easy_days",
 ]
 DeckPresetSections = Annotated[tuple[DeckPresetSection, ...], Field(max_length=8)]
-DeckLimitScope = Literal["this_deck", "today"]
-DeckLimitField = Literal["new_cards_per_day", "reviews_per_day", "desired_retention"]
-DeckLimitFields = Annotated[tuple[DeckLimitField, ...], Field(max_length=3)]
+DailyDeckLimitField = Literal["new_cards_per_day", "reviews_per_day"]
+DailyDeckLimitFields = Annotated[tuple[DailyDeckLimitField, ...], Field(max_length=2)]
+ThisDeckLimitField = Literal[
+    "new_cards_per_day", "reviews_per_day", "desired_retention"
+]
+ThisDeckLimitFields = Annotated[tuple[ThisDeckLimitField, ...], Field(max_length=3)]
 NonNegativeFloat = Annotated[StrictFloat, Field(ge=0)]
 PositiveFloat = Annotated[StrictFloat, Field(gt=0)]
 Steps = Annotated[list[NonNegativeFloat], Field(max_length=100)]
@@ -185,12 +188,37 @@ class NoteTypeTemplateMappingInput(NoteTypeTemplateInput):
     source_ordinal: NonNegativeInt | None = None
 
 
-class DeckLimitPatch(BaseModel):
+class DeckTodayLimitPatch(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     new_cards_per_day: DailyLimit | None = None
     reviews_per_day: DailyLimit | None = None
+
+
+class DeckThisLimitPatch(DeckTodayLimitPatch):
     desired_retention: Retention | None = None
+
+
+class DeckTodayLimitUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    scope: Literal["today"]
+    values: DeckTodayLimitPatch | None = None
+    clear_fields: DailyDeckLimitFields = ()
+
+
+class DeckThisLimitUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    scope: Literal["this_deck"]
+    values: DeckThisLimitPatch | None = None
+    clear_fields: ThisDeckLimitFields = ()
+
+
+DeckLimitUpdate = Annotated[
+    DeckTodayLimitUpdate | DeckThisLimitUpdate,
+    Field(discriminator="scope"),
+]
 
 
 class DeckPresetPatch(BaseModel):
@@ -587,22 +615,20 @@ def create_app(settings: Settings) -> ASGIApp:
     @scoped_tool(name="anki_deck_limits_update", scope="admin")
     async def deck_limits_update(
         deck_id: StableId,
-        scope: DeckLimitScope,
-        values: DeckLimitPatch | None = None,
-        clear_fields: DeckLimitFields = (),
-        apply_all_parent_limits: StrictBool | None = None,
-        new_cards_ignore_review_limit: StrictBool | None = None,
+        update: DeckLimitUpdate,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Patch or clear this-deck/today limits and optionally update limit aggregation."""
-        value_dict = values.model_dump(exclude_none=True) if values is not None else {}
+        """Patch or clear validated this-deck or today-only limits for one deck."""
+        value_dict = (
+            update.values.model_dump(exclude_none=True) if update.values is not None else {}
+        )
         request = {
             "deck_id": deck_id,
-            "scope": scope,
-            "values": value_dict,
-            "clear_fields": list(clear_fields),
-            "apply_all_parent_limits": apply_all_parent_limits,
-            "new_cards_ignore_review_limit": new_cards_ignore_review_limit,
+            "update": {
+                "scope": update.scope,
+                "values": value_dict,
+                "clear_fields": list(update.clear_fields),
+            },
         }
         return await mutate(
             "anki_deck_limits_update",
@@ -610,9 +636,28 @@ def create_app(settings: Settings) -> ASGIApp:
             request,
             lambda adapter: adapter.update_deck_limits(
                 deck_id,
-                scope,
+                update.scope,
                 value_dict,
-                clear_fields,
+                update.clear_fields,
+            ),
+        )
+
+    @scoped_tool(name="anki_scheduler_settings_update", scope="admin")
+    async def scheduler_settings_update(
+        apply_all_parent_limits: StrictBool | None = None,
+        new_cards_ignore_review_limit: StrictBool | None = None,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Patch explicit collection-wide scheduler limit aggregation settings."""
+        request = {
+            "apply_all_parent_limits": apply_all_parent_limits,
+            "new_cards_ignore_review_limit": new_cards_ignore_review_limit,
+        }
+        return await mutate(
+            "anki_scheduler_settings_update",
+            idempotency_key,
+            request,
+            lambda adapter: adapter.update_deck_scheduler_settings(
                 apply_all_parent_limits,
                 new_cards_ignore_review_limit,
             ),

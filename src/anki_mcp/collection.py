@@ -751,8 +751,6 @@ class CollectionAdapter:
         scope: str,
         values: dict[str, Any],
         clear_fields: Sequence[str],
-        apply_all_parent_limits: bool | None = None,
-        new_cards_ignore_review_limit: bool | None = None,
     ) -> dict[str, Any]:
         if scope not in {"this_deck", "today"}:
             raise ValueError("scope must be this_deck or today")
@@ -767,12 +765,7 @@ class CollectionAdapter:
             raise ValueError(
                 f"limit fields cannot be set and cleared together: {', '.join(sorted(overlap))}"
             )
-        if (
-            not values
-            and not clear_fields
-            and apply_all_parent_limits is None
-            and new_cards_ignore_review_limit is None
-        ):
+        if not values and not clear_fields:
             raise ValueError("at least one deck limit update must be provided")
 
         state = self._deck_config_state(deck_id)
@@ -798,13 +791,37 @@ class CollectionAdapter:
             if scope == "today":
                 setattr(limits, f"{target}_active", False)
 
+        self._update_deck_config_state(deck_id, state)
+        return {"deck_id": deck_id, "scope": scope, "updated": True}
+
+    def update_deck_scheduler_settings(
+        self,
+        apply_all_parent_limits: bool | None,
+        new_cards_ignore_review_limit: bool | None,
+    ) -> dict[str, Any]:
+        if apply_all_parent_limits is None and new_cards_ignore_review_limit is None:
+            raise ValueError("at least one collection-wide scheduler setting must be provided")
+        state = self._deck_config_state(1)
         self._update_deck_config_state(
-            deck_id,
+            1,
             state,
             apply_all_parent_limits=apply_all_parent_limits,
             new_cards_ignore_review_limit=new_cards_ignore_review_limit,
         )
-        return {"deck_id": deck_id, "scope": scope, "updated": True}
+        return {
+            "scope": "collection",
+            "updated": True,
+            "apply_all_parent_limits": (
+                bool(state.apply_all_parent_limits)
+                if apply_all_parent_limits is None
+                else apply_all_parent_limits
+            ),
+            "new_cards_ignore_review_limit": (
+                bool(state.new_cards_ignore_review_limit)
+                if new_cards_ignore_review_limit is None
+                else new_cards_ignore_review_limit
+            ),
+        }
 
     def get_deck_options(
         self, deck_id: int, include_sections: Sequence[str] = ()
@@ -818,62 +835,99 @@ class CollectionAdapter:
         deck = self.collection.decks.get(cast("DeckId", deck_id), default=False)
         if deck is None:  # pragma: no cover - validated by _deck_config_state
             raise LookupError(f"deck {deck_id} not found")
-        entry = next(
-            item
-            for item in state.all_config
-            if int(item.config.id) == int(state.current_deck.config_id)
-        )
-        limits = state.current_deck.limits
+        def resolved_layers(source_deck_id: int, source_state: Any) -> tuple[Any, Any, Any]:
+            entry = next(
+                item
+                for item in source_state.all_config
+                if int(item.config.id) == int(source_state.current_deck.config_id)
+            )
+            limits = source_state.current_deck.limits
 
-        def optional(field: str) -> Any:
-            if not limits.HasField(field):
-                return None
-            value = getattr(limits, field)
-            return round(float(value), 6) if field == "desired_retention" else value
+            def optional(field: str) -> Any:
+                if not limits.HasField(field):
+                    return None
+                value = getattr(limits, field)
+                return round(float(value), 6) if field == "desired_retention" else value
 
-        preset = self._preset_summary(entry)
-        preset.pop("use_count")
-        this_deck_limits = {
-            "new_cards_per_day": optional("new"),
-            "reviews_per_day": optional("review"),
-            "desired_retention": optional("desired_retention"),
-        }
-        today_limits = {
-            "new_cards_per_day": optional("new_today") if limits.new_today_active else None,
-            "reviews_per_day": optional("review_today") if limits.review_today_active else None,
-        }
+            preset = self._preset_summary(entry)
+            preset.pop("use_count")
+            this_deck = {
+                "new_cards_per_day": optional("new"),
+                "reviews_per_day": optional("review"),
+                "desired_retention": optional("desired_retention"),
+            }
+            today = {
+                "new_cards_per_day": optional("new_today") if limits.new_today_active else None,
+                "reviews_per_day": (
+                    optional("review_today") if limits.review_today_active else None
+                ),
+            }
 
-        def effective_limit(field: str) -> dict[str, Any]:
-            if field in today_limits and today_limits[field] is not None:
-                return {"value": today_limits[field], "source": "today"}
-            if this_deck_limits[field] is not None:
-                return {"value": this_deck_limits[field], "source": "this_deck"}
-            return {"value": preset[field], "source": "preset"}
+            def effective(field: str) -> dict[str, Any]:
+                if field in today and today[field] is not None:
+                    value, layer = today[field], "today"
+                elif this_deck[field] is not None:
+                    value, layer = this_deck[field], "this_deck"
+                else:
+                    value, layer = preset[field], "preset"
+                return {
+                    "value": value,
+                    "source": layer,
+                    "source_deck_id": source_deck_id,
+                    "inherited": False,
+                }
 
-        result: dict[str, Any] = {
-            "deck_id": deck_id,
-            "name": str(deck["name"]),
-            "preset": preset,
-            "limits": {
-                "this_deck": this_deck_limits,
-                "today": today_limits,
-            },
-            "effective_limits": {
-                field: effective_limit(field)
+            effective_limits = {
+                field: effective(field)
                 for field in (
                     "new_cards_per_day",
                     "reviews_per_day",
                     "desired_retention",
                 )
-            },
+            }
+            return preset, {"this_deck": this_deck, "today": today}, effective_limits
+
+        preset, limit_layers, effective_limits = resolved_layers(deck_id, state)
+        parents = self.collection.decks.parents(cast("DeckId", deck_id))
+        parent_chain = []
+        for parent in parents:
+            parent_id = int(parent["id"])
+            _, _, parent_effective = resolved_layers(
+                parent_id, self._deck_config_state(parent_id)
+            )
+            parent_chain.append(
+                {
+                    "deck_id": parent_id,
+                    "name": str(parent["name"]),
+                    "effective_limits": {
+                        field: parent_effective[field]
+                        for field in ("new_cards_per_day", "reviews_per_day")
+                    },
+                }
+            )
+            if state.apply_all_parent_limits:
+                for field in ("new_cards_per_day", "reviews_per_day"):
+                    if parent_effective[field]["value"] < effective_limits[field]["value"]:
+                        effective_limits[field] = {
+                            **parent_effective[field],
+                            "inherited": True,
+                        }
+
+        result: dict[str, Any] = {
+            "deck_id": deck_id,
+            "name": str(deck["name"]),
+            "preset": preset,
+            "limits": limit_layers,
+            "effective_limits": effective_limits,
             "apply_all_parent_limits": bool(state.apply_all_parent_limits),
         }
         sections: dict[str, Any] = {}
         if "parents" in requested:
-            parents = self.collection.decks.parents(cast("DeckId", deck_id))
             sections["parents"] = {
                 "deck_ids": [int(parent["id"]) for parent in parents],
                 "preset_ids": [int(value) for value in state.current_deck.parent_config_ids],
+                "limits_applied": bool(state.apply_all_parent_limits),
+                "limit_chain": parent_chain,
             }
         if "counts" in requested:
             node = self.collection.decks.find_deck_in_tree(
@@ -2568,8 +2622,6 @@ class AnkiCollectionService:
         scope: str,
         values: dict[str, Any],
         clear_fields: Sequence[str],
-        apply_all_parent_limits: bool | None = None,
-        new_cards_ignore_review_limit: bool | None = None,
     ) -> dict[str, Any]:
         return await self.executor.run(
             lambda adapter: adapter.update_deck_limits(
@@ -2577,6 +2629,16 @@ class AnkiCollectionService:
                 scope,
                 values,
                 clear_fields,
+            )
+        )
+
+    async def update_deck_scheduler_settings(
+        self,
+        apply_all_parent_limits: bool | None,
+        new_cards_ignore_review_limit: bool | None,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.update_deck_scheduler_settings(
                 apply_all_parent_limits,
                 new_cards_ignore_review_limit,
             )
