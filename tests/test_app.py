@@ -309,8 +309,8 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     }
     simulator = by_name["anki_fsrs_simulate"]["inputSchema"]["properties"]
     assert simulator["mode"]["enum"] == ["review", "workload", "optimal_retention"]
-    assert simulator["days_to_simulate"]["maximum"] == 3650
-    assert simulator["deck_size"]["maximum"] == 10_000_000
+    assert simulator["days_to_simulate"]["maximum"] == 730
+    assert simulator["deck_size"]["maximum"] == 1_000_000
     assert (
         by_name["anki_fsrs_reschedule"]["inputSchema"]["properties"]["confirmation_token"][
             "type"
