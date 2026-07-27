@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Generic, Literal, NoReturn, TypeVar, cast
@@ -29,6 +30,7 @@ from starlette.types import ASGIApp
 from anki_mcp.auth import BearerAuthMiddleware, RequestBodyLimitMiddleware
 from anki_mcp.collection import (
     AnkiCollectionService,
+    BackupFailedError,
     CollectionAdapter,
     DuplicateNoteError,
     FullSyncRequiredError,
@@ -41,6 +43,7 @@ from anki_mcp.config import Settings
 from anki_mcp.guard import ConfirmationRegistry
 
 T = TypeVar("T")
+LOGGER = logging.getLogger(__name__)
 Offset = StrictInt
 PageLimit = StrictInt
 StableId = Annotated[StrictInt, Field(gt=0)]
@@ -483,12 +486,27 @@ def create_app(settings: Settings) -> ASGIApp:
 
         return register
 
-    def raise_tool_error(code: str, message: str, cause: Exception) -> NoReturn:
+    def raise_tool_error(
+        code: str,
+        message: str,
+        cause: Exception,
+        *,
+        log_cause: bool = False,
+    ) -> NoReturn:
+        correlation_id = str(uuid4())
         payload = {
             "code": code,
             "message": message,
-            "correlation_id": str(uuid4()),
+            "correlation_id": correlation_id,
         }
+        if log_cause:
+            LOGGER.error(
+                "tool failure code=%s correlation_id=%s exception_type=%s",
+                code,
+                correlation_id,
+                type(cause).__name__,
+                exc_info=(type(cause), cause, cause.__traceback__),
+            )
         raise ToolError(json.dumps(payload, separators=(",", ":"))) from cause
 
     async def execute(
@@ -519,6 +537,8 @@ def create_app(settings: Settings) -> ASGIApp:
             raise_tool_error("AUTHENTICATION_FAILED", str(exc), exc)
         except MediaSyncFailedError as exc:
             raise_tool_error("MEDIA_SYNC_FAILED", str(exc), exc)
+        except BackupFailedError as exc:
+            raise_tool_error("BACKUP_FAILED", str(exc), exc, log_cause=True)
         except ResponseTooLargeError as exc:
             raise_tool_error("RESPONSE_TOO_LARGE", str(exc), exc)
         except NetworkError as exc:
@@ -527,7 +547,12 @@ def create_app(settings: Settings) -> ASGIApp:
             code = "AUTHENTICATION_FAILED" if exc.kind == SyncErrorKind.AUTH else "SYNC_ERROR"
             raise_tool_error(code, "remote sync operation failed", exc)
         except Exception as exc:
-            raise_tool_error("INTERNAL_ERROR", "internal collection operation failed", exc)
+            raise_tool_error(
+                "INTERNAL_ERROR",
+                "internal collection operation failed",
+                exc,
+                log_cause=True,
+            )
 
     async def mutate(
         operation: str,
