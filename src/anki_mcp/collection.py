@@ -114,6 +114,10 @@ class MediaSyncFailedError(TimeoutError):
     """Raised when requested media synchronization does not complete safely."""
 
 
+class BackupFailedError(RuntimeError):
+    """Raised when a guarded mutation cannot obtain a verified fresh backup."""
+
+
 class CollectionAdapter:
     """Synchronous adapter; an instance must only be used by its owning thread."""
 
@@ -271,17 +275,36 @@ class CollectionAdapter:
 
     def create_backup(self) -> dict[str, Any]:
         self._backup_folder.mkdir(parents=True, exist_ok=True)
-        existing = set(self._backup_folder.glob("*.colpkg"))
-        created = self.collection.create_backup(
+        existing = {
+            path: (
+                path.stat().st_dev,
+                path.stat().st_ino,
+                path.stat().st_size,
+                path.stat().st_mtime_ns,
+            )
+            for path in self._backup_folder.glob("*.colpkg")
+        }
+        native_created = self.collection.create_backup(
             backup_folder=str(self._backup_folder), force=True, wait_for_completion=True
         )
-        candidates = set(self._backup_folder.glob("*.colpkg")) - existing
-        if not candidates:
-            candidates = set(self._backup_folder.glob("*.colpkg"))
-        path = max(candidates, key=lambda item: item.stat().st_mtime_ns) if candidates else None
+        candidates = set(self._backup_folder.glob("*.colpkg"))
+        fresh = {
+            path
+            for path in candidates
+            if path not in existing
+            or existing[path]
+            != (
+                path.stat().st_dev,
+                path.stat().st_ino,
+                path.stat().st_size,
+                path.stat().st_mtime_ns,
+            )
+        }
+        selected = fresh if fresh else candidates
+        path = max(selected, key=lambda item: item.stat().st_mtime_ns) if selected else None
         return {
             "requested": True,
-            "created": bool(created),
+            "created": bool(native_created and fresh),
             "path": str(path) if path is not None else None,
         }
 
@@ -289,8 +312,17 @@ class CollectionAdapter:
         """Create a verified backup immediately before a guarded mutation."""
         backup = self.create_backup()
         path = backup.get("path")
-        if not isinstance(path, str) or not Path(path).is_file():
-            raise RuntimeError("required pre-operation backup is unavailable")
+        backup_path = Path(path) if isinstance(path, str) else None
+        if (
+            backup.get("created") is not True
+            or backup_path is None
+            or not backup_path.is_file()
+            or backup_path.is_symlink()
+            or backup_path.stat().st_size <= 0
+        ):
+            raise BackupFailedError(
+                "required newly created pre-operation backup is unavailable"
+            )
         return {**mutation(), "backup": backup}
 
     def bootstrap(
@@ -416,7 +448,7 @@ class CollectionAdapter:
         self._state.put_receipt(idempotency_key, operation, request_hash, intent)
         try:
             result = mutate(self)
-        except (ValueError, LookupError):
+        except (ValueError, LookupError, BackupFailedError):
             self._state.delete_receipt(idempotency_key)
             raise
         receipt: dict[str, Any] = {
@@ -1053,43 +1085,71 @@ class CollectionAdapter:
             ),
             key=lambda deck: deck["id"],
         )
-        candidate_ids = sorted(
-            int(card_id)
-            for deck in decks
-            for card_id in self.collection.find_cards(
-                f"did:{deck['id']} is:review -is:suspended"
+        if len(decks) > self.max_search_scan:
+            raise ValueError(
+                f"FSRS reschedule for preset {config_id} exceeds "
+                f"MCP_MAX_SEARCH_SCAN={self.max_search_scan} decks"
             )
-        )
-        ignore_before = self._ignore_revlogs_before_ms(str(config.ignore_revlogs_before_date))
         db = self.collection.db
         assert db is not None
+        deck_ids_json = json.dumps([deck["id"] for deck in decks])
+        candidate_ids = [
+            int(card_id)
+            for card_id in db.list(
+                """
+                select id from cards
+                where did in (select value from json_each(?))
+                  and type = ? and queue != ?
+                order by id limit ?
+                """,
+                deck_ids_json,
+                CARD_TYPE_REV,
+                QUEUE_TYPE_SUSPENDED,
+                self.max_search_scan + 1,
+            )
+        ]
+        if len(candidate_ids) > self.max_search_scan:
+            raise ValueError(
+                f"FSRS reschedule for preset {config_id} across {len(decks)} decks exceeds "
+                f"MCP_MAX_SEARCH_SCAN={self.max_search_scan} candidate cards"
+            )
+        ignore_before = self._ignore_revlogs_before_ms(str(config.ignore_revlogs_before_date))
+        candidate_ids_json = json.dumps(candidate_ids)
+        valid_card_ids: set[int] = set()
+        review_history_hash = hashlib.sha256()
+        last_review_id = -1
+        while True:
+            review_rows = db.all(
+                """
+                select cid, id, ease, ivl, lastIvl, factor, time, type
+                from revlog
+                where cid in (select value from json_each(?))
+                  and id >= ? and id > ?
+                  and ease between 1 and 4 and type between 0 and 3
+                order by id limit 1000
+                """,
+                candidate_ids_json,
+                ignore_before,
+                last_review_id,
+            )
+            if not review_rows:
+                break
+            for row in review_rows:
+                valid_card_ids.add(int(row[0]))
+                review_history_hash.update(
+                    json.dumps(
+                        list(row), ensure_ascii=False, separators=(",", ":")
+                    ).encode("utf-8")
+                )
+                review_history_hash.update(b"\n")
+            last_review_id = int(review_rows[-1][1])
         card_states = []
         for card_id in candidate_ids:
+            if card_id not in valid_card_ids:
+                continue
             card = self.collection.get_card(cast("CardId", card_id))
             if card.type != CARD_TYPE_REV or card.queue == QUEUE_TYPE_SUSPENDED:
                 continue
-            valid_reviews = int(
-                db.scalar(
-                    """
-                    select count() from revlog
-                    where cid = ? and id >= ? and ease between 1 and 4 and type between 0 and 3
-                    """,
-                    card_id,
-                    ignore_before,
-                )
-            )
-            if not valid_reviews:
-                continue
-            review_state = db.first(
-                """
-                select count(), coalesce(max(id), 0), coalesce(sum(ease), 0),
-                       coalesce(sum(ivl), 0), coalesce(sum(lastIvl), 0),
-                       coalesce(sum(factor), 0), coalesce(sum(time), 0),
-                       coalesce(sum(type), 0)
-                from revlog where cid = ?
-                """,
-                card_id,
-            )
             memory_state = card.memory_state
             card_states.append(
                 {
@@ -1112,11 +1172,9 @@ class CollectionAdapter:
                             "difficulty": float(memory_state.difficulty),
                         }
                     ),
-                    "revlog": list(review_state) if review_state is not None else [],
                 }
             )
-            if len(card_states) > self.max_search_scan:
-                raise ValueError("FSRS reschedule exceeds MCP_MAX_SEARCH_SCAN")
+        timing = self.collection.sched._timing_today()
         impact = {
             "config_id": config_id,
             "decks": len(decks),
@@ -1127,8 +1185,11 @@ class CollectionAdapter:
                 {
                     "decks": decks,
                     "cards": card_states,
+                    "review_history": review_history_hash.hexdigest(),
                     "scheduler": {
                         "fsrs": bool(state.fsrs),
+                        "days_elapsed": int(timing.days_elapsed),
+                        "next_day_at": int(timing.next_day_at),
                         "load_balancer": self.collection.get_config_bool(
                             ConfigKey.Bool.LOAD_BALANCER_ENABLED
                         ),

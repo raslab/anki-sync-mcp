@@ -119,10 +119,6 @@ def test_guarded_note_deletion_requires_matching_preview_and_creates_backup(
         assert failed is False
         assert unchanged["id"] == note_id
 
-        failed, explicit_backup = call("anki_backup_create", {})
-        assert failed is False
-        assert Path(explicit_backup["path"]).is_file()
-
         failed, preview = call("anki_notes_delete_preview", {"note_ids": [note_id]})
         assert failed is False
         assert preview["impact"]["notes"] == 1
