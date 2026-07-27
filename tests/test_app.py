@@ -258,11 +258,39 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     by_name = {tool["name"]: tool for tool in tools}
     review_list = by_name["anki_reviews_list"]["inputSchema"]["properties"]
     assert review_list["order"]["enum"] == ["newest", "oldest"]
-    assert by_name["anki_review_stats"]["inputSchema"]["properties"]["days"]["enum"] == [
+    assert review_list["include_fields"]["items"]["enum"] == [
+        "review_kind",
+        "rating_label",
+        "intervals",
+        "answer_time",
+        "ease",
+        "memory_state",
+    ]
+    card_get = by_name["anki_cards_get"]["inputSchema"]["properties"]
+    assert card_get["include_sections"]["items"]["enum"] == ["review_summary", "fsrs"]
+    review_stats = by_name["anki_review_stats"]["inputSchema"]["properties"]
+    assert review_stats["days"]["enum"] == [
         0,
         30,
         90,
         365,
+    ]
+    assert review_stats["include_sections"]["items"]["enum"] == [
+        "buttons",
+        "card_counts",
+        "hours",
+        "today",
+        "eases",
+        "intervals",
+        "future_due",
+        "added",
+        "reviews",
+        "rollover_hour",
+        "difficulty",
+        "retrievability",
+        "stability",
+        "true_retention",
+        "fsrs",
     ]
     assert by_name["anki_sync"]["inputSchema"]["properties"]["sync_media"]["type"] == "boolean"
     for name in (
@@ -319,16 +347,31 @@ def test_review_tools_and_enriched_card_work_through_json_rpc(client: TestClient
 
     cards = call(2, "anki_cards_search", {"query": "hola"})
     card_id = cards["items"][0]["id"]
-    card = call(3, "anki_cards_get", {"card_id": card_id})
+    compact_card = call(3, "anki_cards_get", {"card_id": card_id})
     reviews = call(4, "anki_reviews_list", {"card_id": card_id})
     stats = call(5, "anki_review_stats", {"card_id": card_id, "days": 30})
+    card = call(
+        6,
+        "anki_cards_get",
+        {"card_id": card_id, "include_sections": ["review_summary", "fsrs"]},
+    )
+    extended_stats = call(
+        7,
+        "anki_review_stats",
+        {"card_id": card_id, "days": 30, "include_sections": ["card_counts"]},
+    )
 
+    assert "review_summary" not in compact_card
+    assert "fsrs" not in compact_card
     assert card["review_summary"]["reviews"] == 0
     assert "memory_state" in card["fsrs"]
     assert reviews["scope"] == {"kind": "card", "card_id": card_id}
     assert reviews["items"] == []
     assert stats["scope"] == {"kind": "card", "card_id": card_id}
-    assert "today" in stats["graphs"]
+    assert "graphs" not in stats
+    assert "sections" not in stats
+    assert "summary" in stats
+    assert set(extended_stats["sections"]) == {"card_counts"}
 
 
 def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -> None:

@@ -53,14 +53,17 @@ def reviewed_collection(tmp_path: Path) -> Iterator[tuple[str, int, int, int]]:
 
 
 @pytest.mark.anyio
-async def test_card_get_includes_lifetime_review_and_fsrs_summary(
+async def test_card_get_keeps_history_compact_and_supports_opt_in_sections(
     reviewed_collection: tuple[str, int, int, int],
 ) -> None:
     path, _, card_id, _ = reviewed_collection
 
     async with AnkiCollectionService(path, max_page_size=100) as service:
-        card = await service.get_card(card_id)
+        compact = await service.get_card(card_id)
+        card = await service.get_card(card_id, ["review_summary", "fsrs"])
 
+    assert "review_summary" not in compact
+    assert "fsrs" not in compact
     assert card["review_summary"]["added_at"] > 0
     assert card["review_summary"]["first_review_at"] > 0
     assert card["review_summary"]["latest_review_at"] >= card["review_summary"]["first_review_at"]
@@ -89,6 +92,14 @@ async def test_reviews_list_supports_card_scope_and_stable_pagination(
             offset=0,
             limit=1,
             order="newest",
+            include_fields=[
+                "review_kind",
+                "rating_label",
+                "intervals",
+                "answer_time",
+                "ease",
+                "memory_state",
+            ],
         )
         oldest = await service.list_reviews(
             card_id=card_id,
@@ -112,6 +123,7 @@ async def test_reviews_list_supports_card_scope_and_stable_pagination(
     assert newest["items"][0]["previous_interval_seconds"] == 86_400
     assert newest["items"][0]["card_id"] == card_id
     assert oldest["items"][0]["rating"] == 1
+    assert set(oldest["items"][0]) == {"card_id", "reviewed_at", "rating"}
 
 
 @pytest.mark.anyio
@@ -193,20 +205,44 @@ async def test_review_stats_supports_card_deck_and_query_scopes(
 
     async with AnkiCollectionService(path, max_page_size=100) as service:
         card_stats = await service.review_stats(card_id, None, None, False, 30)
-        deck_stats = await service.review_stats(None, deck_id, None, True, 30)
+        deck_stats = await service.review_stats(
+            None,
+            deck_id,
+            None,
+            True,
+            30,
+            ["future_due", "hours", "intervals", "difficulty", "stability", "retrievability"],
+        )
         query_stats = await service.review_stats(None, None, '"child review"', False, 30)
 
     assert card_stats["scope"] == {"kind": "card", "card_id": card_id}
     assert card_stats["attribution"] == "exact_card"
     assert card_stats["days"] == 30
-    assert card_stats["graphs"]["today"]["answer_count"] >= 0
-    assert "reviews" in card_stats["graphs"]
+    assert "graphs" not in card_stats
+    assert "sections" not in card_stats
+    assert card_stats["summary"] == {
+        "reviews": 2,
+        "answer_seconds": 3.75,
+        "average_answer_seconds": 1.875,
+        "retention": 1.0,
+        "ratings": {"again": 1, "hard": 0, "good": 1, "easy": 0},
+        "daily": [{"day": 0, "reviews": 2, "answer_seconds": 3.75}],
+    }
     assert deck_stats["scope"] == {
         "kind": "deck",
         "deck_id": deck_id,
         "include_children": True,
     }
     assert deck_stats["attribution"] == "current_card_membership"
+    assert set(deck_stats["sections"]) == {
+        "future_due",
+        "hours",
+        "intervals",
+        "difficulty",
+        "stability",
+        "retrievability",
+    }
+    assert "card_counts" not in deck_stats["sections"]
     assert query_stats["scope"] == {"kind": "query", "query": '"child review"'}
 
 
