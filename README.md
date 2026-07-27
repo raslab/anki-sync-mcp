@@ -125,27 +125,6 @@ Boolean values accept the forms supported by Pydantic settings, including `true`
 `1`/`0`, and `yes`/`no`. Invalid or unknown configuration causes startup to fail instead of
 silently falling back to a default.
 
-## Review history and analytics
-
-`anki_cards_get` includes current scheduling data, a lifetime review summary, and available FSRS
-memory state. Detailed events are kept out of that response so they remain independently bounded
-and paginated.
-
-The two read-only review tools accept exactly one scope: `card_id`, `deck_id`, or an Anki search
-`query`. Set `include_children=true` only with `deck_id` to include descendant decks.
-
-- `anki_reviews_list` returns individual review events with stable offset pagination, oldest/newest
-  ordering, ratings, review kinds, intervals, answer time, and available historical FSRS state.
-- `anki_review_stats` returns Anki's review graphs and aggregates for 30, 90, 365, or all-time
-  (`days=0`) windows, including review/time series, retention, button usage, card counts, future
-  workload, and FSRS distributions.
-
-Anki review records contain a card ID but not the deck containing that card at review time. Deck
-and general-query results therefore report `attribution: current_card_membership`: moving a card
-causes its earlier reviews to follow it into its current deck. Card-scoped results report
-`attribution: exact_card`. Review scopes and event sets are limited by `MCP_MAX_SEARCH_SCAN`, and
-serialized results remain subject to `MCP_MAX_RESPONSE_BYTES`.
-
 ## Development
 
 Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
