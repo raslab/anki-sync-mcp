@@ -17,7 +17,8 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import anki.lang
 from anki.collection import AddNoteRequest, Collection
-from anki.errors import NetworkError, NotFoundError
+from anki.decks import UpdateDeckConfigs
+from anki.errors import InvalidInput, NetworkError, NotFoundError
 from anki.sync import SyncAuth
 from anki.utils import field_checksum
 from google.protobuf.json_format import MessageToDict
@@ -27,7 +28,7 @@ from anki_mcp.state import PersistentState
 
 if TYPE_CHECKING:
     from anki.cards import CardId
-    from anki.decks import DeckId
+    from anki.decks import DeckConfigId, DeckId
     from anki.models import NotetypeId
     from anki.notes import NoteId
 
@@ -40,6 +41,54 @@ SYNC_REQUIRED_NAMES = (
     "FULL_DOWNLOAD",
     "FULL_UPLOAD",
 )
+DECK_PRESET_SECTIONS: dict[str, tuple[str, ...]] = {
+    "learning": (
+        "learn_steps",
+        "relearn_steps",
+        "initial_ease",
+        "graduating_interval_good",
+        "graduating_interval_easy",
+    ),
+    "new_cards": (
+        "new_per_day_minimum",
+        "new_card_insert_order",
+        "new_card_gather_priority",
+        "new_card_sort_order",
+        "new_mix",
+    ),
+    "reviews": (
+        "easy_multiplier",
+        "hard_multiplier",
+        "lapse_multiplier",
+        "interval_multiplier",
+        "maximum_review_interval",
+        "minimum_lapse_interval",
+        "review_order",
+        "interday_learning_mix",
+    ),
+    "lapses": ("leech_action", "leech_threshold"),
+    "burying": ("bury_new", "bury_reviews", "bury_interday_learning"),
+    "display_audio": (
+        "disable_autoplay",
+        "show_timer",
+        "stop_timer_on_answer",
+        "seconds_to_show_question",
+        "seconds_to_show_answer",
+        "question_action",
+        "answer_action",
+        "wait_for_audio",
+        "skip_question_when_replaying_answer",
+    ),
+    "fsrs": (
+        "fsrs_params_4",
+        "fsrs_params_5",
+        "fsrs_params_6",
+        "historical_retention",
+        "ignore_revlogs_before_date",
+        "param_search",
+    ),
+    "easy_days": ("easy_days_percentages",),
+}
 
 
 class SyncLoginRequiredError(RuntimeError):
@@ -528,6 +577,381 @@ class CollectionAdapter:
             config["desiredRetention"] = desired_retention
         self.collection.decks.update_config(config)
         return {"id": deck_id, "config_id": int(config["id"]), "updated": True}
+
+    def _deck_config_state(self, deck_id: int) -> Any:
+        deck = self.collection.decks.get(cast("DeckId", deck_id), default=False)
+        if deck is None:
+            raise LookupError(f"deck {deck_id} not found")
+        if bool(deck.get("dyn", 0)):
+            raise ValueError("dynamic decks do not have editable deck options")
+        return self.collection.decks.get_deck_configs_for_update(cast("DeckId", deck_id))
+
+    def _preset_entry(self, config_id: int) -> tuple[Any, Any]:
+        state = self.collection.decks.get_deck_configs_for_update(cast("DeckId", 1))
+        for entry in state.all_config:
+            if int(entry.config.id) == config_id:
+                return state, entry
+        raise LookupError(f"deck preset {config_id} not found")
+
+    def _preset_summary(self, entry: Any) -> dict[str, Any]:
+        config = entry.config.config
+        name, name_truncated = self._truncate_rendered(str(entry.config.name))
+        result = {
+            "id": int(entry.config.id),
+            "name": name,
+            "use_count": int(entry.use_count),
+            "new_cards_per_day": int(config.new_per_day),
+            "reviews_per_day": int(config.reviews_per_day),
+            "max_answer_seconds": int(config.cap_answer_time_to_secs),
+            "desired_retention": round(float(config.desired_retention), 6),
+        }
+        if name_truncated:
+            result["name_truncated"] = True
+        return result
+
+    def list_deck_presets(self, offset: int, limit: int) -> dict[str, Any]:
+        state = self.collection.decks.get_deck_configs_for_update(cast("DeckId", 1))
+        if len(state.all_config) > self.max_search_scan:
+            raise ValueError(
+                "deck presets exceed MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        values = sorted(
+            (self._preset_summary(entry) for entry in state.all_config),
+            key=lambda item: str(item["name"]).casefold(),
+        )
+        return self._page(values, offset, limit)
+
+    def get_deck_preset(
+        self, config_id: int, include_sections: Sequence[str] = ()
+    ) -> dict[str, Any]:
+        _, entry = self._preset_entry(config_id)
+        requested = list(dict.fromkeys(include_sections))
+        unknown = set(requested) - set(DECK_PRESET_SECTIONS)
+        if unknown:
+            raise ValueError(f"unknown deck preset sections: {', '.join(sorted(unknown))}")
+        result = self._preset_summary(entry)
+        if requested:
+            values = MessageToDict(
+                entry.config.config,
+                preserving_proto_field_name=True,
+                always_print_fields_with_no_presence=True,
+            )
+            result["sections"] = {
+                section: {field: values[field] for field in DECK_PRESET_SECTIONS[section]}
+                for section in requested
+            }
+        return result
+
+    def _update_deck_config_state(
+        self,
+        deck_id: int,
+        state: Any,
+        *,
+        apply_all_parent_limits: bool | None = None,
+        new_cards_ignore_review_limit: bool | None = None,
+    ) -> None:
+        try:
+            self.collection.decks.update_deck_configs(
+                UpdateDeckConfigs(
+                    target_deck_id=deck_id,
+                    configs=[entry.config for entry in state.all_config],
+                    card_state_customizer=state.card_state_customizer,
+                    limits=state.current_deck.limits,
+                    new_cards_ignore_review_limit=(
+                        state.new_cards_ignore_review_limit
+                        if new_cards_ignore_review_limit is None
+                        else new_cards_ignore_review_limit
+                    ),
+                    fsrs=state.fsrs,
+                    apply_all_parent_limits=(
+                        state.apply_all_parent_limits
+                        if apply_all_parent_limits is None
+                        else apply_all_parent_limits
+                    ),
+                    fsrs_health_check=state.fsrs_health_check,
+                )
+            )
+        except InvalidInput as exc:
+            raise ValueError("invalid deck option update") from exc
+
+    def update_deck_preset(
+        self, config_id: int, name: str | None, options: dict[str, Any]
+    ) -> dict[str, Any]:
+        state, entry = self._preset_entry(config_id)
+        if name is None and not options:
+            raise ValueError("at least one deck preset update must be provided")
+        if name is not None:
+            if not name.strip():
+                raise ValueError("deck preset name must not be blank")
+            for candidate in state.all_config:
+                if (
+                    int(candidate.config.id) != config_id
+                    and str(candidate.config.name).casefold() == name.casefold()
+                ):
+                    raise ValueError(f"deck preset {name} already exists")
+            entry.config.name = name
+
+        config = entry.config.config
+        descriptors = {
+            field.name: field for field in config.DESCRIPTOR.fields if field.name != "other"
+        }
+        unknown = set(options) - set(descriptors)
+        if unknown:
+            raise ValueError(f"unknown deck preset options: {', '.join(sorted(unknown))}")
+        for field_name, value in options.items():
+            descriptor = descriptors[field_name]
+            if descriptor.is_repeated:
+                target = getattr(config, field_name)
+                del target[:]
+                target.extend(value)
+            elif descriptor.enum_type is not None:
+                enum_value = descriptor.enum_type.values_by_name.get(str(value))
+                if enum_value is None:
+                    raise ValueError(f"unsupported {field_name} value")
+                setattr(config, field_name, enum_value.number)
+            else:
+                setattr(config, field_name, value)
+
+        affected_decks = int(entry.use_count)
+        self._update_deck_config_state(1, state)
+        return {
+            "id": config_id,
+            "updated": True,
+            "changed_fields": len(options) + int(name is not None),
+            "affected_decks": affected_decks,
+        }
+
+    def create_deck_preset(self, name: str, clone_from_config_id: int | None) -> dict[str, Any]:
+        if not name.strip():
+            raise ValueError("deck preset name must not be blank")
+        presets = self.collection.decks.all_config()
+        if any(str(config["name"]).casefold() == name.casefold() for config in presets):
+            raise ValueError(f"deck preset {name} already exists")
+        clone = None
+        if clone_from_config_id is not None:
+            clone = self.collection.decks.get_config(cast("DeckConfigId", clone_from_config_id))
+            if clone is None:
+                raise LookupError(f"deck preset {clone_from_config_id} not found")
+        created = self.collection.decks.add_config(name, clone)
+        return {"id": int(created["id"]), "created": True}
+
+    def assign_deck_preset(self, deck_id: int, config_id: int) -> dict[str, Any]:
+        self._preset_entry(config_id)
+        deck = self.collection.decks.get(cast("DeckId", deck_id), default=False)
+        if deck is None:
+            raise LookupError(f"deck {deck_id} not found")
+        if bool(deck.get("dyn", 0)):
+            raise ValueError("dynamic decks cannot be assigned a deck preset")
+        self.collection.decks.set_config_id_for_deck_dict(deck, cast("DeckConfigId", config_id))
+        return {"deck_id": deck_id, "config_id": config_id, "updated": True}
+
+    def update_deck_limits(
+        self,
+        deck_id: int,
+        scope: str,
+        values: dict[str, Any],
+        clear_fields: Sequence[str],
+    ) -> dict[str, Any]:
+        if scope not in {"this_deck", "today"}:
+            raise ValueError("scope must be this_deck or today")
+        allowed = {"new_cards_per_day", "reviews_per_day"}
+        if scope == "this_deck":
+            allowed.add("desired_retention")
+        unknown = (set(values) | set(clear_fields)) - allowed
+        if unknown:
+            raise ValueError(f"unsupported {scope} limit fields: {', '.join(sorted(unknown))}")
+        overlap = set(values) & set(clear_fields)
+        if overlap:
+            raise ValueError(
+                f"limit fields cannot be set and cleared together: {', '.join(sorted(overlap))}"
+            )
+        if not values and not clear_fields:
+            raise ValueError("at least one deck limit update must be provided")
+
+        state = self._deck_config_state(deck_id)
+        limits = state.current_deck.limits
+        field_names = {
+            "new_cards_per_day": "new",
+            "reviews_per_day": "review",
+            "desired_retention": "desired_retention",
+        }
+        if scope == "today":
+            field_names = {
+                "new_cards_per_day": "new_today",
+                "reviews_per_day": "review_today",
+            }
+        for field, value in values.items():
+            target = field_names[field]
+            setattr(limits, target, value)
+            if scope == "today":
+                setattr(limits, f"{target}_active", True)
+        for field in clear_fields:
+            target = field_names[field]
+            limits.ClearField(target)
+            if scope == "today":
+                setattr(limits, f"{target}_active", False)
+
+        self._update_deck_config_state(deck_id, state)
+        return {"deck_id": deck_id, "scope": scope, "updated": True}
+
+    def update_deck_scheduler_settings(
+        self,
+        apply_all_parent_limits: bool | None,
+        new_cards_ignore_review_limit: bool | None,
+    ) -> dict[str, Any]:
+        if apply_all_parent_limits is None and new_cards_ignore_review_limit is None:
+            raise ValueError("at least one collection-wide scheduler setting must be provided")
+        state = self._deck_config_state(1)
+        self._update_deck_config_state(
+            1,
+            state,
+            apply_all_parent_limits=apply_all_parent_limits,
+            new_cards_ignore_review_limit=new_cards_ignore_review_limit,
+        )
+        return {
+            "scope": "collection",
+            "updated": True,
+            "apply_all_parent_limits": (
+                bool(state.apply_all_parent_limits)
+                if apply_all_parent_limits is None
+                else apply_all_parent_limits
+            ),
+            "new_cards_ignore_review_limit": (
+                bool(state.new_cards_ignore_review_limit)
+                if new_cards_ignore_review_limit is None
+                else new_cards_ignore_review_limit
+            ),
+        }
+
+    def get_deck_options(
+        self, deck_id: int, include_sections: Sequence[str] = ()
+    ) -> dict[str, Any]:
+        allowed_sections = {"counts", "parents", "global_settings"}
+        requested = list(dict.fromkeys(include_sections))
+        unknown = set(requested) - allowed_sections
+        if unknown:
+            raise ValueError(f"unknown deck option sections: {', '.join(sorted(unknown))}")
+        state = self._deck_config_state(deck_id)
+        deck = self.collection.decks.get(cast("DeckId", deck_id), default=False)
+        if deck is None:  # pragma: no cover - validated by _deck_config_state
+            raise LookupError(f"deck {deck_id} not found")
+        def resolved_layers(source_deck_id: int, source_state: Any) -> tuple[Any, Any, Any]:
+            entry = next(
+                item
+                for item in source_state.all_config
+                if int(item.config.id) == int(source_state.current_deck.config_id)
+            )
+            limits = source_state.current_deck.limits
+
+            def optional(field: str) -> Any:
+                if not limits.HasField(field):
+                    return None
+                value = getattr(limits, field)
+                return round(float(value), 6) if field == "desired_retention" else value
+
+            preset = self._preset_summary(entry)
+            preset.pop("use_count")
+            this_deck = {
+                "new_cards_per_day": optional("new"),
+                "reviews_per_day": optional("review"),
+                "desired_retention": optional("desired_retention"),
+            }
+            today = {
+                "new_cards_per_day": optional("new_today") if limits.new_today_active else None,
+                "reviews_per_day": (
+                    optional("review_today") if limits.review_today_active else None
+                ),
+            }
+
+            def effective(field: str) -> dict[str, Any]:
+                if field in today and today[field] is not None:
+                    value, layer = today[field], "today"
+                elif this_deck[field] is not None:
+                    value, layer = this_deck[field], "this_deck"
+                else:
+                    value, layer = preset[field], "preset"
+                return {
+                    "value": value,
+                    "source": layer,
+                    "source_deck_id": source_deck_id,
+                    "inherited": False,
+                }
+
+            effective_limits = {
+                field: effective(field)
+                for field in (
+                    "new_cards_per_day",
+                    "reviews_per_day",
+                    "desired_retention",
+                )
+            }
+            return preset, {"this_deck": this_deck, "today": today}, effective_limits
+
+        preset, limit_layers, effective_limits = resolved_layers(deck_id, state)
+        parents = self.collection.decks.parents(cast("DeckId", deck_id))
+        parent_chain = []
+        for parent in parents:
+            parent_id = int(parent["id"])
+            _, _, parent_effective = resolved_layers(
+                parent_id, self._deck_config_state(parent_id)
+            )
+            parent_chain.append(
+                {
+                    "deck_id": parent_id,
+                    "name": str(parent["name"]),
+                    "effective_limits": {
+                        field: parent_effective[field]
+                        for field in ("new_cards_per_day", "reviews_per_day")
+                    },
+                }
+            )
+            if state.apply_all_parent_limits:
+                for field in ("new_cards_per_day", "reviews_per_day"):
+                    if parent_effective[field]["value"] < effective_limits[field]["value"]:
+                        effective_limits[field] = {
+                            **parent_effective[field],
+                            "inherited": True,
+                        }
+
+        result: dict[str, Any] = {
+            "deck_id": deck_id,
+            "name": str(deck["name"]),
+            "preset": preset,
+            "limits": limit_layers,
+            "effective_limits": effective_limits,
+            "apply_all_parent_limits": bool(state.apply_all_parent_limits),
+        }
+        sections: dict[str, Any] = {}
+        if "parents" in requested:
+            sections["parents"] = {
+                "deck_ids": [int(parent["id"]) for parent in parents],
+                "preset_ids": [int(value) for value in state.current_deck.parent_config_ids],
+                "limits_applied": bool(state.apply_all_parent_limits),
+                "limit_chain": parent_chain,
+            }
+        if "counts" in requested:
+            node = self.collection.decks.find_deck_in_tree(
+                self.collection.decks.deck_tree(), cast("DeckId", deck_id)
+            )
+            if node is None:  # pragma: no cover - a fetched deck is present in the tree
+                raise RuntimeError("deck was not present in Anki's deck tree")
+            sections["counts"] = {
+                "new": int(node.new_count),
+                "review": int(node.review_count),
+                "learning": int(node.learn_count),
+                "new_uncapped": int(node.new_uncapped),
+                "review_uncapped": int(node.review_uncapped),
+                "total_in_deck": int(node.total_in_deck),
+                "total_including_children": int(node.total_including_children),
+            }
+        if "global_settings" in requested:
+            sections["global_settings"] = {
+                "new_cards_ignore_review_limit": bool(state.new_cards_ignore_review_limit),
+                "fsrs": bool(state.fsrs),
+            }
+        if sections:
+            result["sections"] = sections
+        return result
 
     def _raise_after_delete_failure(
         self,
@@ -2153,6 +2577,70 @@ class AnkiCollectionService:
                 reviews_per_day,
                 max_answer_seconds,
                 desired_retention,
+            )
+        )
+
+    async def get_deck_options(
+        self, deck_id: int, include_sections: Sequence[str] = ()
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.get_deck_options(deck_id, include_sections)
+        )
+
+    async def list_deck_presets(self, offset: int, limit: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.list_deck_presets(offset, limit))
+
+    async def get_deck_preset(
+        self, config_id: int, include_sections: Sequence[str] = ()
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.get_deck_preset(config_id, include_sections)
+        )
+
+    async def update_deck_preset(
+        self, config_id: int, name: str | None, options: dict[str, Any]
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.update_deck_preset(config_id, name, options)
+        )
+
+    async def create_deck_preset(
+        self, name: str, clone_from_config_id: int | None
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.create_deck_preset(name, clone_from_config_id)
+        )
+
+    async def assign_deck_preset(self, deck_id: int, config_id: int) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.assign_deck_preset(deck_id, config_id)
+        )
+
+    async def update_deck_limits(
+        self,
+        deck_id: int,
+        scope: str,
+        values: dict[str, Any],
+        clear_fields: Sequence[str],
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.update_deck_limits(
+                deck_id,
+                scope,
+                values,
+                clear_fields,
+            )
+        )
+
+    async def update_deck_scheduler_settings(
+        self,
+        apply_all_parent_limits: bool | None,
+        new_cards_ignore_review_limit: bool | None,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.update_deck_scheduler_settings(
+                apply_all_parent_limits,
+                new_cards_ignore_review_limit,
             )
         )
 

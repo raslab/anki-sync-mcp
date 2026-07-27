@@ -204,9 +204,17 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_backup_create",
         "anki_decks_list",
         "anki_decks_get",
+        "anki_deck_options_get",
+        "anki_deck_presets_list",
+        "anki_deck_presets_get",
         "anki_decks_create",
         "anki_decks_update",
         "anki_decks_update_config",
+        "anki_deck_limits_update",
+        "anki_scheduler_settings_update",
+        "anki_deck_presets_create",
+        "anki_deck_presets_update",
+        "anki_deck_presets_assign",
         "anki_decks_delete_preview",
         "anki_decks_delete",
         "anki_notes_search",
@@ -256,6 +264,101 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     assert all(tool["inputSchema"]["properties"]["limit"]["minimum"] == 1 for tool in paginated)
     assert all(tool["inputSchema"]["properties"]["limit"]["maximum"] == 100 for tool in paginated)
     by_name = {tool["name"]: tool for tool in tools}
+    deck_options = by_name["anki_deck_options_get"]["inputSchema"]["properties"]
+    assert deck_options["include_sections"]["items"]["enum"] == [
+        "counts",
+        "parents",
+        "global_settings",
+    ]
+    limits_schema = by_name["anki_deck_limits_update"]["inputSchema"]
+    assert set(limits_schema["properties"]) == {
+        "deck_id",
+        "update",
+        "idempotency_key",
+    }
+    update_schema = limits_schema["properties"]["update"]
+    assert update_schema["discriminator"]["propertyName"] == "scope"
+    update_models = {
+        limits_schema["$defs"][option["$ref"].rsplit("/", 1)[-1]]["properties"]["scope"][
+            "const"
+        ]: limits_schema["$defs"][option["$ref"].rsplit("/", 1)[-1]]
+        for option in update_schema["oneOf"]
+    }
+    today_values_ref = update_models["today"]["properties"]["values"]["anyOf"][0]["$ref"]
+    today_values = limits_schema["$defs"][today_values_ref.rsplit("/", 1)[-1]]["properties"]
+    assert set(today_values) == {"new_cards_per_day", "reviews_per_day"}
+    this_values_ref = update_models["this_deck"]["properties"]["values"]["anyOf"][0]["$ref"]
+    this_values = limits_schema["$defs"][this_values_ref.rsplit("/", 1)[-1]]["properties"]
+    assert set(this_values) == {
+        "new_cards_per_day",
+        "reviews_per_day",
+        "desired_retention",
+    }
+    scheduler_settings = by_name["anki_scheduler_settings_update"]["inputSchema"]["properties"]
+    assert set(scheduler_settings) == {
+        "apply_all_parent_limits",
+        "new_cards_ignore_review_limit",
+        "idempotency_key",
+    }
+    preset_get = by_name["anki_deck_presets_get"]["inputSchema"]["properties"]
+    assert preset_get["include_sections"]["items"]["enum"] == [
+        "learning",
+        "new_cards",
+        "reviews",
+        "lapses",
+        "burying",
+        "display_audio",
+        "fsrs",
+        "easy_days",
+    ]
+    preset_update_schema = by_name["anki_deck_presets_update"]["inputSchema"]
+    patch_ref = preset_update_schema["properties"]["options"]["anyOf"][0]["$ref"]
+    patch_name = patch_ref.rsplit("/", 1)[-1]
+    assert set(preset_update_schema["$defs"][patch_name]["properties"]) == {
+        "learn_steps",
+        "relearn_steps",
+        "fsrs_params_4",
+        "fsrs_params_5",
+        "fsrs_params_6",
+        "new_per_day",
+        "reviews_per_day",
+        "new_per_day_minimum",
+        "initial_ease",
+        "easy_multiplier",
+        "hard_multiplier",
+        "lapse_multiplier",
+        "interval_multiplier",
+        "maximum_review_interval",
+        "minimum_lapse_interval",
+        "graduating_interval_good",
+        "graduating_interval_easy",
+        "new_card_insert_order",
+        "new_card_gather_priority",
+        "new_card_sort_order",
+        "new_mix",
+        "review_order",
+        "interday_learning_mix",
+        "leech_action",
+        "leech_threshold",
+        "disable_autoplay",
+        "cap_answer_time_to_secs",
+        "show_timer",
+        "stop_timer_on_answer",
+        "seconds_to_show_question",
+        "seconds_to_show_answer",
+        "question_action",
+        "answer_action",
+        "wait_for_audio",
+        "skip_question_when_replaying_answer",
+        "bury_new",
+        "bury_reviews",
+        "bury_interday_learning",
+        "desired_retention",
+        "ignore_revlogs_before_date",
+        "easy_days_percentages",
+        "historical_retention",
+        "param_search",
+    }
     review_list = by_name["anki_reviews_list"]["inputSchema"]["properties"]
     assert review_list["order"]["enum"] == ["newest", "oldest"]
     assert review_list["include_fields"]["items"]["enum"] == [
@@ -431,6 +534,76 @@ def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -
             "idempotency_key": "phase2-deck-config",
         },
     )
+    config_id = deck_config["result"]["config_id"]
+    compact_options = call("anki_deck_options_get", {"deck_id": deck_id})
+    detailed_preset = call(
+        "anki_deck_presets_get",
+        {
+            "config_id": config_id,
+            "include_sections": [
+                "learning",
+                "new_cards",
+                "reviews",
+                "lapses",
+                "burying",
+                "display_audio",
+                "fsrs",
+                "easy_days",
+            ],
+        },
+    )
+    scoped_limits = call(
+        "anki_deck_limits_update",
+        {
+            "deck_id": deck_id,
+            "update": {
+                "scope": "this_deck",
+                "values": {"new_cards_per_day": 5, "desired_retention": 0.91},
+            },
+            "idempotency_key": "phase2-deck-limits",
+        },
+    )
+    scheduler_settings = call(
+        "anki_scheduler_settings_update",
+        {
+            "apply_all_parent_limits": True,
+            "idempotency_key": "phase2-scheduler-settings",
+        },
+    )
+    preset_patch = call(
+        "anki_deck_presets_update",
+        {
+            "config_id": config_id,
+            "options": {
+                "bury_new": True,
+                "review_order": "REVIEW_CARD_ORDER_RANDOM",
+            },
+            "idempotency_key": "phase2-preset-patch",
+        },
+    )
+    updated_options = call("anki_deck_options_get", {"deck_id": deck_id})
+    updated_preset = call(
+        "anki_deck_presets_get",
+        {"config_id": config_id, "include_sections": ["burying", "reviews"]},
+    )
+    preset_list = call("anki_deck_presets_list", {})
+    created_preset = call(
+        "anki_deck_presets_create",
+        {
+            "name": "Protocol Preset",
+            "clone_from_config_id": config_id,
+            "idempotency_key": "phase2-preset-create",
+        },
+    )
+    assigned_preset = call(
+        "anki_deck_presets_assign",
+        {
+            "deck_id": deck_id,
+            "config_id": created_preset["result"]["id"],
+            "idempotency_key": "phase2-preset-assign",
+        },
+    )
+    assigned_options = call("anki_deck_options_get", {"deck_id": deck_id})
     flagged = call(
         "anki_cards_set_flag",
         {"card_ids": [card_id], "flag": 4, "idempotency_key": "phase2-flag"},
@@ -508,14 +681,36 @@ def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -
     metrics = call("anki_metrics", {})
 
     assert deck_config["result"]["updated"] is True
+    assert "sections" not in compact_options
+    assert set(detailed_preset["sections"]) == {
+        "learning",
+        "new_cards",
+        "reviews",
+        "lapses",
+        "burying",
+        "display_audio",
+        "fsrs",
+        "easy_days",
+    }
+    assert scoped_limits["result"]["scope"] == "this_deck"
+    assert scheduler_settings["result"]["scope"] == "collection"
+    assert preset_patch["result"]["changed_fields"] == 2
+    assert updated_options["limits"]["this_deck"]["new_cards_per_day"] == 5
+    assert updated_options["apply_all_parent_limits"] is True
+    assert updated_preset["sections"]["burying"]["bury_new"] is True
+    assert updated_preset["sections"]["reviews"]["review_order"] == "REVIEW_CARD_ORDER_RANDOM"
+    assert preset_list["total"] == 1
+    assert created_preset["result"]["created"] is True
+    assert assigned_preset["result"]["config_id"] == created_preset["result"]["id"]
+    assert assigned_options["preset"]["id"] == created_preset["result"]["id"]
     assert flagged["result"]["flag"] == 4
     assert repositioned["result"]["repositioned"] == 1
     assert fields["result"]["field_count"] == 3
     assert templates["result"]["template_count"] == 1
     assert media["missing_total"] == 0
-    assert operations["total"] == 5
+    assert operations["total"] == 10
     assert operation["operation"] == "anki_decks_update_config"
-    assert metrics["mutations"]["total"] == 5
+    assert metrics["mutations"]["total"] == 10
 
 
 def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) -> None:
