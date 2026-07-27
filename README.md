@@ -124,58 +124,6 @@ Boolean values accept the forms supported by Pydantic settings, including `true`
 `1`/`0`, and `yes`/`no`. Invalid or unknown configuration causes startup to fail instead of
 silently falling back to a default.
 
-## Native FSRS workflows
-
-The FSRS tools target the pinned `anki==26.5` backend. Collection, synchronization, and deck
-configuration use Anki's supported Python APIs where available. Optimization and simulation
-use Anki 26.5 generated/private backend calls, so other Anki versions are unsupported until
-their schemas and behavior have been validated.
-
-`config_id` is a shared deck preset ID. Discover it with `anki_deck_presets_list` or from
-`anki_deck_options_get`. Enable FSRS collection-wide with
-`anki_scheduler_settings_update(fsrs_enabled=true)` before rescheduling.
-
-### Optimization
-
-1. Call `anki_fsrs_optimize_preview`. Search selection is explicit `search`, then the preset's
-   `param_search`, then all non-suspended cards using that preset.
-2. Inspect training count, health-check result, current/candidate finite 21-value FSRS-6
-   parameters, and the bounded IDs/names of every affected deck.
-3. Call `anki_fsrs_optimize_apply` with identical arguments, the unexpired confirmation token,
-   and an `idempotency_key` stable across retries of the same logical request.
-
-A requested failed health check prevents preview/apply. `health_check=false` is an explicit
-safety bypass. Optimization changes a shared preset and therefore affects every deck using it.
-
-### Simulation
-
-`anki_fsrs_simulate` is read-only. `deck_size` is hypothetical, not inferred from collection
-size. Modes are:
-
-- `review`: estimated review count, new-card count, time in seconds, and knowledge acquisition;
-  `include_daily=true` adds one row per simulated day.
-- `workload`: retention-string keys mapped to cost seconds, memorized cards, and review counts.
-- `optimal_retention`: estimated retention target for the supplied scenario.
-
-### Guarded rescheduling
-
-1. Enable both the `destructive` scope and `ANKI_ALLOW_DESTRUCTIVE`.
-2. Call `anki_fsrs_reschedule_preview` with a changed retention and/or finite 21-value FSRS-6
-   parameter vector.
-3. Call `anki_fsrs_reschedule` with identical change arguments, the unexpired token, and a
-   stable caller-supplied `idempotency_key`.
-
-Execution revalidates scheduling state, creates and verifies a fresh non-empty backup, then
-uses Anki's native rescheduler. A stale/consumed token requires a new preview. Resource-limit
-errors report the operation, configured maximum, observed lower bound, and remediation.
-
-If a response is lost, retry with the same idempotency key and identical arguments. A different
-request with the same key is rejected. A receipt with `outcome_unknown` means local commit
-status could not be established; inspect it with `anki_operations_get` before choosing a new
-key. `discarded_by_full_download` means recovery replaced the local collection and discarded
-the pending local outcome. Synchronization failures after local commit remain visible in the
-durable receipt and can be retried with the original key.
-
 ## Development
 
 Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
