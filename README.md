@@ -4,8 +4,7 @@
 
 `anki-sync-mcp` lets an MCP client safely manage a real Anki collection without Anki
 Desktop or AnkiConnect. It runs as an authenticated Streamable HTTP service, uses Anki's
-official collection and sync APIs, and synchronizes with AnkiWeb or a self-hosted Anki sync
-server.
+collection and sync APIs, and synchronizes with AnkiWeb or a self-hosted Anki sync server.
 
 Unlike desktop bridges, it is designed to run unattended in Docker. Writes are serialized,
 idempotent, persisted across restarts, and synchronized before and after mutation. Destructive
@@ -21,7 +20,7 @@ Requirements: Docker Compose, Python 3 for token generation, and an AnkiWeb or s
 sync account.
 
 ```sh
-git clone https://github.com/YOUR-USERNAME/anki-sync-mcp.git
+git clone https://github.com/raslab/anki-sync-mcp.git
 cd anki-sync-mcp
 
 mkdir -p secrets
@@ -107,7 +106,7 @@ receipts, and backups. Preserve the volume across container recreation.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `ANKI_ALLOW_DESTRUCTIVE` | `false` | Registers delete tools when `MCP_SCOPES` also includes `destructive`. Delete operations require a preview token and create a backup. |
+| `ANKI_ALLOW_DESTRUCTIVE` | `false` | Registers delete and FSRS rescheduling preview/apply tools when `MCP_SCOPES` also includes `destructive`. Applying destructive changes requires a preview token and verified fresh backup. |
 | `ANKI_ALLOW_FULL_SYNC` | `false` | Registers explicit full-download and full-upload recovery tools. It must also be enabled for schema-changing tools. |
 | `ANKI_ALLOW_SCHEMA_CHANGES` | `false` | Registers note-type and template mutation tools when `ANKI_ALLOW_FULL_SYNC` is also enabled. Note-type deletion additionally requires destructive access. |
 | `ANKI_ALLOW_REVIEW_ANSWERS` | `false` | Registers the administrative card-answering tool, which changes scheduling state. |

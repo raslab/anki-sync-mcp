@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Annotated, Any, Literal, NoReturn, TypeVar
+from typing import Annotated, Any, Generic, Literal, NoReturn, TypeVar, cast
 from uuid import uuid4
 
 from anki.errors import NetworkError, SyncError, SyncErrorKind
@@ -34,6 +34,7 @@ from anki_mcp.collection import (
     FullSyncRequiredError,
     IdempotencyConflictError,
     MediaSyncFailedError,
+    ResourceLimitError,
     SyncLoginRequiredError,
 )
 from anki_mcp.config import Settings
@@ -114,10 +115,29 @@ NonNegativeFloat = Annotated[StrictFloat, Field(ge=0)]
 PositiveFloat = Annotated[StrictFloat, Field(gt=0)]
 Steps = Annotated[list[NonNegativeFloat], Field(max_length=100)]
 FsrsParameters = Annotated[list[StrictFloat], Field(max_length=30)]
-FsrsRescheduleParameters = Annotated[list[StrictFloat], Field(min_length=21, max_length=21)]
+FiniteFloat = Annotated[StrictFloat, Field(allow_inf_nan=False)]
+FsrsRescheduleParameters = Annotated[
+    list[FiniteFloat],
+    Field(
+        min_length=21,
+        max_length=21,
+        description="Finite 21-value FSRS-6 parameter vector.",
+    ),
+]
 FsrsSimulationMode = Literal["review", "workload", "optimal_retention"]
 FsrsSimulationDays = Annotated[StrictInt, Field(ge=1, le=730)]
-FsrsSimulationDeckSize = Annotated[StrictInt, Field(ge=1, le=1_000_000)]
+FsrsSimulationDeckSize = Annotated[
+    StrictInt,
+    Field(
+        ge=1,
+        le=1_000_000,
+        description="Hypothetical simulated deck size; it is not inferred from the collection.",
+    ),
+]
+DeckPresetId = Annotated[
+    StrictInt,
+    Field(gt=0, description="Shared deck preset ID from anki_deck_presets_list or deck options."),
+]
 EasyDaysPercentages = Annotated[list[NonNegativeFloat], Field(min_length=7, max_length=7)]
 NewCardInsertOrder = Literal["NEW_CARD_INSERT_ORDER_DUE", "NEW_CARD_INSERT_ORDER_RANDOM"]
 NewCardGatherPriority = Literal[
@@ -289,6 +309,140 @@ class ConfirmationRequiredError(ValueError):
     """Raised when a guarded operation lacks a valid preview token."""
 
 
+class FsrsAffectedDeck(BaseModel):
+    id: int
+    name: str
+
+
+class FsrsOptimizationImpact(BaseModel):
+    config_id: int
+    search: str
+    training_items: int
+    health_check_requested: bool
+    health_check_passed: bool
+    current_parameters: list[float]
+    candidate_parameters: list[float]
+    affected_decks: int
+    affected_deck_ids: list[int]
+    affected_decks_detail: list[FsrsAffectedDeck]
+    state_fingerprint: str
+
+
+class FsrsOptimizationPreviewResult(BaseModel):
+    operation: Literal["anki_fsrs_optimize_apply"]
+    impact: FsrsOptimizationImpact
+    confirmation_token: str
+    expires_in_seconds: int
+
+
+class FsrsOptimizationApplied(BaseModel):
+    config_id: int
+    optimized: Literal[True]
+    search: str
+    training_items: int
+    health_check_requested: bool
+    health_check_passed: bool
+    previous_parameters: list[float]
+    parameters: list[float]
+    affected_decks: int
+    affected_deck_ids: list[int]
+    affected_decks_detail: list[FsrsAffectedDeck]
+
+
+class FsrsMutationReceipt(BaseModel, Generic[T]):  # noqa: UP046
+    idempotency_key: str
+    state: Literal["outcome_unknown", "committed", "discarded_by_full_download"]
+    local_committed: bool | None
+    remote_synced: bool
+    media_synced: bool | None
+    retryable: bool
+    result: T | None
+
+
+class FsrsRescheduleImpact(BaseModel):
+    config_id: int
+    decks: int
+    cards: int
+    desired_retention: float
+    parameters_changed: bool
+    state_fingerprint: str
+
+
+class FsrsReschedulePreviewResult(BaseModel):
+    operation: Literal["anki_fsrs_reschedule"]
+    impact: FsrsRescheduleImpact
+    confirmation_token: str
+    expires_in_seconds: int
+
+
+class BackupReceipt(BaseModel):
+    created: bool
+    path: str
+
+
+class FsrsRescheduleApplied(BaseModel):
+    config_id: int
+    rescheduled: Literal[True]
+    cards: int
+    decks: int
+    desired_retention: float
+    parameters_changed: bool
+    backup: BackupReceipt
+
+
+class FsrsReviewSummary(BaseModel):
+    total_reviews: int
+    total_new_cards: int
+    total_time_seconds: float
+    final_knowledge_acquisition: float
+
+
+class FsrsDailyReview(BaseModel):
+    day: int
+    reviews: int
+    new_cards: int
+    time_seconds: float
+    knowledge_acquisition: float
+
+
+class FsrsSimulationBase(BaseModel):
+    config_id: int
+    search: str
+    days_to_simulate: int
+    deck_size: int
+
+
+class FsrsReviewSimulationResult(FsrsSimulationBase):
+    mode: Literal["review"]
+    summary: FsrsReviewSummary
+    daily: list[FsrsDailyReview] | None = None
+
+
+class FsrsWorkloadRetention(BaseModel):
+    cost_seconds: dict[str, float]
+    memorized_cards: dict[str, float]
+    review_count: dict[str, int]
+
+
+class FsrsWorkloadSimulationResult(FsrsSimulationBase):
+    mode: Literal["workload"]
+    retention: FsrsWorkloadRetention
+    reviewless_end_memorized: float
+
+
+class FsrsOptimalRetentionSimulationResult(FsrsSimulationBase):
+    mode: Literal["optimal_retention"]
+    optimal_retention: float
+
+
+FsrsSimulationResult = Annotated[
+    FsrsReviewSimulationResult
+    | FsrsWorkloadSimulationResult
+    | FsrsOptimalRetentionSimulationResult,
+    Field(discriminator="mode"),
+]
+
+
 def create_app(settings: Settings) -> ASGIApp:
     """Create the complete ASGI application and MCP registry."""
 
@@ -357,6 +511,8 @@ def create_app(settings: Settings) -> ASGIApp:
             raise_tool_error("NOT_FOUND", str(exc), exc)
         except ConfirmationRequiredError as exc:
             raise_tool_error("DESTRUCTIVE_CONFIRMATION_REQUIRED", str(exc), exc)
+        except ResourceLimitError as exc:
+            raise_tool_error("RESOURCE_LIMIT_EXCEEDED", str(exc), exc)
         except ValueError as exc:
             raise_tool_error("INVALID_ARGUMENT", str(exc), exc)
         except SyncLoginRequiredError as exc:
@@ -425,7 +581,7 @@ def create_app(settings: Settings) -> ASGIApp:
                     {"request": guard_request, "impact": current_impact},
                 )
             except ValueError as exc:
-                raise ConfirmationRequiredError(str(exc)) from exc
+                raise ConfirmationRequiredError(f"{exc}; run preview again") from exc
             return adapter.backup_before(lambda: function(adapter))
 
         return await mutate(
@@ -670,25 +826,62 @@ def create_app(settings: Settings) -> ASGIApp:
             ),
         )
 
-    @scoped_tool(name="anki_fsrs_optimize", scope="admin")
-    async def fsrs_optimize(
-        config_id: StableId,
+    @scoped_tool(name="anki_fsrs_optimize_preview", scope="admin")
+    async def fsrs_optimize_preview(
+        config_id: DeckPresetId,
         search: SearchQuery | None = None,
         health_check: StrictBool = True,
-        idempotency_key: IdempotencyKey | None = None,
-    ) -> dict[str, Any]:
-        """Compute and apply native FSRS parameters to one deck preset."""
+    ) -> FsrsOptimizationPreviewResult:
+        """Preview native FSRS-6 optimization for a preset ID without changing it.
+
+        Search defaults to preset param_search, then its non-suspended cards. A requested
+        failed health check is rejected; health_check=false explicitly bypasses that check.
+        The preview reports candidate/current parameters, training count, and affected decks.
+        """
         request = {"config_id": config_id, "search": search, "health_check": health_check}
-        return await mutate(
-            "anki_fsrs_optimize",
-            idempotency_key,
+        result = await preview(
+            "anki_fsrs_optimize_apply",
             request,
-            lambda adapter: adapter.optimize_fsrs(config_id, search, health_check),
+            lambda adapter: adapter.preview_fsrs_optimization(config_id, search, health_check),
         )
+        return FsrsOptimizationPreviewResult.model_validate(result)
+
+    @scoped_tool(name="anki_fsrs_optimize_apply", scope="admin")
+    async def fsrs_optimize_apply(
+        config_id: DeckPresetId,
+        confirmation_token: ConfirmationToken,
+        idempotency_key: IdempotencyKey,
+        search: SearchQuery | None = None,
+        health_check: StrictBool = True,
+    ) -> FsrsMutationReceipt[FsrsOptimizationApplied]:
+        """Apply a matching optimization preview to every deck sharing one preset ID.
+
+        Use identical preview arguments. idempotency_key is required, stable across retries of
+        this logical request, and replays return the durable receipt.
+        """
+        guard_request = {"config_id": config_id, "search": search, "health_check": health_check}
+        request = {**guard_request, "confirmation_token": confirmation_token}
+
+        def guarded(adapter: CollectionAdapter) -> dict[str, Any]:
+            current_impact = adapter.preview_fsrs_optimization(config_id, search, health_check)
+            try:
+                confirmations.consume(
+                    confirmation_token,
+                    "anki_fsrs_optimize_apply",
+                    {"request": guard_request, "impact": current_impact},
+                )
+            except ValueError as exc:
+                raise ConfirmationRequiredError(f"{exc}; run optimization preview again") from exc
+            return adapter.apply_fsrs_optimization(
+                config_id, search, health_check, impact=current_impact
+            )
+
+        result = await mutate("anki_fsrs_optimize_apply", idempotency_key, request, guarded)
+        return FsrsMutationReceipt[FsrsOptimizationApplied].model_validate(result)
 
     @scoped_tool(name="anki_fsrs_simulate", scope="read")
     async def fsrs_simulate(
-        config_id: StableId,
+        config_id: DeckPresetId,
         mode: FsrsSimulationMode,
         deck_size: FsrsSimulationDeckSize,
         days_to_simulate: FsrsSimulationDays,
@@ -696,9 +889,15 @@ def create_app(settings: Settings) -> ASGIApp:
         search: SearchQuery | None = None,
         include_daily: StrictBool = False,
         sync_before: SyncMedia = False,
-    ) -> dict[str, Any]:
-        """Run Anki's native FSRS review, workload, or optimal-retention simulator."""
-        return await execute(
+    ) -> FsrsSimulationResult:
+        """Simulate a preset ID with Anki 26.5 native FSRS without changing the collection.
+
+        review estimates reviews/new cards/time seconds and knowledge acquisition; workload
+        maps retention to cost seconds, memorized cards, and review count; optimal_retention
+        estimates a target. Search defaults to preset param_search, then non-suspended cards.
+        deck_size is hypothetical; include_daily returns exactly days_to_simulate rows.
+        """
+        result = await execute(
             service.coordinated_read(
                 lambda adapter: adapter.simulate_fsrs(
                     config_id,
@@ -712,6 +911,7 @@ def create_app(settings: Settings) -> ASGIApp:
                 sync_before,
             )
         )
+        return cast(FsrsSimulationResult, result)
 
     @scoped_tool(
         name="anki_fsrs_reschedule_preview",
@@ -719,23 +919,29 @@ def create_app(settings: Settings) -> ASGIApp:
         enabled=settings.allow_destructive,
     )
     async def fsrs_reschedule_preview(
-        config_id: StableId,
+        config_id: DeckPresetId,
         desired_retention: Retention | None = None,
         parameters: FsrsRescheduleParameters | None = None,
-    ) -> dict[str, Any]:
-        """Preview cards affected by a native FSRS-setting change and reschedule."""
+    ) -> FsrsReschedulePreviewResult:
+        """Preview native rescheduling after changing one shared preset ID.
+
+        FSRS must first be enabled with anki_scheduler_settings_update. parameters is a finite
+        21-value FSRS-6 vector. This destructive-scope tool requires ANKI_ALLOW_DESTRUCTIVE;
+        execution requires identical change arguments and the unexpired token returned here.
+        """
         request = {
             "config_id": config_id,
             "desired_retention": desired_retention,
             "parameters": parameters,
         }
-        return await preview(
+        result = await preview(
             "anki_fsrs_reschedule",
             request,
             lambda adapter: adapter.preview_fsrs_reschedule(
                 config_id, desired_retention, parameters
             ),
         )
+        return FsrsReschedulePreviewResult.model_validate(result)
 
     @scoped_tool(
         name="anki_fsrs_reschedule",
@@ -743,20 +949,25 @@ def create_app(settings: Settings) -> ASGIApp:
         enabled=settings.allow_destructive,
     )
     async def fsrs_reschedule(
-        config_id: StableId,
+        config_id: DeckPresetId,
         confirmation_token: ConfirmationToken,
+        idempotency_key: IdempotencyKey,
         desired_retention: Retention | None = None,
         parameters: FsrsRescheduleParameters | None = None,
-        idempotency_key: IdempotencyKey | None = None,
-    ) -> dict[str, Any]:
-        """Change FSRS settings and natively reschedule affected cards after preview and backup."""
+    ) -> FsrsMutationReceipt[FsrsRescheduleApplied]:
+        """Apply a matching FSRS reschedule preview after a verified fresh backup.
+
+        The finite 21-value parameters and retention must match preview. idempotency_key is
+        required and must remain stable across retries of this logical request. A stale token
+        requires a new preview. This affects every deck sharing the preset ID.
+        """
         guard_request = {
             "config_id": config_id,
             "desired_retention": desired_retention,
             "parameters": parameters,
         }
         request = {**guard_request, "confirmation_token": confirmation_token}
-        return await guarded_mutate(
+        result = await guarded_mutate(
             "anki_fsrs_reschedule",
             idempotency_key,
             request,
@@ -767,6 +978,7 @@ def create_app(settings: Settings) -> ASGIApp:
             ),
             lambda adapter: adapter.reschedule_fsrs(config_id, desired_retention, parameters),
         )
+        return FsrsMutationReceipt[FsrsRescheduleApplied].model_validate(result)
 
     @scoped_tool(name="anki_deck_presets_create", scope="admin")
     async def deck_presets_create(

@@ -1,17 +1,18 @@
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from anki import scheduler_pb2
+from anki import buildinfo, scheduler_pb2
 from anki._backend_generated import RustBackendGenerated
 from anki.collection import Collection
 from anki.config_pb2 import ConfigKey
 from anki.decks import DeckManager
 
-from anki_mcp.collection import AnkiCollectionService
+from anki_mcp.collection import AnkiCollectionService, ResourceLimitError
 
 
 @pytest.fixture
@@ -136,7 +137,7 @@ async def test_fsrs_simulator_uses_preset_defaults_and_is_compact(
 
     assert compact["mode"] == "review"
     assert compact["config_id"] == 1
-    assert compact["days"] == 30
+    assert compact["days_to_simulate"] == 30
     assert compact["summary"]["total_reviews"] >= 0
     assert compact["summary"]["total_new_cards"] >= 0
     assert "daily" not in compact
@@ -148,7 +149,7 @@ async def test_fsrs_simulator_uses_preset_defaults_and_is_compact(
 async def test_fsrs_optimizer_applies_native_parameters(
     fsrs_collection: tuple[str, int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path, _ = fsrs_collection
+    path, deck_id = fsrs_collection
     optimized = [0.2 + index / 100 for index in range(21)]
 
     def compute_fsrs_params(self, **kwargs):  # type: ignore[no-untyped-def]
@@ -171,12 +172,147 @@ async def test_fsrs_optimizer_applies_native_parameters(
         "optimized": True,
         "search": 'preset:"Default" -is:suspended',
         "training_items": 432,
+        "health_check_requested": True,
         "health_check_passed": True,
         "previous_parameters": [],
         "parameters": pytest.approx(optimized),
         "affected_decks": 2,
+        "affected_deck_ids": [1, deck_id],
+        "affected_decks_detail": [
+            {"id": 1, "name": "Default"},
+            {"id": deck_id, "name": "FSRS"},
+        ],
     }
     assert preset["sections"]["fsrs"]["fsrs_params_6"] == pytest.approx(optimized)
+
+
+@pytest.mark.anyio
+async def test_fsrs_optimizer_supports_a_non_default_shared_preset(
+    fsrs_collection: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, deck_id = fsrs_collection
+    candidate = [0.2 + index / 100 for index in range(21)]
+
+    def compute_fsrs_params(self, **kwargs):  # type: ignore[no-untyped-def]
+        assert 'preset:"Custom FSRS"' in kwargs["search"]
+        return scheduler_pb2.ComputeFsrsParamsResponse(
+            params=candidate,
+            fsrs_items=10,
+            health_check_passed=True,
+        )
+
+    monkeypatch.setattr(RustBackendGenerated, "compute_fsrs_params", compute_fsrs_params)
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        created = await service.create_deck_preset("Custom FSRS", 1)
+        config_id = created["id"]
+        await service.assign_deck_preset(deck_id, config_id)
+        preview = await service.preview_fsrs_optimization(config_id, None, True)
+
+    assert config_id != 1
+    assert preview["affected_decks"] == 1
+    assert preview["affected_deck_ids"] == [deck_id]
+    assert preview["affected_decks_detail"] == [{"id": deck_id, "name": "FSRS"}]
+    assert preview["candidate_parameters"] == pytest.approx(candidate)
+
+
+@pytest.mark.anyio
+async def test_fsrs_optimizer_preview_rejects_failed_health_check_without_mutation(
+    fsrs_collection: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _ = fsrs_collection
+    candidate = [0.2 + index / 100 for index in range(21)]
+
+    def compute_fsrs_params(self, **kwargs):  # type: ignore[no-untyped-def]
+        return scheduler_pb2.ComputeFsrsParamsResponse(
+            params=candidate,
+            fsrs_items=432,
+            health_check_passed=False,
+        )
+
+    monkeypatch.setattr(RustBackendGenerated, "compute_fsrs_params", compute_fsrs_params)
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        before = await service.get_deck_preset(1, ("fsrs",))
+        with pytest.raises(ValueError, match="health check failed"):
+            await service.preview_fsrs_optimization(1, search=None, health_check=True)
+        after = await service.get_deck_preset(1, ("fsrs",))
+
+    assert after == before
+
+
+@pytest.mark.anyio
+async def test_fsrs_optimizer_health_check_can_be_explicitly_bypassed(
+    fsrs_collection: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _ = fsrs_collection
+    candidate = [0.2 + index / 100 for index in range(21)]
+
+    def compute_fsrs_params(self, **kwargs):  # type: ignore[no-untyped-def]
+        assert kwargs["health_check"] is False
+        return scheduler_pb2.ComputeFsrsParamsResponse(
+            params=candidate,
+            fsrs_items=432,
+            health_check_passed=False,
+        )
+
+    monkeypatch.setattr(RustBackendGenerated, "compute_fsrs_params", compute_fsrs_params)
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        preview = await service.preview_fsrs_optimization(1, search=None, health_check=False)
+
+    assert preview["health_check_requested"] is False
+    assert preview["health_check_passed"] is False
+    assert preview["candidate_parameters"] == pytest.approx(candidate)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+async def test_fsrs_reschedule_rejects_non_finite_parameters_before_impact(
+    fsrs_collection: tuple[str, int], value: float
+) -> None:
+    path, _ = fsrs_collection
+    parameters = [0.2 + index / 100 for index in range(21)]
+    parameters[7] = value
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        with pytest.raises(ValueError, match="parameter 7 must be finite"):
+            await service.preview_fsrs_reschedule(1, 0.91, parameters)
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_rejects_native_invalid_finite_parameters_before_impact(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    path, _ = fsrs_collection
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        with pytest.raises(ValueError, match="invalid FSRS parameters"):
+            await service.preview_fsrs_reschedule(1, 0.91, [-1.0] * 21)
+
+
+@pytest.mark.anyio
+async def test_fsrs_simulation_covers_workload_and_daily_output_contracts(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    path, _ = fsrs_collection
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        workload = await service.simulate_fsrs(1, "workload", 100, 30, None, None, False)
+        review = await service.simulate_fsrs(1, "review", 100, 30, None, None, True)
+
+    assert workload["mode"] == "workload"
+    assert set(workload["retention"]) == {
+        "cost_seconds",
+        "memorized_cards",
+        "review_count",
+    }
+    assert review["days_to_simulate"] == 30
+    assert len(review["daily"]) == 30
+    assert set(review["daily"][0]) == {
+        "day",
+        "reviews",
+        "new_cards",
+        "time_seconds",
+        "knowledge_acquisition",
+    }
 
 
 @pytest.mark.anyio
@@ -209,6 +345,7 @@ async def test_fsrs_operations_bound_the_selected_search_not_the_collection(
 ) -> None:
     path, _ = fsrs_collection
     optimized = [0.2 + index / 100 for index in range(21)]
+    _add_review_state_card(path, 1, "Unselected default card")
 
     def compute_fsrs_params(self, **kwargs):  # type: ignore[no-untyped-def]
         return scheduler_pb2.ComputeFsrsParamsResponse(
@@ -220,7 +357,7 @@ async def test_fsrs_operations_bound_the_selected_search_not_the_collection(
     monkeypatch.setattr(RustBackendGenerated, "compute_fsrs_params", compute_fsrs_params)
 
     async with AnkiCollectionService(
-        path, max_page_size=100, max_search_scan=1
+        path, max_page_size=100, max_search_scan=2
     ) as service:
         optimized_result = await service.optimize_fsrs(
             1, search="deck:FSRS -is:new", health_check=True
@@ -231,6 +368,28 @@ async def test_fsrs_operations_bound_the_selected_search_not_the_collection(
 
     assert optimized_result["training_items"] == 1
     assert simulated["summary"]["total_reviews"] >= 0
+
+
+@pytest.mark.anyio
+async def test_fsrs_selected_search_stops_after_limit_plus_one(
+    fsrs_collection: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _ = fsrs_collection
+    original = Collection.find_cards
+    observed_orders: list[object] = []
+
+    def bounded_find_cards(self, query, order=False, reverse=False):  # type: ignore[no-untyped-def]
+        observed_orders.append(order)
+        return original(self, query, order=order, reverse=reverse)
+
+    monkeypatch.setattr(Collection, "find_cards", bounded_find_cards)
+    async with AnkiCollectionService(
+        path, max_page_size=100, max_search_scan=1
+    ) as service:
+        with pytest.raises(ResourceLimitError, match="observed_at_least=2"):
+            await service.preview_fsrs_optimization(1, search="deck:FSRS", health_check=True)
+
+    assert observed_orders == ["c.id asc limit 2"]
 
 
 @pytest.mark.anyio
@@ -280,6 +439,46 @@ async def test_fsrs_reschedule_fingerprint_tracks_card_eligibility(
     assert before["cards"] == 1
     assert after["cards"] == 0
     assert after["state_fingerprint"] != before["state_fingerprint"]
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_fingerprint_tracks_per_deck_retention_override(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    path, deck_id = fsrs_collection
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        before = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+        await service.update_deck_limits(
+            deck_id, "this_deck", {"desired_retention": 0.88}, ()
+        )
+        after = await service.preview_fsrs_reschedule(1, 0.91, None)
+
+    assert after["state_fingerprint"] != before["state_fingerprint"]
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_honors_per_deck_retention_override(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    path, deck_id = fsrs_collection
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        card_id = (await service.search_cards("deck:FSRS -is:new", 0, 1))["items"][0]["id"]
+        before = await service.get_card(card_id)
+        await service.update_deck_limits(
+            deck_id, "this_deck", {"desired_retention": 0.88}, ()
+        )
+        preview = await service.preview_fsrs_reschedule(1, 0.91, None)
+        result = await service.reschedule_fsrs(1, 0.91, None)
+        after = await service.get_card(card_id)
+        options = await service.get_deck_options(deck_id)
+
+    assert preview["cards"] == 1
+    assert result["rescheduled"] is True
+    assert after["scheduling"]["due"] == before["scheduling"]["due"]
+    assert options["limits"]["this_deck"]["desired_retention"] == pytest.approx(0.88)
 
 
 @pytest.mark.anyio
@@ -512,7 +711,7 @@ async def test_fsrs_reschedule_candidate_discovery_rejects_one_over_limit_before
         await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
         with pytest.raises(
             ValueError,
-            match=r"preset 1 across 2 decks exceeds MCP_MAX_SEARCH_SCAN=2 candidate cards",
+            match=r"preset 1 across 2 decks: maximum=2, observed_at_least=3 candidate cards",
         ):
             await service.preview_fsrs_reschedule(1, 0.91, None)
 
@@ -529,7 +728,7 @@ async def test_fsrs_reschedule_rejects_preset_deck_scope_over_limit(
         await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
         with pytest.raises(
             ValueError,
-            match=r"preset 1 exceeds MCP_MAX_SEARCH_SCAN=1 decks",
+            match=r"preset 1: maximum=1, observed_at_least=2 decks",
         ):
             await service.preview_fsrs_reschedule(1, 0.91, None)
 
@@ -692,3 +891,41 @@ async def test_fsrs_reschedule_preview_requires_fsrs_to_be_enabled(
     async with AnkiCollectionService(path, max_page_size=100) as service:
         with pytest.raises(ValueError, match="must be enabled"):
             await service.preview_fsrs_reschedule(1, 0.91, None)
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_rejects_malformed_ignore_date(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    path, _ = fsrs_collection
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        await service.update_deck_preset(
+            1, None, {"ignore_revlogs_before_date": "not-a-date"}
+        )
+        with pytest.raises(ValueError, match="YYYY-MM-DD"):
+            await service.preview_fsrs_reschedule(1, 0.91, None)
+
+
+@pytest.mark.anyio
+async def test_anki_26_5_native_fsrs_compatibility_smoke(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    """Exercise each pinned native backend path separately from mocked contract tests."""
+    path, _ = fsrs_collection
+    assert buildinfo.version == "26.05"
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        try:
+            await service.preview_fsrs_optimization(1, None, True)
+        except ValueError as exc:
+            assert "not enough review history" in str(exc)
+        for mode in ("review", "workload", "optimal_retention"):
+            result = await service.simulate_fsrs(1, mode, 100, 7, None, None, True)
+            assert result["mode"] == mode
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        impact = await service.preview_fsrs_reschedule(1, 0.91, None)
+        applied = await service.reschedule_fsrs(1, 0.91, None)
+
+    assert impact["cards"] == 1
+    assert applied["rescheduled"] is True

@@ -1,6 +1,6 @@
 # FSRS Independent Review Backlog
 
-Status: deferred for later implementation  
+Status: P0 and P1 implemented; P2 items remain deferred
 Reviewed commit: `32a890fc49b26a76e5b2f9e20281a269d9641468`  
 Review date: 2026-07-27
 

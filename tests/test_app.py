@@ -15,6 +15,7 @@ from anki.sync_pb2 import MediaSyncStatusResponse
 from starlette.testclient import TestClient
 
 from anki_mcp.app import create_app
+from anki_mcp.collection import CollectionAdapter, ResourceLimitError
 from anki_mcp.config import Settings
 
 
@@ -214,7 +215,8 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_decks_update_config",
         "anki_deck_limits_update",
         "anki_scheduler_settings_update",
-        "anki_fsrs_optimize",
+        "anki_fsrs_optimize_preview",
+        "anki_fsrs_optimize_apply",
         "anki_fsrs_simulate",
         "anki_fsrs_reschedule_preview",
         "anki_fsrs_reschedule",
@@ -311,6 +313,26 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     assert simulator["mode"]["enum"] == ["review", "workload", "optimal_retention"]
     assert simulator["days_to_simulate"]["maximum"] == 730
     assert simulator["deck_size"]["maximum"] == 1_000_000
+    assert "hypothetical" in simulator["deck_size"]["description"].lower()
+    assert "preset ID" in by_name["anki_fsrs_simulate"]["description"]
+    assert "21" in by_name["anki_fsrs_reschedule_preview"]["description"]
+    assert "stable across retries" in by_name["anki_fsrs_optimize_apply"]["description"]
+    assert "outputSchema" in by_name["anki_fsrs_simulate"]
+    assert "outputSchema" in by_name["anki_fsrs_optimize_preview"]
+    assert "outputSchema" in by_name["anki_fsrs_optimize_apply"]
+    assert "outputSchema" in by_name["anki_fsrs_reschedule_preview"]
+    assert "outputSchema" in by_name["anki_fsrs_reschedule"]
+    assert "idempotency_key" in by_name["anki_fsrs_optimize_apply"]["inputSchema"]["required"]
+    assert "idempotency_key" in by_name["anki_fsrs_reschedule"]["inputSchema"]["required"]
+    mutation_state = by_name["anki_fsrs_optimize_apply"]["outputSchema"]["properties"]["state"]
+    assert mutation_state["enum"] == [
+        "outcome_unknown",
+        "committed",
+        "discarded_by_full_download",
+    ]
+    simulation_output = by_name["anki_fsrs_simulate"]["outputSchema"]
+    simulation_result = simulation_output["properties"]["result"]
+    assert simulation_result["discriminator"]["propertyName"] == "mode"
     assert (
         by_name["anki_fsrs_reschedule"]["inputSchema"]["properties"]["confirmation_token"][
             "type"
@@ -784,6 +806,26 @@ def test_fsrs_tools_work_through_json_rpc(
         assert isinstance(parsed, dict)
         return parsed
 
+    def call_error(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        nonlocal request_id
+        response = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+        )
+        request_id += 1
+        result = response.json()["result"]
+        assert result["isError"] is True
+        text = result["content"][0]["text"]
+        parsed = json.loads(text[text.index("{") :])
+        assert isinstance(parsed, dict)
+        return parsed
+
     enabled = call("anki_scheduler_settings_update", {"fsrs_enabled": True})
     simulated = call(
         "anki_fsrs_simulate",
@@ -792,27 +834,218 @@ def test_fsrs_tools_work_through_json_rpc(
             "mode": "review",
             "deck_size": 1000,
             "days_to_simulate": 30,
+            "include_daily": True,
         },
     )
-    optimized_result = call("anki_fsrs_optimize", {"config_id": 1})
+    workload = call(
+        "anki_fsrs_simulate",
+        {
+            "config_id": 1,
+            "mode": "workload",
+            "deck_size": 1000,
+            "days_to_simulate": 30,
+        },
+    )
+    optimal = call(
+        "anki_fsrs_simulate",
+        {
+            "config_id": 1,
+            "mode": "optimal_retention",
+            "deck_size": 1000,
+            "days_to_simulate": 30,
+        },
+    )
+    optimized_preview = call("anki_fsrs_optimize_preview", {"config_id": 1})
+    optimized_result = call(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "confirmation_token": optimized_preview["confirmation_token"],
+            "idempotency_key": "optimize-default-preset",
+        },
+    )
+    replayed_optimization = call(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "confirmation_token": optimized_preview["confirmation_token"],
+            "idempotency_key": "optimize-default-preset",
+        },
+    )
+    conflict = call_error(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "search": "deck:Languages::Spanish",
+            "confirmation_token": optimized_preview["confirmation_token"],
+            "idempotency_key": "optimize-default-preset",
+        },
+    )
+    cleanup_preview = call("anki_fsrs_optimize_preview", {"config_id": 1})
+    cleanup_key = "optimize-invalid-input-cleanup"
+    invalid_apply = call_error(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "confirmation_token": "invalid-token",
+            "idempotency_key": cleanup_key,
+        },
+    )
+    cleaned_up_apply = call(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "confirmation_token": cleanup_preview["confirmation_token"],
+            "idempotency_key": cleanup_key,
+        },
+    )
+    health_preview = call("anki_fsrs_optimize_preview", {"config_id": 1})
+    monkeypatch.setattr(
+        RustBackendGenerated,
+        "compute_fsrs_params",
+        lambda self, **kwargs: scheduler_pb2.ComputeFsrsParamsResponse(
+            params=optimized,
+            fsrs_items=500,
+            health_check_passed=False,
+        ),
+    )
+    health_failure = call_error(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "confirmation_token": health_preview["confirmation_token"],
+            "idempotency_key": "optimize-health-failure-cleanup",
+        },
+    )
+    monkeypatch.setattr(RustBackendGenerated, "compute_fsrs_params", compute_fsrs_params)
+    health_retry_preview = call("anki_fsrs_optimize_preview", {"config_id": 1})
+    health_retry = call(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "confirmation_token": health_retry_preview["confirmation_token"],
+            "idempotency_key": "optimize-health-failure-cleanup",
+        },
+    )
+    interrupted_preview = call("anki_fsrs_optimize_preview", {"config_id": 1})
+    interrupted_args = {
+        "config_id": 1,
+        "confirmation_token": interrupted_preview["confirmation_token"],
+        "idempotency_key": "optimize-outcome-unknown",
+    }
+    original_apply = CollectionAdapter.apply_fsrs_optimization
+    monkeypatch.setattr(
+        CollectionAdapter,
+        "apply_fsrs_optimization",
+        lambda self, config_id, search, health_check, impact=None: (_ for _ in ()).throw(
+            RuntimeError("native backend interrupted")
+        ),
+    )
+    interrupted = call_error("anki_fsrs_optimize_apply", interrupted_args)
+    monkeypatch.setattr(CollectionAdapter, "apply_fsrs_optimization", original_apply)
+    recovered_unknown = call("anki_fsrs_optimize_apply", interrupted_args)
+
+    monkeypatch.setattr(
+        RustBackendGenerated,
+        "compute_fsrs_params",
+        lambda self, **kwargs: (_ for _ in ()).throw(RuntimeError("native backend failed")),
+    )
+    backend_failure = call_error("anki_fsrs_optimize_preview", {"config_id": 1})
+    monkeypatch.setattr(RustBackendGenerated, "compute_fsrs_params", compute_fsrs_params)
+    changed_parameters = [optimized[0] + 0.01, *optimized[1:]]
     preview = call(
         "anki_fsrs_reschedule_preview",
-        {"config_id": 1, "desired_retention": 0.91},
+        {
+            "config_id": 1,
+            "desired_retention": 0.91,
+            "parameters": changed_parameters,
+        },
     )
     rescheduled = call(
         "anki_fsrs_reschedule",
         {
             "config_id": 1,
             "desired_retention": 0.91,
+            "parameters": changed_parameters,
             "confirmation_token": preview["confirmation_token"],
+            "idempotency_key": "reschedule-default-preset",
         },
     )
 
     assert enabled["result"]["fsrs_enabled"] is True
     assert simulated["mode"] == "review"
+    assert len(simulated["daily"]) == 30
+    assert workload["mode"] == "workload"
+    assert optimal["mode"] == "optimal_retention"
     assert optimized_result["result"]["training_items"] == 500
+    assert optimized_result["idempotency_key"] == "optimize-default-preset"
+    assert replayed_optimization == optimized_result
+    assert conflict["code"] == "CONFLICT"
+    assert invalid_apply["code"] == "DESTRUCTIVE_CONFIRMATION_REQUIRED"
+    assert cleaned_up_apply["state"] == "committed"
+    assert health_failure["code"] == "INVALID_ARGUMENT"
+    assert health_retry["state"] == "committed"
+    assert interrupted["code"] == "INTERNAL_ERROR"
+    assert recovered_unknown["state"] == "outcome_unknown"
+    assert recovered_unknown["result"] is None
+    assert backend_failure["code"] == "INTERNAL_ERROR"
     assert rescheduled["result"]["rescheduled"] is True
+    assert rescheduled["result"]["parameters_changed"] is True
     assert rescheduled["result"]["backup"]["path"]
+
+    spanish_deck = next(
+        deck for deck in call("anki_decks_list", {"offset": 0, "limit": 20})["items"]
+        if deck["name"] == "Languages::Spanish"
+    )
+    stale_preview = call(
+        "anki_fsrs_reschedule_preview", {"config_id": 1, "desired_retention": 0.92}
+    )
+
+    def sync_changes_fsrs_state(adapter: CollectionAdapter) -> None:
+        adapter.update_deck_limits(
+            spanish_deck["id"], "this_deck", {"desired_retention": 0.88}, ()
+        )
+
+    service = client.app.app.state.collection_service
+    service.executor.submit(lambda adapter: setattr(adapter, "sync_on_write", True)).result()
+    monkeypatch.setattr(
+        CollectionAdapter,
+        "_sync_or_raise_full_sync",
+        lambda self, sync_media: sync_changes_fsrs_state(self),
+    )
+    stale = call_error(
+        "anki_fsrs_reschedule",
+        {
+            "config_id": 1,
+            "desired_retention": 0.92,
+            "confirmation_token": stale_preview["confirmation_token"],
+            "idempotency_key": "reschedule-after-sync-change",
+        },
+    )
+    assert stale["code"] == "DESTRUCTIVE_CONFIRMATION_REQUIRED"
+    assert "preview again" in stale["message"]
+
+    def discard_pending_optimization(adapter: CollectionAdapter) -> None:
+        recorded = adapter._state.get_receipt("optimize-default-preset")
+        assert recorded is not None
+        operation, request_hash, receipt = recorded
+        receipt["remote_synced"] = False
+        adapter._state.put_receipt(
+            "optimize-default-preset", operation, request_hash, receipt
+        )
+        adapter._state.mark_pending_discarded_by_full_download()
+
+    service.executor.submit(discard_pending_optimization).result()
+    discarded = call(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "confirmation_token": optimized_preview["confirmation_token"],
+            "idempotency_key": "optimize-default-preset",
+        },
+    )
+    assert discarded["state"] == "discarded_by_full_download"
+    assert discarded["result"] is None
 
 
 def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) -> None:
@@ -1160,6 +1393,14 @@ def test_sync_failures_have_safe_machine_readable_codes(
         ("anki_cards_set_flag", {"card_ids": [1], "flag": 8}),
         ("anki_cards_reposition", {"card_ids": [1], "starting_from": 0}),
         ("anki_cards_set_flag", {"card_ids": [1], "flag": 1, "unexpected": True}),
+        (
+            "anki_fsrs_reschedule_preview",
+            {"config_id": 1, "parameters": [float("nan")] * 21},
+        ),
+        (
+            "anki_fsrs_reschedule_preview",
+            {"config_id": 1, "parameters": [float("inf")] * 21},
+        ),
     ],
 )
 def test_argument_validation_has_stable_machine_readable_error(
@@ -1184,16 +1425,20 @@ def test_argument_validation_has_stable_machine_readable_error(
         },
     )
     headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
-    response = client.post(
-        "/mcp",
-        headers=headers,
-        json={
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": name, "arguments": arguments},
-        },
-    )
+    request = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    }
+    if name == "anki_fsrs_reschedule_preview":
+        response = client.post(
+            "/mcp",
+            headers={**headers, "Content-Type": "application/json"},
+            content=json.dumps(request),
+        )
+    else:
+        response = client.post("/mcp", headers=headers, json=request)
 
     result = response.json()["result"]
     text = result["content"][0]["text"]
@@ -1610,7 +1855,9 @@ def test_read_tools_have_protocol_happy_paths(client: TestClient) -> None:
     assert card["deck_name"] == "Languages::Spanish"
 
 
-def test_tool_errors_are_machine_readable(client: TestClient) -> None:
+def test_tool_errors_are_machine_readable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     headers = {
         "Authorization": "Bearer correct-token",
         "Accept": "application/json, text/event-stream",
@@ -1653,10 +1900,24 @@ def test_tool_errors_are_machine_readable(client: TestClient) -> None:
     invalid = error_for("anki_cards_search", {"query": "", "limit": 0}, 3)
     sync_auth = error_for("anki_sync", {}, 4)
     destructive = error_for("anki_decks_delete", {"deck_id": 1}, 5)
+    monkeypatch.setattr(
+        CollectionAdapter,
+        "preview_fsrs_reschedule",
+        lambda self, config_id, desired_retention, parameters: (_ for _ in ()).throw(
+            ResourceLimitError(
+                "FSRS reschedule: maximum=1, observed_at_least=2; split scope"
+            )
+        ),
+    )
+    limited = error_for(
+        "anki_fsrs_reschedule_preview", {"config_id": 1, "desired_retention": 0.91}, 6
+    )
     assert missing["code"] == "NOT_FOUND"
     assert invalid["code"] == "INVALID_ARGUMENT"
     assert sync_auth["code"] == "AUTHENTICATION_FAILED"
     assert destructive["code"] == "INVALID_ARGUMENT"
+    assert limited["code"] == "RESOURCE_LIMIT_EXCEEDED"
+    assert "maximum=1" in limited["message"]
     assert missing["correlation_id"]
     assert invalid["correlation_id"]
 
