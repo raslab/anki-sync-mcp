@@ -20,6 +20,7 @@ from anki.collection import AddNoteRequest, Collection
 from anki.errors import NetworkError, NotFoundError
 from anki.sync import SyncAuth
 from anki.utils import field_checksum
+from google.protobuf.json_format import MessageToDict
 
 from anki_mcp.config import validate_sync_migration_endpoint
 from anki_mcp.state import PersistentState
@@ -1319,6 +1320,7 @@ class CollectionAdapter:
         answer, answer_truncated = self._truncate_rendered(card.answer())
         deck_name, deck_name_truncated = self._truncate_rendered(str(deck["name"]))
         note = card.note()
+        stats = self.collection.card_stats_data(card.id)
         fields: list[dict[str, Any]] = []
         note_items = note.items()
         for name, value in note_items[: self.max_card_fields]:
@@ -1357,6 +1359,194 @@ class CollectionAdapter:
                 "lapses": int(card.lapses),
                 "left": int(card.left),
             },
+            "review_summary": {
+                "added_at": int(stats.added),
+                "first_review_at": int(stats.first_review) or None,
+                "latest_review_at": int(stats.latest_review) or None,
+                "reviews": int(stats.reviews),
+                "lapses": int(stats.lapses),
+                "average_answer_seconds": float(stats.average_secs),
+                "total_answer_seconds": float(stats.total_secs),
+                "preset": str(stats.preset),
+                "original_deck": str(stats.original_deck) or None,
+            },
+            "fsrs": {
+                "memory_state": (
+                    {
+                        "stability": float(stats.memory_state.stability),
+                        "difficulty": float(stats.memory_state.difficulty),
+                    }
+                    if stats.HasField("memory_state")
+                    else None
+                ),
+                "retrievability": (
+                    float(stats.fsrs_retrievability)
+                    if stats.HasField("memory_state")
+                    else None
+                ),
+                "desired_retention": (
+                    float(stats.desired_retention) if stats.HasField("memory_state") else None
+                ),
+                "parameters": [float(value) for value in stats.fsrs_params],
+            },
+        }
+
+    def _review_scope(
+        self,
+        card_id: int | None,
+        deck_id: int | None,
+        query: str | None,
+        include_children: bool,
+    ) -> tuple[list[int], str, dict[str, Any], str]:
+        selectors = (card_id is not None, deck_id is not None, query is not None)
+        if sum(selectors) != 1:
+            raise ValueError("exactly one of card_id, deck_id, or query must be provided")
+        if include_children and deck_id is None:
+            raise ValueError("include_children is only valid with deck_id")
+
+        if card_id is not None:
+            try:
+                self.collection.get_card(cast("CardId", card_id))
+            except NotFoundError as exc:
+                raise LookupError(f"card {card_id} not found") from exc
+            search = f"cid:{card_id}"
+            scope = {"kind": "card", "card_id": card_id}
+            attribution = "exact_card"
+        elif deck_id is not None:
+            deck = self.get_deck(deck_id)
+            deck_ids = [deck_id]
+            if include_children:
+                deck_name = str(deck["name"])
+                deck_ids.extend(
+                    int(item.id)
+                    for item in self.collection.decks.all_names_and_ids()
+                    if item.name.startswith(f"{deck_name}::")
+                )
+            search = " OR ".join(f"did:{value}" for value in deck_ids)
+            scope = {
+                "kind": "deck",
+                "deck_id": deck_id,
+                "include_children": include_children,
+            }
+            attribution = "current_card_membership"
+        else:
+            search = cast(str, query)
+            scope = {"kind": "query", "query": search}
+            attribution = "current_card_membership"
+
+        card_ids = [int(value) for value in self.collection.find_cards(search)]
+        if len(card_ids) > self.max_search_scan:
+            raise ValueError(
+                "review scope exceeds MCP_MAX_SEARCH_SCAN; narrow the scope or raise the bound"
+            )
+        return card_ids, search, scope, attribution
+
+    def _review_log_count(self, card_ids: list[int]) -> int:
+        database = self.collection.db
+        if database is None:  # pragma: no cover - reads only run against an open collection
+            raise RuntimeError("collection database is unavailable")
+        total = 0
+        for start in range(0, len(card_ids), 500):
+            chunk = card_ids[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            total += int(
+                database.scalar(f"select count() from revlog where cid in ({placeholders})", *chunk)
+                or 0
+            )
+        return total
+
+    @staticmethod
+    def _review_event(card_id: int, entry: Any) -> dict[str, Any]:
+        rating = int(entry.button_chosen)
+        kinds = ("learning", "review", "relearning", "filtered", "manual", "rescheduled")
+        kind = int(entry.review_kind)
+        return {
+            "card_id": card_id,
+            "reviewed_at": int(entry.time),
+            "review_kind": kinds[kind] if 0 <= kind < len(kinds) else "unknown",
+            "rating": rating,
+            "rating_label": ("", "Again", "Hard", "Good", "Easy")[rating]
+            if 1 <= rating <= 4
+            else None,
+            "interval_seconds": int(entry.interval),
+            "previous_interval_seconds": int(entry.last_interval),
+            "answer_seconds": float(entry.taken_secs),
+            "ease": int(entry.ease),
+            "memory_state": (
+                {
+                    "stability": float(entry.memory_state.stability),
+                    "difficulty": float(entry.memory_state.difficulty),
+                }
+                if entry.HasField("memory_state")
+                else None
+            ),
+        }
+
+    def list_reviews(
+        self,
+        card_id: int | None,
+        deck_id: int | None,
+        query: str | None,
+        include_children: bool,
+        offset: int,
+        limit: int,
+        order: str,
+    ) -> dict[str, Any]:
+        self._page([], offset, limit)
+        if order not in {"newest", "oldest"}:
+            raise ValueError("order must be newest or oldest")
+        card_ids, _, scope, attribution = self._review_scope(
+            card_id, deck_id, query, include_children
+        )
+        total = self._review_log_count(card_ids)
+        if total > self.max_search_scan:
+            raise ValueError(
+                "review history exceeds MCP_MAX_SEARCH_SCAN; narrow the scope or raise the bound"
+            )
+        events = [
+            self._review_event(current_card_id, entry)
+            for current_card_id in card_ids
+            for entry in self.collection.get_review_logs(cast("CardId", current_card_id))
+        ]
+        events.sort(
+            key=lambda event: (event["reviewed_at"], event["card_id"]),
+            reverse=order == "newest",
+        )
+        return {
+            "items": events[offset : offset + limit],
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "has_more": offset + limit < total,
+            "scope": scope,
+            "attribution": attribution,
+        }
+
+    def review_stats(
+        self,
+        card_id: int | None,
+        deck_id: int | None,
+        query: str | None,
+        include_children: bool,
+        days: int,
+    ) -> dict[str, Any]:
+        if days not in {0, 30, 90, 365}:
+            raise ValueError("days must be one of 0, 30, 90, or 365")
+        _, search, scope, attribution = self._review_scope(
+            card_id, deck_id, query, include_children
+        )
+        graphs = self.collection._backend.graphs(  # pyright: ignore[reportPrivateUsage]
+            search=search, days=days
+        )
+        return {
+            "scope": scope,
+            "attribution": attribution,
+            "days": days,
+            "graphs": MessageToDict(
+                graphs,
+                preserving_proto_field_name=True,
+                always_print_fields_with_no_presence=True,
+            ),
         }
 
     def _basic_model(self) -> dict[str, Any]:
@@ -1956,6 +2146,36 @@ class AnkiCollectionService:
 
     async def get_card(self, card_id: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.get_card(card_id))
+
+    async def list_reviews(
+        self,
+        card_id: int | None,
+        deck_id: int | None,
+        query: str | None,
+        include_children: bool,
+        offset: int,
+        limit: int,
+        order: str,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.list_reviews(
+                card_id, deck_id, query, include_children, offset, limit, order
+            )
+        )
+
+    async def review_stats(
+        self,
+        card_id: int | None,
+        deck_id: int | None,
+        query: str | None,
+        include_children: bool,
+        days: int,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.review_stats(
+                card_id, deck_id, query, include_children, days
+            )
+        )
 
     async def create_card(self, deck_id: int, front: str, back: str) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.create_card(deck_id, front, back))
