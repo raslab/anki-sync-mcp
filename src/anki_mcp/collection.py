@@ -14,10 +14,12 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, TypeVar, cast
-from zipfile import BadZipFile, ZipFile
+from zipfile import ZipFile
 
 import anki.lang
+from anki._backend import RustBackend
 from anki.collection import AddNoteRequest, Collection
 from anki.config_pb2 import ConfigKey
 from anki.consts import CARD_TYPE_REV, QUEUE_TYPE_SUSPENDED
@@ -310,23 +312,44 @@ class CollectionAdapter:
             )
         }
         selected = fresh if native_created else candidates
-        path = max(selected, key=lambda item: item.stat().st_mtime_ns) if selected else None
+        path = next(
+            (
+                candidate
+                for candidate in sorted(
+                    selected, key=lambda item: item.stat().st_mtime_ns, reverse=True
+                )
+                if self._is_valid_backup(candidate)
+            ),
+            None,
+        )
         return {
             "requested": True,
-            "created": bool(native_created and fresh),
+            "created": bool(native_created and path is not None),
             "path": str(path) if path is not None else None,
         }
 
-    @staticmethod
-    def _is_valid_backup(path: Path) -> bool:
+    def _is_valid_backup(self, path: Path) -> bool:
         if not path.is_file() or path.is_symlink() or path.stat().st_size <= 0:
             return False
         try:
             with ZipFile(path) as archive:
                 members = set(archive.namelist())
-                required = {"meta", "collection.anki21b", "media"}
-                return required <= members and archive.testzip() is None
-        except (BadZipFile, OSError, RuntimeError):
+                required = {"meta", "collection.anki21b", "collection.anki2", "media"}
+                if not required <= members or archive.testzip() is not None:
+                    return False
+            with TemporaryDirectory(prefix="anki-mcp-backup-check-") as temporary:
+                restore_folder = Path(temporary)
+                media_folder = restore_folder / "media"
+                media_folder.mkdir()
+                restored_collection = restore_folder / "collection.anki2"
+                RustBackend().import_collection_package(
+                    col_path=str(restored_collection),
+                    backup_path=str(path),
+                    media_folder=str(media_folder),
+                    media_db=str(restore_folder / "media.db2"),
+                )
+                return restored_collection.is_file() and restored_collection.stat().st_size > 0
+        except Exception:
             return False
 
     def backup_before(self, mutation: Callable[[], dict[str, Any]]) -> dict[str, Any]:
@@ -334,7 +357,7 @@ class CollectionAdapter:
         backup = self.create_backup()
         path = backup.get("path")
         backup_path = Path(path) if isinstance(path, str) else None
-        if backup_path is None or not self._is_valid_backup(backup_path):
+        if backup_path is None:
             raise BackupFailedError("required current pre-operation backup is unavailable")
         return {**mutation(), "backup": backup}
 
