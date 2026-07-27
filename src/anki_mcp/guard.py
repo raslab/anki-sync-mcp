@@ -57,15 +57,20 @@ class ConfirmationRegistry:
         )
         return token
 
-    def consume(self, token: str, operation: str, request: dict[str, Any]) -> None:
+    def validate(self, token: str, operation: str, request: dict[str, Any]) -> None:
+        """Validate a token without consuming it before pre-mutation safety gates."""
         now = self._clock()
-        confirmation = self._tokens.pop(token, None)
+        confirmation = self._tokens.get(token)
         if confirmation is None:
             raise ValueError("confirmation token is invalid or already used")
         if confirmation.expires_at <= now:
+            self._tokens.pop(token, None)
             raise ValueError("confirmation token expired")
         if confirmation.operation != operation or confirmation.request_hash != self._request_hash(
             operation, request
         ):
-            self._tokens[token] = confirmation
             raise ValueError("confirmation token does not match this request")
+
+    def consume(self, token: str, operation: str, request: dict[str, Any]) -> None:
+        self.validate(token, operation, request)
+        self._tokens.pop(token)

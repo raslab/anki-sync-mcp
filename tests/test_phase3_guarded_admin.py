@@ -203,14 +203,64 @@ def test_schema_tools_require_full_sync_maintenance_and_preview(
         assert Path(receipt["result"]["backup"]["path"]).is_file()
 
 
+def test_schema_apply_accepts_explicit_current_backup(
+    phase3_settings: Settings,
+) -> None:
+    with TestClient(create_app(phase3_settings)) as client:
+        _, call = _session(client)
+        failed, note_types = call("anki_note_types_list", {})
+        assert failed is False
+        note_type_id = note_types["items"][0]["id"]
+        failed, before = call("anki_note_types_get", {"note_type_id": note_type_id})
+        assert failed is False
+        mappings = [
+            {
+                "source_ordinal": template["ordinal"],
+                "name": template["name"],
+                "question_format": template["question_format"] + " explicit backup",
+                "answer_format": template["answer_format"],
+            }
+            for template in before["templates"]
+        ]
+        failed, preview = call(
+            "anki_note_types_change_preview",
+            {
+                "operation": "templates_update",
+                "note_type_id": note_type_id,
+                "template_mappings": mappings,
+            },
+        )
+        assert failed is False
+        assert preview["impact"]["backup_required"] is True
+        assert preview["impact"]["full_sync_required"] is True
+
+        failed, backup = call("anki_backup_create", {})
+        assert failed is False
+        assert backup["created"] is True
+        assert Path(backup["path"]).is_file()
+
+        failed, receipt = call(
+            "anki_templates_update",
+            {
+                "note_type_id": note_type_id,
+                "mappings": mappings,
+                "confirmation_token": preview["confirmation_token"],
+                "idempotency_key": "schema-explicit-backup",
+            },
+        )
+
+        assert failed is False
+        assert receipt["result"]["template_count"] == len(mappings)
+        assert receipt["result"]["backup"]["created"] is False
+        assert receipt["result"]["backup"]["path"] == backup["path"]
+
+
 def test_schema_apply_reports_backup_gate_failure_and_logs_correlation(
     phase3_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    backup_folder = phase3_settings.collection_path.parent / "backups"
-    backup_folder.mkdir()
-    (backup_folder / "existing.colpkg").write_bytes(b"existing backup")
+    native_create_backup = Collection.create_backup
     monkeypatch.setattr(Collection, "create_backup", lambda *args, **kwargs: False)
 
     with TestClient(create_app(phase3_settings)) as client:
@@ -264,6 +314,19 @@ def test_schema_apply_reports_backup_gate_failure_and_logs_correlation(
         failed, after = call("anki_note_types_get", {"note_type_id": note_type_id})
         assert failed is False
         assert after["templates"] == before["templates"]
+
+        monkeypatch.setattr(Collection, "create_backup", native_create_backup)
+        failed, receipt = call(
+            "anki_templates_update",
+            {
+                "note_type_id": note_type_id,
+                "mappings": mappings,
+                "confirmation_token": preview["confirmation_token"],
+                "idempotency_key": "schema-backup-gate",
+            },
+        )
+        assert failed is False
+        assert receipt["result"]["template_count"] == len(mappings)
 
 
 def test_native_backup_failure_is_redacted_from_client(
