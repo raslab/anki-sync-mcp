@@ -140,7 +140,7 @@ their schemas and behavior have been validated.
 1. Call `anki_fsrs_optimize_preview`. Search selection is explicit `search`, then the preset's
    `param_search`, then all non-suspended cards using that preset.
 2. Inspect training count, health-check result, current/candidate finite 21-value FSRS-6
-   parameters, and affected deck count.
+   parameters, and the bounded IDs/names of every affected deck.
 3. Call `anki_fsrs_optimize_apply` with identical arguments, the unexpired confirmation token,
    and an `idempotency_key` stable across retries of the same logical request.
 
@@ -172,8 +172,9 @@ errors report the operation, configured maximum, observed lower bound, and remed
 If a response is lost, retry with the same idempotency key and identical arguments. A different
 request with the same key is rejected. A receipt with `outcome_unknown` means local commit
 status could not be established; inspect it with `anki_operations_get` before choosing a new
-key. Synchronization failures after local commit remain visible in the durable receipt and can
-be retried with the original key.
+key. `discarded_by_full_download` means recovery replaced the local collection and discarded
+the pending local outcome. Synchronization failures after local commit remain visible in the
+durable receipt and can be retried with the original key.
 
 ## Development
 

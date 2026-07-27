@@ -309,6 +309,11 @@ class ConfirmationRequiredError(ValueError):
     """Raised when a guarded operation lacks a valid preview token."""
 
 
+class FsrsAffectedDeck(BaseModel):
+    id: int
+    name: str
+
+
 class FsrsOptimizationImpact(BaseModel):
     config_id: int
     search: str
@@ -318,6 +323,8 @@ class FsrsOptimizationImpact(BaseModel):
     current_parameters: list[float]
     candidate_parameters: list[float]
     affected_decks: int
+    affected_deck_ids: list[int]
+    affected_decks_detail: list[FsrsAffectedDeck]
     state_fingerprint: str
 
 
@@ -338,11 +345,13 @@ class FsrsOptimizationApplied(BaseModel):
     previous_parameters: list[float]
     parameters: list[float]
     affected_decks: int
+    affected_deck_ids: list[int]
+    affected_decks_detail: list[FsrsAffectedDeck]
 
 
 class FsrsMutationReceipt(BaseModel, Generic[T]):  # noqa: UP046
     idempotency_key: str
-    state: Literal["outcome_unknown", "committed"]
+    state: Literal["outcome_unknown", "committed", "discarded_by_full_download"]
     local_committed: bool | None
     remote_synced: bool
     media_synced: bool | None

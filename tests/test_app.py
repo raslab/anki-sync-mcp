@@ -324,6 +324,12 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     assert "outputSchema" in by_name["anki_fsrs_reschedule"]
     assert "idempotency_key" in by_name["anki_fsrs_optimize_apply"]["inputSchema"]["required"]
     assert "idempotency_key" in by_name["anki_fsrs_reschedule"]["inputSchema"]["required"]
+    mutation_state = by_name["anki_fsrs_optimize_apply"]["outputSchema"]["properties"]["state"]
+    assert mutation_state["enum"] == [
+        "outcome_unknown",
+        "committed",
+        "discarded_by_full_download",
+    ]
     simulation_output = by_name["anki_fsrs_simulate"]["outputSchema"]
     simulation_result = simulation_output["properties"]["result"]
     assert simulation_result["discriminator"]["propertyName"] == "mode"
@@ -800,6 +806,26 @@ def test_fsrs_tools_work_through_json_rpc(
         assert isinstance(parsed, dict)
         return parsed
 
+    def call_error(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        nonlocal request_id
+        response = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+        )
+        request_id += 1
+        result = response.json()["result"]
+        assert result["isError"] is True
+        text = result["content"][0]["text"]
+        parsed = json.loads(text[text.index("{") :])
+        assert isinstance(parsed, dict)
+        return parsed
+
     enabled = call("anki_scheduler_settings_update", {"fsrs_enabled": True})
     simulated = call(
         "anki_fsrs_simulate",
@@ -838,6 +864,94 @@ def test_fsrs_tools_work_through_json_rpc(
             "idempotency_key": "optimize-default-preset",
         },
     )
+    replayed_optimization = call(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "confirmation_token": optimized_preview["confirmation_token"],
+            "idempotency_key": "optimize-default-preset",
+        },
+    )
+    conflict = call_error(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "search": "deck:Languages::Spanish",
+            "confirmation_token": optimized_preview["confirmation_token"],
+            "idempotency_key": "optimize-default-preset",
+        },
+    )
+    cleanup_preview = call("anki_fsrs_optimize_preview", {"config_id": 1})
+    cleanup_key = "optimize-invalid-input-cleanup"
+    invalid_apply = call_error(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "confirmation_token": "invalid-token",
+            "idempotency_key": cleanup_key,
+        },
+    )
+    cleaned_up_apply = call(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "confirmation_token": cleanup_preview["confirmation_token"],
+            "idempotency_key": cleanup_key,
+        },
+    )
+    health_preview = call("anki_fsrs_optimize_preview", {"config_id": 1})
+    monkeypatch.setattr(
+        RustBackendGenerated,
+        "compute_fsrs_params",
+        lambda self, **kwargs: scheduler_pb2.ComputeFsrsParamsResponse(
+            params=optimized,
+            fsrs_items=500,
+            health_check_passed=False,
+        ),
+    )
+    health_failure = call_error(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "confirmation_token": health_preview["confirmation_token"],
+            "idempotency_key": "optimize-health-failure-cleanup",
+        },
+    )
+    monkeypatch.setattr(RustBackendGenerated, "compute_fsrs_params", compute_fsrs_params)
+    health_retry_preview = call("anki_fsrs_optimize_preview", {"config_id": 1})
+    health_retry = call(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "confirmation_token": health_retry_preview["confirmation_token"],
+            "idempotency_key": "optimize-health-failure-cleanup",
+        },
+    )
+    interrupted_preview = call("anki_fsrs_optimize_preview", {"config_id": 1})
+    interrupted_args = {
+        "config_id": 1,
+        "confirmation_token": interrupted_preview["confirmation_token"],
+        "idempotency_key": "optimize-outcome-unknown",
+    }
+    original_apply = CollectionAdapter.apply_fsrs_optimization
+    monkeypatch.setattr(
+        CollectionAdapter,
+        "apply_fsrs_optimization",
+        lambda self, config_id, search, health_check, impact=None: (_ for _ in ()).throw(
+            RuntimeError("native backend interrupted")
+        ),
+    )
+    interrupted = call_error("anki_fsrs_optimize_apply", interrupted_args)
+    monkeypatch.setattr(CollectionAdapter, "apply_fsrs_optimization", original_apply)
+    recovered_unknown = call("anki_fsrs_optimize_apply", interrupted_args)
+
+    monkeypatch.setattr(
+        RustBackendGenerated,
+        "compute_fsrs_params",
+        lambda self, **kwargs: (_ for _ in ()).throw(RuntimeError("native backend failed")),
+    )
+    backend_failure = call_error("anki_fsrs_optimize_preview", {"config_id": 1})
+    monkeypatch.setattr(RustBackendGenerated, "compute_fsrs_params", compute_fsrs_params)
     changed_parameters = [optimized[0] + 0.01, *optimized[1:]]
     preview = call(
         "anki_fsrs_reschedule_preview",
@@ -865,9 +979,73 @@ def test_fsrs_tools_work_through_json_rpc(
     assert optimal["mode"] == "optimal_retention"
     assert optimized_result["result"]["training_items"] == 500
     assert optimized_result["idempotency_key"] == "optimize-default-preset"
+    assert replayed_optimization == optimized_result
+    assert conflict["code"] == "CONFLICT"
+    assert invalid_apply["code"] == "DESTRUCTIVE_CONFIRMATION_REQUIRED"
+    assert cleaned_up_apply["state"] == "committed"
+    assert health_failure["code"] == "INVALID_ARGUMENT"
+    assert health_retry["state"] == "committed"
+    assert interrupted["code"] == "INTERNAL_ERROR"
+    assert recovered_unknown["state"] == "outcome_unknown"
+    assert recovered_unknown["result"] is None
+    assert backend_failure["code"] == "INTERNAL_ERROR"
     assert rescheduled["result"]["rescheduled"] is True
     assert rescheduled["result"]["parameters_changed"] is True
     assert rescheduled["result"]["backup"]["path"]
+
+    spanish_deck = next(
+        deck for deck in call("anki_decks_list", {"offset": 0, "limit": 20})["items"]
+        if deck["name"] == "Languages::Spanish"
+    )
+    stale_preview = call(
+        "anki_fsrs_reschedule_preview", {"config_id": 1, "desired_retention": 0.92}
+    )
+
+    def sync_changes_fsrs_state(adapter: CollectionAdapter) -> None:
+        adapter.update_deck_limits(
+            spanish_deck["id"], "this_deck", {"desired_retention": 0.88}, ()
+        )
+
+    service = client.app.app.state.collection_service
+    service.executor.submit(lambda adapter: setattr(adapter, "sync_on_write", True)).result()
+    monkeypatch.setattr(
+        CollectionAdapter,
+        "_sync_or_raise_full_sync",
+        lambda self, sync_media: sync_changes_fsrs_state(self),
+    )
+    stale = call_error(
+        "anki_fsrs_reschedule",
+        {
+            "config_id": 1,
+            "desired_retention": 0.92,
+            "confirmation_token": stale_preview["confirmation_token"],
+            "idempotency_key": "reschedule-after-sync-change",
+        },
+    )
+    assert stale["code"] == "DESTRUCTIVE_CONFIRMATION_REQUIRED"
+    assert "preview again" in stale["message"]
+
+    def discard_pending_optimization(adapter: CollectionAdapter) -> None:
+        recorded = adapter._state.get_receipt("optimize-default-preset")
+        assert recorded is not None
+        operation, request_hash, receipt = recorded
+        receipt["remote_synced"] = False
+        adapter._state.put_receipt(
+            "optimize-default-preset", operation, request_hash, receipt
+        )
+        adapter._state.mark_pending_discarded_by_full_download()
+
+    service.executor.submit(discard_pending_optimization).result()
+    discarded = call(
+        "anki_fsrs_optimize_apply",
+        {
+            "config_id": 1,
+            "confirmation_token": optimized_preview["confirmation_token"],
+            "idempotency_key": "optimize-default-preset",
+        },
+    )
+    assert discarded["state"] == "discarded_by_full_download"
+    assert discarded["result"] is None
 
 
 def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) -> None:

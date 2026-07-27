@@ -887,7 +887,9 @@ class CollectionAdapter:
     def _bounded_fsrs_search(self, entry: Any, search: str | None, operation: str) -> str:
         selected = self._fsrs_search(entry, search)
         try:
-            selected_cards = self.collection.find_cards(selected)
+            selected_cards = self.collection.find_cards(
+                selected, order=f"c.id asc limit {self.max_search_scan + 1}"
+            )
         except SearchError as exc:
             raise ValueError(f"invalid FSRS search: {exc}") from exc
         if len(selected_cards) > self.max_search_scan:
@@ -897,6 +899,29 @@ class CollectionAdapter:
                 "MCP_MAX_SEARCH_SCAN"
             )
         return selected
+
+    def _bounded_preset_decks(self, config_id: int, operation: str) -> list[dict[str, Any]]:
+        db = self.collection.db
+        assert db is not None
+        rows = db.all(
+            "select id, name from decks order by id limit ?", self.max_search_scan + 1
+        )
+        if len(rows) > self.max_search_scan:
+            raise ResourceLimitError(
+                f"FSRS {operation} for preset {config_id}: maximum={self.max_search_scan}, "
+                f"observed_at_least={len(rows)} collection decks; raise MCP_MAX_SEARCH_SCAN "
+                "to inspect the shared preset scope"
+            )
+        affected: list[dict[str, Any]] = []
+        for deck_id, name in rows:
+            deck = self.collection.decks.get(cast("DeckId", int(deck_id)), default=False)
+            if (
+                deck is not None
+                and not bool(deck.get("dyn", 0))
+                and int(deck.get("conf", 1)) == config_id
+            ):
+                affected.append({"id": int(deck_id), "name": str(name)})
+        return affected
 
     @staticmethod
     def _ignore_revlogs_before_ms(value: str) -> int:
@@ -922,6 +947,7 @@ class CollectionAdapter:
         _, entry = self._preset_entry(config_id)
         config = entry.config.config
         selected_search = self._bounded_fsrs_search(entry, search, "optimization")
+        affected_decks = self._bounded_preset_decks(config_id, "optimization")
         previous = [float(value) for value in config.fsrs_params_6]
         try:
             response = self.collection._backend.compute_fsrs_params(  # pyright: ignore[reportPrivateUsage]
@@ -949,7 +975,9 @@ class CollectionAdapter:
             "health_check_passed": bool(response.health_check_passed),
             "current_parameters": previous,
             "candidate_parameters": parameters,
-            "affected_decks": int(entry.use_count),
+            "affected_decks": len(affected_decks),
+            "affected_deck_ids": [deck["id"] for deck in affected_decks],
+            "affected_decks_detail": affected_decks,
             "state_fingerprint": self._impact_fingerprint(
                 {
                     "config_id": config_id,
@@ -957,7 +985,7 @@ class CollectionAdapter:
                     "training_items": int(response.fsrs_items),
                     "current_parameters": previous,
                     "candidate_parameters": parameters,
-                    "affected_decks": int(entry.use_count),
+                    "affected_decks": affected_decks,
                 }
             ),
         }
@@ -984,7 +1012,9 @@ class CollectionAdapter:
             "health_check_passed": selected_impact["health_check_passed"],
             "previous_parameters": selected_impact["current_parameters"],
             "parameters": selected_impact["candidate_parameters"],
-            "affected_decks": int(entry.use_count),
+            "affected_decks": selected_impact["affected_decks"],
+            "affected_deck_ids": selected_impact["affected_deck_ids"],
+            "affected_decks_detail": selected_impact["affected_decks_detail"],
         }
 
     def optimize_fsrs(
