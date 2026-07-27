@@ -284,9 +284,12 @@ class CollectionAdapter:
             )
             for path in self._backup_folder.glob("*.colpkg")
         }
-        native_created = self.collection.create_backup(
-            backup_folder=str(self._backup_folder), force=True, wait_for_completion=True
-        )
+        try:
+            native_created = self.collection.create_backup(
+                backup_folder=str(self._backup_folder), force=True, wait_for_completion=True
+            )
+        except Exception as exc:
+            raise BackupFailedError(f"native backup failed: {exc}") from exc
         candidates = set(self._backup_folder.glob("*.colpkg"))
         fresh = {
             path
@@ -1073,46 +1076,58 @@ class CollectionAdapter:
             raise ValueError("FSRS must be enabled before cards can be rescheduled")
         if parameters is not None and len(parameters) != 21:
             raise ValueError("FSRS parameters must contain exactly 21 values")
-        decks = sorted(
-            (
-                {
-                    "id": int(deck["id"]),
-                    "config_id": int(deck.get("conf", 1)),
-                    "desired_retention": deck.get("desiredRetention"),
-                }
-                for deck in self.collection.decks.all()
-                if not bool(deck.get("dyn", 0)) and int(deck.get("conf", 1)) == config_id
-            ),
-            key=lambda deck: deck["id"],
-        )
-        if len(decks) > self.max_search_scan:
+        db = self.collection.db
+        assert db is not None
+        bounded_deck_ids = [
+            int(deck_id)
+            for deck_id in db.list(
+                "select id from decks order by id limit ?", self.max_search_scan + 1
+            )
+        ]
+        if len(bounded_deck_ids) > self.max_search_scan:
             raise ValueError(
                 f"FSRS reschedule for preset {config_id} exceeds "
                 f"MCP_MAX_SEARCH_SCAN={self.max_search_scan} decks"
             )
-        db = self.collection.db
-        assert db is not None
+        decks = []
+        for deck_id in bounded_deck_ids:
+            deck = self.collection.decks.get(cast("DeckId", deck_id), default=False)
+            if (
+                deck is not None
+                and not bool(deck.get("dyn", 0))
+                and int(deck.get("conf", 1)) == config_id
+            ):
+                decks.append(
+                    {
+                        "id": deck_id,
+                        "config_id": int(deck.get("conf", 1)),
+                        "desired_retention": deck.get("desiredRetention"),
+                    }
+                )
         deck_ids_json = json.dumps([deck["id"] for deck in decks])
-        candidate_ids = [
-            int(card_id)
-            for card_id in db.list(
-                """
-                select id from cards
-                where did in (select value from json_each(?))
+        candidate_rows = db.all(
+            """
+                select id, did, odid, type, queue, due, odue, ivl
+                from cards
+                where (
+                    (odid = 0 and did in (select value from json_each(?)))
+                    or odid in (select value from json_each(?))
+                )
                   and type = ? and queue != ?
                 order by id limit ?
                 """,
-                deck_ids_json,
-                CARD_TYPE_REV,
-                QUEUE_TYPE_SUSPENDED,
-                self.max_search_scan + 1,
-            )
-        ]
-        if len(candidate_ids) > self.max_search_scan:
+            deck_ids_json,
+            deck_ids_json,
+            CARD_TYPE_REV,
+            QUEUE_TYPE_SUSPENDED,
+            self.max_search_scan + 1,
+        )
+        if len(candidate_rows) > self.max_search_scan:
             raise ValueError(
                 f"FSRS reschedule for preset {config_id} across {len(decks)} decks exceeds "
                 f"MCP_MAX_SEARCH_SCAN={self.max_search_scan} candidate cards"
             )
+        candidate_ids = [int(row[0]) for row in candidate_rows]
         ignore_before = self._ignore_revlogs_before_ms(str(config.ignore_revlogs_before_date))
         candidate_ids_json = json.dumps(candidate_ids)
         valid_card_ids: set[int] = set()
@@ -1124,18 +1139,28 @@ class CollectionAdapter:
                 select cid, id, ease, ivl, lastIvl, factor, time, type
                 from revlog
                 where cid in (select value from json_each(?))
-                  and id >= ? and id > ?
-                  and ease between 1 and 4 and type between 0 and 3
+                  and id > ?
+                  and (
+                    (ease > 0 and not (type = 3 and factor = 0)
+                     and (id > ? or type = 0))
+                    or (type = 4 and factor = 0)
+                  )
                 order by id limit 1000
                 """,
                 candidate_ids_json,
-                ignore_before,
                 last_review_id,
+                ignore_before,
             )
             if not review_rows:
                 break
             for row in review_rows:
-                valid_card_ids.add(int(row[0]))
+                if (
+                    int(row[2]) > 0
+                    and int(row[1]) > ignore_before
+                    and (int(row[3]) >= 1 or int(row[3]) <= -86_400)
+                    and not (int(row[7]) == 3 and int(row[5]) == 0)
+                ):
+                    valid_card_ids.add(int(row[0]))
                 review_history_hash.update(
                     json.dumps(
                         list(row), ensure_ascii=False, separators=(",", ":")
@@ -1175,6 +1200,22 @@ class CollectionAdapter:
                 }
             )
         timing = self.collection.sched._timing_today()
+        reviewed_today = int(
+            db.scalar(
+                """
+                select count(distinct r.cid)
+                from revlog r join cards c on r.cid = c.id
+                where r.id > ? and r.ease > 0 and (r.type < 3 or r.factor != 0)
+                  and (
+                    (c.odid = 0 and c.did in (select value from json_each(?)))
+                    or c.odid in (select value from json_each(?))
+                  )
+                """,
+                (int(timing.next_day_at) - 86_400) * 1000,
+                deck_ids_json,
+                deck_ids_json,
+            )
+        )
         impact = {
             "config_id": config_id,
             "decks": len(decks),
@@ -1185,6 +1226,7 @@ class CollectionAdapter:
                 {
                     "decks": decks,
                     "cards": card_states,
+                    "load_balance_cards": [list(row) for row in candidate_rows],
                     "review_history": review_history_hash.hexdigest(),
                     "scheduler": {
                         "fsrs": bool(state.fsrs),
@@ -1193,6 +1235,7 @@ class CollectionAdapter:
                         "load_balancer": self.collection.get_config_bool(
                             ConfigKey.Bool.LOAD_BALANCER_ENABLED
                         ),
+                        "reviewed_today": reviewed_today,
                         "maximum_review_interval": int(config.maximum_review_interval),
                         "historical_retention": float(config.historical_retention),
                         "easy_days_percentages": list(config.easy_days_percentages),
