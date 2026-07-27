@@ -6,6 +6,8 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
+from anki import scheduler_pb2
+from anki._backend_generated import RustBackendGenerated
 from anki.collection import Collection
 from anki.errors import NetworkError, SyncError, SyncErrorKind
 from anki.sync import SyncAuth, SyncOutput
@@ -212,6 +214,10 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_decks_update_config",
         "anki_deck_limits_update",
         "anki_scheduler_settings_update",
+        "anki_fsrs_optimize",
+        "anki_fsrs_simulate",
+        "anki_fsrs_reschedule_preview",
+        "anki_fsrs_reschedule",
         "anki_deck_presets_create",
         "anki_deck_presets_update",
         "anki_deck_presets_assign",
@@ -298,8 +304,19 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     assert set(scheduler_settings) == {
         "apply_all_parent_limits",
         "new_cards_ignore_review_limit",
+        "fsrs_enabled",
         "idempotency_key",
     }
+    simulator = by_name["anki_fsrs_simulate"]["inputSchema"]["properties"]
+    assert simulator["mode"]["enum"] == ["review", "workload", "optimal_retention"]
+    assert simulator["days_to_simulate"]["maximum"] == 730
+    assert simulator["deck_size"]["maximum"] == 1_000_000
+    assert (
+        by_name["anki_fsrs_reschedule"]["inputSchema"]["properties"]["confirmation_token"][
+            "type"
+        ]
+        == "string"
+    )
     preset_get = by_name["anki_deck_presets_get"]["inputSchema"]["properties"]
     assert preset_get["include_sections"]["items"]["enum"] == [
         "learning",
@@ -711,6 +728,91 @@ def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -
     assert operations["total"] == 10
     assert operation["operation"] == "anki_decks_update_config"
     assert metrics["mutations"]["total"] == 10
+
+
+def test_fsrs_tools_work_through_json_rpc(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    optimized = [0.2 + index / 100 for index in range(21)]
+
+    def compute_fsrs_params(self, **kwargs):  # type: ignore[no-untyped-def]
+        return scheduler_pb2.ComputeFsrsParamsResponse(
+            params=optimized,
+            fsrs_items=500,
+            health_check_passed=True,
+        )
+
+    monkeypatch.setattr(RustBackendGenerated, "compute_fsrs_params", compute_fsrs_params)
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    initialized = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1"},
+            },
+        },
+    )
+    headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+    request_id = 2
+
+    def call(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        nonlocal request_id
+        response = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+        )
+        request_id += 1
+        assert response.status_code == 200
+        result = response.json()["result"]
+        assert result.get("isError") is not True, result
+        parsed = json.loads(result["content"][0]["text"])
+        assert isinstance(parsed, dict)
+        return parsed
+
+    enabled = call("anki_scheduler_settings_update", {"fsrs_enabled": True})
+    simulated = call(
+        "anki_fsrs_simulate",
+        {
+            "config_id": 1,
+            "mode": "review",
+            "deck_size": 1000,
+            "days_to_simulate": 30,
+        },
+    )
+    optimized_result = call("anki_fsrs_optimize", {"config_id": 1})
+    preview = call(
+        "anki_fsrs_reschedule_preview",
+        {"config_id": 1, "desired_retention": 0.91},
+    )
+    rescheduled = call(
+        "anki_fsrs_reschedule",
+        {
+            "config_id": 1,
+            "desired_retention": 0.91,
+            "confirmation_token": preview["confirmation_token"],
+        },
+    )
+
+    assert enabled["result"]["fsrs_enabled"] is True
+    assert simulated["mode"] == "review"
+    assert optimized_result["result"]["training_items"] == 500
+    assert rescheduled["result"]["rescheduled"] is True
+    assert rescheduled["result"]["backup"]["path"]
 
 
 def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) -> None:

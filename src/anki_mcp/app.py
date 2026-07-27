@@ -114,6 +114,10 @@ NonNegativeFloat = Annotated[StrictFloat, Field(ge=0)]
 PositiveFloat = Annotated[StrictFloat, Field(gt=0)]
 Steps = Annotated[list[NonNegativeFloat], Field(max_length=100)]
 FsrsParameters = Annotated[list[StrictFloat], Field(max_length=30)]
+FsrsRescheduleParameters = Annotated[list[StrictFloat], Field(min_length=21, max_length=21)]
+FsrsSimulationMode = Literal["review", "workload", "optimal_retention"]
+FsrsSimulationDays = Annotated[StrictInt, Field(ge=1, le=730)]
+FsrsSimulationDeckSize = Annotated[StrictInt, Field(ge=1, le=1_000_000)]
 EasyDaysPercentages = Annotated[list[NonNegativeFloat], Field(min_length=7, max_length=7)]
 NewCardInsertOrder = Literal["NEW_CARD_INSERT_ORDER_DUE", "NEW_CARD_INSERT_ORDER_RANDOM"]
 NewCardGatherPriority = Literal[
@@ -646,12 +650,14 @@ def create_app(settings: Settings) -> ASGIApp:
     async def scheduler_settings_update(
         apply_all_parent_limits: StrictBool | None = None,
         new_cards_ignore_review_limit: StrictBool | None = None,
+        fsrs_enabled: StrictBool | None = None,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Patch explicit collection-wide scheduler limit aggregation settings."""
+        """Patch collection-wide scheduler and FSRS enablement settings."""
         request = {
             "apply_all_parent_limits": apply_all_parent_limits,
             "new_cards_ignore_review_limit": new_cards_ignore_review_limit,
+            "fsrs_enabled": fsrs_enabled,
         }
         return await mutate(
             "anki_scheduler_settings_update",
@@ -660,7 +666,106 @@ def create_app(settings: Settings) -> ASGIApp:
             lambda adapter: adapter.update_deck_scheduler_settings(
                 apply_all_parent_limits,
                 new_cards_ignore_review_limit,
+                fsrs_enabled,
             ),
+        )
+
+    @scoped_tool(name="anki_fsrs_optimize", scope="admin")
+    async def fsrs_optimize(
+        config_id: StableId,
+        search: SearchQuery | None = None,
+        health_check: StrictBool = True,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Compute and apply native FSRS parameters to one deck preset."""
+        request = {"config_id": config_id, "search": search, "health_check": health_check}
+        return await mutate(
+            "anki_fsrs_optimize",
+            idempotency_key,
+            request,
+            lambda adapter: adapter.optimize_fsrs(config_id, search, health_check),
+        )
+
+    @scoped_tool(name="anki_fsrs_simulate", scope="read")
+    async def fsrs_simulate(
+        config_id: StableId,
+        mode: FsrsSimulationMode,
+        deck_size: FsrsSimulationDeckSize,
+        days_to_simulate: FsrsSimulationDays,
+        desired_retention: Retention | None = None,
+        search: SearchQuery | None = None,
+        include_daily: StrictBool = False,
+        sync_before: SyncMedia = False,
+    ) -> dict[str, Any]:
+        """Run Anki's native FSRS review, workload, or optimal-retention simulator."""
+        return await execute(
+            service.coordinated_read(
+                lambda adapter: adapter.simulate_fsrs(
+                    config_id,
+                    mode,
+                    deck_size,
+                    days_to_simulate,
+                    desired_retention,
+                    search,
+                    include_daily,
+                ),
+                sync_before,
+            )
+        )
+
+    @scoped_tool(
+        name="anki_fsrs_reschedule_preview",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def fsrs_reschedule_preview(
+        config_id: StableId,
+        desired_retention: Retention | None = None,
+        parameters: FsrsRescheduleParameters | None = None,
+    ) -> dict[str, Any]:
+        """Preview cards affected by a native FSRS-setting change and reschedule."""
+        request = {
+            "config_id": config_id,
+            "desired_retention": desired_retention,
+            "parameters": parameters,
+        }
+        return await preview(
+            "anki_fsrs_reschedule",
+            request,
+            lambda adapter: adapter.preview_fsrs_reschedule(
+                config_id, desired_retention, parameters
+            ),
+        )
+
+    @scoped_tool(
+        name="anki_fsrs_reschedule",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def fsrs_reschedule(
+        config_id: StableId,
+        confirmation_token: ConfirmationToken,
+        desired_retention: Retention | None = None,
+        parameters: FsrsRescheduleParameters | None = None,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Change FSRS settings and natively reschedule affected cards after preview and backup."""
+        guard_request = {
+            "config_id": config_id,
+            "desired_retention": desired_retention,
+            "parameters": parameters,
+        }
+        request = {**guard_request, "confirmation_token": confirmation_token}
+        return await guarded_mutate(
+            "anki_fsrs_reschedule",
+            idempotency_key,
+            request,
+            confirmation_token,
+            guard_request,
+            lambda adapter: adapter.preview_fsrs_reschedule(
+                config_id, desired_retention, parameters
+            ),
+            lambda adapter: adapter.reschedule_fsrs(config_id, desired_retention, parameters),
         )
 
     @scoped_tool(name="anki_deck_presets_create", scope="admin")

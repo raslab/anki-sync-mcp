@@ -17,8 +17,11 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import anki.lang
 from anki.collection import AddNoteRequest, Collection
+from anki.config_pb2 import ConfigKey
+from anki.consts import CARD_TYPE_REV, QUEUE_TYPE_SUSPENDED
 from anki.decks import UpdateDeckConfigs
-from anki.errors import InvalidInput, NetworkError, NotFoundError
+from anki.errors import InvalidInput, NetworkError, NotFoundError, SearchError
+from anki.scheduler_pb2 import SimulateFsrsReviewRequest
 from anki.sync import SyncAuth
 from anki.utils import field_checksum
 from google.protobuf.json_format import MessageToDict
@@ -649,6 +652,8 @@ class CollectionAdapter:
         *,
         apply_all_parent_limits: bool | None = None,
         new_cards_ignore_review_limit: bool | None = None,
+        fsrs_enabled: bool | None = None,
+        fsrs_reschedule: bool = False,
     ) -> None:
         try:
             self.collection.decks.update_deck_configs(
@@ -662,12 +667,13 @@ class CollectionAdapter:
                         if new_cards_ignore_review_limit is None
                         else new_cards_ignore_review_limit
                     ),
-                    fsrs=state.fsrs,
+                    fsrs=state.fsrs if fsrs_enabled is None else fsrs_enabled,
                     apply_all_parent_limits=(
                         state.apply_all_parent_limits
                         if apply_all_parent_limits is None
                         else apply_all_parent_limits
                     ),
+                    fsrs_reschedule=fsrs_reschedule,
                     fsrs_health_check=state.fsrs_health_check,
                 )
             )
@@ -798,8 +804,13 @@ class CollectionAdapter:
         self,
         apply_all_parent_limits: bool | None,
         new_cards_ignore_review_limit: bool | None,
+        fsrs_enabled: bool | None,
     ) -> dict[str, Any]:
-        if apply_all_parent_limits is None and new_cards_ignore_review_limit is None:
+        if (
+            apply_all_parent_limits is None
+            and new_cards_ignore_review_limit is None
+            and fsrs_enabled is None
+        ):
             raise ValueError("at least one collection-wide scheduler setting must be provided")
         state = self._deck_config_state(1)
         self._update_deck_config_state(
@@ -807,6 +818,7 @@ class CollectionAdapter:
             state,
             apply_all_parent_limits=apply_all_parent_limits,
             new_cards_ignore_review_limit=new_cards_ignore_review_limit,
+            fsrs_enabled=fsrs_enabled,
         )
         return {
             "scope": "collection",
@@ -821,6 +833,351 @@ class CollectionAdapter:
                 if new_cards_ignore_review_limit is None
                 else new_cards_ignore_review_limit
             ),
+            "fsrs_enabled": bool(state.fsrs) if fsrs_enabled is None else fsrs_enabled,
+        }
+
+    @staticmethod
+    def _fsrs_search(entry: Any, search: str | None) -> str:
+        selected = search if search is not None else str(entry.config.config.param_search)
+        if selected.strip():
+            return selected
+        name = str(entry.config.name).replace('"', '\\"')
+        return f'preset:"{name}" -is:suspended'
+
+    def _bounded_fsrs_search(self, entry: Any, search: str | None, operation: str) -> str:
+        selected = self._fsrs_search(entry, search)
+        try:
+            selected_cards = self.collection.find_cards(selected)
+        except SearchError as exc:
+            raise ValueError(f"invalid FSRS search: {exc}") from exc
+        if len(selected_cards) > self.max_search_scan:
+            raise ValueError(f"FSRS {operation} exceeds MCP_MAX_SEARCH_SCAN")
+        return selected
+
+    @staticmethod
+    def _ignore_revlogs_before_ms(value: str) -> int:
+        if not value.strip():
+            return 0
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC)
+        except ValueError as exc:
+            raise ValueError("ignore_revlogs_before_date must use YYYY-MM-DD") from exc
+        return int(parsed.timestamp() * 1000)
+
+    @staticmethod
+    def _active_fsrs_parameters(config: Any, defaults: Any) -> list[float]:
+        for field in ("fsrs_params_6", "fsrs_params_5", "fsrs_params_4"):
+            values = list(getattr(config, field))
+            if values:
+                return [float(value) for value in values]
+        return [float(value) for value in defaults.fsrs_params_6]
+
+    def optimize_fsrs(
+        self, config_id: int, search: str | None, health_check: bool
+    ) -> dict[str, Any]:
+        state, entry = self._preset_entry(config_id)
+        config = entry.config.config
+        selected_search = self._bounded_fsrs_search(entry, search, "optimization")
+        previous = [float(value) for value in config.fsrs_params_6]
+        try:
+            response = self.collection._backend.compute_fsrs_params(  # pyright: ignore[reportPrivateUsage]
+                search=selected_search,
+                current_params=previous,
+                ignore_revlogs_before_ms=self._ignore_revlogs_before_ms(
+                    str(config.ignore_revlogs_before_date)
+                ),
+                num_of_relearning_steps=len(config.relearn_steps),
+                health_check=health_check,
+            )
+        except (InvalidInput, SearchError) as exc:
+            raise ValueError(f"invalid FSRS optimization input: {exc}") from exc
+        parameters = [float(value) for value in response.params]
+        if not parameters:
+            raise ValueError("not enough review history to optimize FSRS parameters")
+        del config.fsrs_params_6[:]
+        config.fsrs_params_6.extend(parameters)
+        self._update_deck_config_state(1, state)
+        return {
+            "config_id": config_id,
+            "optimized": True,
+            "search": selected_search,
+            "training_items": int(response.fsrs_items),
+            "health_check_passed": bool(response.health_check_passed),
+            "previous_parameters": previous,
+            "parameters": parameters,
+            "affected_decks": int(entry.use_count),
+        }
+
+    def _fsrs_simulation_request(
+        self,
+        config_id: int,
+        deck_size: int,
+        days_to_simulate: int,
+        desired_retention: float | None,
+        search: str | None,
+    ) -> tuple[SimulateFsrsReviewRequest, str]:
+        state, entry = self._preset_entry(config_id)
+        config = entry.config.config
+        defaults = state.defaults.config
+        selected_search = self._fsrs_search(entry, search)
+        easy_days = list(config.easy_days_percentages) or list(defaults.easy_days_percentages)
+        request = SimulateFsrsReviewRequest(
+            params=self._active_fsrs_parameters(config, defaults),
+            desired_retention=(
+                float(config.desired_retention)
+                if desired_retention is None
+                else desired_retention
+            ),
+            deck_size=deck_size,
+            days_to_simulate=days_to_simulate,
+            new_limit=int(config.new_per_day),
+            review_limit=int(config.reviews_per_day),
+            max_interval=int(config.maximum_review_interval),
+            search=selected_search,
+            new_cards_ignore_review_limit=bool(state.new_cards_ignore_review_limit),
+            easy_days_percentages=easy_days,
+            review_order=config.review_order,
+            suspend_after_lapse_count=int(config.leech_threshold),
+            historical_retention=float(config.historical_retention),
+            learning_step_count=len(config.learn_steps),
+            relearning_step_count=len(config.relearn_steps),
+        )
+        return request, selected_search
+
+    def simulate_fsrs(
+        self,
+        config_id: int,
+        mode: str,
+        deck_size: int,
+        days_to_simulate: int,
+        desired_retention: float | None,
+        search: str | None,
+        include_daily: bool,
+    ) -> dict[str, Any]:
+        if mode not in {"review", "workload", "optimal_retention"}:
+            raise ValueError("mode must be review, workload, or optimal_retention")
+        _, entry = self._preset_entry(config_id)
+        selected_search = self._bounded_fsrs_search(entry, search, "simulation")
+        request, selected_search = self._fsrs_simulation_request(
+            config_id, deck_size, days_to_simulate, desired_retention, selected_search
+        )
+        result: dict[str, Any] = {
+            "mode": mode,
+            "config_id": config_id,
+            "search": selected_search,
+            "days": days_to_simulate,
+            "deck_size": deck_size,
+        }
+        backend = self.collection._backend  # pyright: ignore[reportPrivateUsage]
+        if mode == "optimal_retention":
+            try:
+                result["optimal_retention"] = round(
+                    float(backend.compute_optimal_retention(request)), 6
+                )
+            except (InvalidInput, SearchError) as exc:
+                raise ValueError(f"invalid FSRS simulation input: {exc}") from exc
+            return result
+        if mode == "workload":
+            try:
+                response = backend.simulate_fsrs_workload(request)
+            except (InvalidInput, SearchError) as exc:
+                raise ValueError(f"invalid FSRS simulation input: {exc}") from exc
+            result["retention"] = {
+                "cost_seconds": {str(key): float(value) for key, value in response.cost.items()},
+                "memorized": {
+                    str(key): float(value) for key, value in response.memorized.items()
+                },
+                "review_count": {
+                    str(key): int(value) for key, value in response.review_count.items()
+                },
+            }
+            result["reviewless_end_memorized"] = float(response.reviewless_end_memorized)
+            return result
+
+        try:
+            response = backend.simulate_fsrs_review(request)
+        except (InvalidInput, SearchError) as exc:
+            raise ValueError(f"invalid FSRS simulation input: {exc}") from exc
+        daily_reviews = [int(value) for value in response.daily_review_count]
+        daily_new = [int(value) for value in response.daily_new_count]
+        daily_time = [float(value) for value in response.daily_time_cost]
+        knowledge = [float(value) for value in response.accumulated_knowledge_acquisition]
+        result["summary"] = {
+            "total_reviews": sum(daily_reviews),
+            "total_new_cards": sum(daily_new),
+            "total_time_seconds": round(sum(daily_time), 6),
+            "final_knowledge_acquisition": knowledge[-1] if knowledge else 0.0,
+        }
+        if include_daily:
+            result["daily"] = [
+                {
+                    "day": index + 1,
+                    "reviews": daily_reviews[index],
+                    "new_cards": daily_new[index],
+                    "time_seconds": daily_time[index],
+                    "knowledge_acquisition": knowledge[index],
+                }
+                for index in range(len(daily_reviews))
+            ]
+        return result
+
+    def _fsrs_reschedule_impact(
+        self,
+        config_id: int,
+        desired_retention: float | None,
+        parameters: Sequence[float] | None,
+    ) -> tuple[Any, Any, dict[str, Any]]:
+        state, entry = self._preset_entry(config_id)
+        config = entry.config.config
+        current_retention = round(float(config.desired_retention), 6)
+        target_retention = (
+            current_retention if desired_retention is None else round(desired_retention, 6)
+        )
+        current_parameters = [float(value) for value in config.fsrs_params_6]
+        target_parameters = current_parameters if parameters is None else list(parameters)
+        if target_retention == current_retention and target_parameters == current_parameters:
+            raise ValueError("FSRS rescheduling must change desired retention or parameters")
+        if not state.fsrs:
+            raise ValueError("FSRS must be enabled before cards can be rescheduled")
+        if parameters is not None and len(parameters) != 21:
+            raise ValueError("FSRS parameters must contain exactly 21 values")
+        decks = sorted(
+            (
+                {
+                    "id": int(deck["id"]),
+                    "config_id": int(deck.get("conf", 1)),
+                    "desired_retention": deck.get("desiredRetention"),
+                }
+                for deck in self.collection.decks.all()
+                if not bool(deck.get("dyn", 0)) and int(deck.get("conf", 1)) == config_id
+            ),
+            key=lambda deck: deck["id"],
+        )
+        candidate_ids = sorted(
+            int(card_id)
+            for deck in decks
+            for card_id in self.collection.find_cards(
+                f"did:{deck['id']} is:review -is:suspended"
+            )
+        )
+        ignore_before = self._ignore_revlogs_before_ms(str(config.ignore_revlogs_before_date))
+        db = self.collection.db
+        assert db is not None
+        card_states = []
+        for card_id in candidate_ids:
+            card = self.collection.get_card(cast("CardId", card_id))
+            if card.type != CARD_TYPE_REV or card.queue == QUEUE_TYPE_SUSPENDED:
+                continue
+            valid_reviews = int(
+                db.scalar(
+                    """
+                    select count() from revlog
+                    where cid = ? and id >= ? and ease between 1 and 4 and type between 0 and 3
+                    """,
+                    card_id,
+                    ignore_before,
+                )
+            )
+            if not valid_reviews:
+                continue
+            review_state = db.first(
+                """
+                select count(), coalesce(max(id), 0), coalesce(sum(ease), 0),
+                       coalesce(sum(ivl), 0), coalesce(sum(lastIvl), 0),
+                       coalesce(sum(factor), 0), coalesce(sum(time), 0),
+                       coalesce(sum(type), 0)
+                from revlog where cid = ?
+                """,
+                card_id,
+            )
+            memory_state = card.memory_state
+            card_states.append(
+                {
+                    "id": card_id,
+                    "type": int(card.type),
+                    "queue": int(card.queue),
+                    "due": int(card.due),
+                    "original_due": int(card.odue),
+                    "interval": int(card.ivl),
+                    "reps": int(card.reps),
+                    "lapses": int(card.lapses),
+                    "left": int(card.left),
+                    "desired_retention": card.desired_retention,
+                    "decay": card.decay,
+                    "memory_state": (
+                        None
+                        if memory_state is None
+                        else {
+                            "stability": float(memory_state.stability),
+                            "difficulty": float(memory_state.difficulty),
+                        }
+                    ),
+                    "revlog": list(review_state) if review_state is not None else [],
+                }
+            )
+            if len(card_states) > self.max_search_scan:
+                raise ValueError("FSRS reschedule exceeds MCP_MAX_SEARCH_SCAN")
+        impact = {
+            "config_id": config_id,
+            "decks": len(decks),
+            "cards": len(card_states),
+            "desired_retention": target_retention,
+            "parameters_changed": target_parameters != current_parameters,
+            "state_fingerprint": self._impact_fingerprint(
+                {
+                    "decks": decks,
+                    "cards": card_states,
+                    "scheduler": {
+                        "fsrs": bool(state.fsrs),
+                        "load_balancer": self.collection.get_config_bool(
+                            ConfigKey.Bool.LOAD_BALANCER_ENABLED
+                        ),
+                        "maximum_review_interval": int(config.maximum_review_interval),
+                        "historical_retention": float(config.historical_retention),
+                        "easy_days_percentages": list(config.easy_days_percentages),
+                        "ignore_revlogs_before_date": str(config.ignore_revlogs_before_date),
+                    },
+                    "current_retention": current_retention,
+                    "current_parameters": current_parameters,
+                }
+            ),
+        }
+        return state, entry, impact
+
+    def preview_fsrs_reschedule(
+        self,
+        config_id: int,
+        desired_retention: float | None,
+        parameters: Sequence[float] | None,
+    ) -> dict[str, Any]:
+        _, _, impact = self._fsrs_reschedule_impact(
+            config_id, desired_retention, parameters
+        )
+        return impact
+
+    def reschedule_fsrs(
+        self,
+        config_id: int,
+        desired_retention: float | None,
+        parameters: Sequence[float] | None,
+    ) -> dict[str, Any]:
+        state, entry, impact = self._fsrs_reschedule_impact(
+            config_id, desired_retention, parameters
+        )
+        config = entry.config.config
+        if desired_retention is not None:
+            config.desired_retention = desired_retention
+        if parameters is not None:
+            del config.fsrs_params_6[:]
+            config.fsrs_params_6.extend(parameters)
+        self._update_deck_config_state(1, state, fsrs_reschedule=True)
+        return {
+            "config_id": config_id,
+            "rescheduled": True,
+            "cards": impact["cards"],
+            "decks": impact["decks"],
+            "desired_retention": impact["desired_retention"],
+            "parameters_changed": impact["parameters_changed"],
         }
 
     def get_deck_options(
@@ -2636,12 +2993,65 @@ class AnkiCollectionService:
         self,
         apply_all_parent_limits: bool | None,
         new_cards_ignore_review_limit: bool | None,
+        fsrs_enabled: bool | None,
     ) -> dict[str, Any]:
         return await self.executor.run(
             lambda adapter: adapter.update_deck_scheduler_settings(
                 apply_all_parent_limits,
                 new_cards_ignore_review_limit,
+                fsrs_enabled,
             )
+        )
+
+    async def optimize_fsrs(
+        self, config_id: int, search: str | None, health_check: bool
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.optimize_fsrs(config_id, search, health_check)
+        )
+
+    async def simulate_fsrs(
+        self,
+        config_id: int,
+        mode: str,
+        deck_size: int,
+        days_to_simulate: int,
+        desired_retention: float | None,
+        search: str | None,
+        include_daily: bool,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.simulate_fsrs(
+                config_id,
+                mode,
+                deck_size,
+                days_to_simulate,
+                desired_retention,
+                search,
+                include_daily,
+            )
+        )
+
+    async def preview_fsrs_reschedule(
+        self,
+        config_id: int,
+        desired_retention: float | None,
+        parameters: Sequence[float] | None,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.preview_fsrs_reschedule(
+                config_id, desired_retention, parameters
+            )
+        )
+
+    async def reschedule_fsrs(
+        self,
+        config_id: int,
+        desired_retention: float | None,
+        parameters: Sequence[float] | None,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.reschedule_fsrs(config_id, desired_retention, parameters)
         )
 
     async def delete_deck(self, deck_id: int) -> dict[str, Any]:
