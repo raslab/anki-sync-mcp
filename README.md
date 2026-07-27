@@ -13,7 +13,7 @@ and schema-changing tools are disabled by default and use preview tokens plus ve
 when enabled.
 
 It supports decks, notes, cards, tags, note types, templates, media, scheduling controls,
-backups, and explicit full-sync recovery.
+review history and analytics, backups, and explicit full-sync recovery.
 
 ## Quick start with Docker Compose
 

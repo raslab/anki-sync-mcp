@@ -65,6 +65,32 @@ ConfirmationToken = Annotated[StrictStr, Field(min_length=1, max_length=256)]
 SchemaChangeOperation = Literal["create", "update", "fields_update", "templates_update", "delete"]
 ReviewRating = Annotated[StrictInt, Field(ge=1, le=4)]
 AnswerSeconds = Annotated[StrictInt, Field(ge=0, le=86_400)]
+ReviewOrder = Literal["newest", "oldest"]
+ReviewDays = Literal[0, 30, 90, 365]
+CardGetSection = Literal["review_summary", "fsrs"]
+CardGetSections = Annotated[tuple[CardGetSection, ...], Field(max_length=2)]
+ReviewEventField = Literal[
+    "review_kind", "rating_label", "intervals", "answer_time", "ease", "memory_state"
+]
+ReviewEventFields = Annotated[tuple[ReviewEventField, ...], Field(max_length=6)]
+ReviewStatsSection = Literal[
+    "buttons",
+    "card_counts",
+    "hours",
+    "today",
+    "eases",
+    "intervals",
+    "future_due",
+    "added",
+    "reviews",
+    "rollover_hour",
+    "difficulty",
+    "retrievability",
+    "stability",
+    "true_retention",
+    "fsrs",
+]
+ReviewStatsSections = Annotated[tuple[ReviewStatsSection, ...], Field(max_length=15)]
 
 
 class NoteCreateInput(BaseModel):
@@ -642,10 +668,65 @@ def create_app(settings: Settings) -> ASGIApp:
         )
 
     @scoped_tool(name="anki_cards_get", scope="read")
-    async def cards_get(card_id: StableId, sync_before: SyncMedia = False) -> dict[str, Any]:
-        """Get card content, deck identity, and scheduling state by stable card ID."""
+    async def cards_get(
+        card_id: StableId,
+        include_sections: CardGetSections = (),
+        sync_before: SyncMedia = False,
+    ) -> dict[str, Any]:
+        """Get card content and scheduling, with optional review_summary and fsrs sections."""
         return await execute(
-            service.coordinated_read(lambda adapter: adapter.get_card(card_id), sync_before)
+            service.coordinated_read(
+                lambda adapter: adapter.get_card(card_id, include_sections), sync_before
+            )
+        )
+
+    @scoped_tool(name="anki_reviews_list", scope="read")
+    async def reviews_list(
+        card_id: StableId | None = None,
+        deck_id: StableId | None = None,
+        query: SearchQuery | None = None,
+        include_children: StrictBool = False,
+        offset: Offset = 0,
+        limit: PageLimit = settings.max_page_size,
+        order: ReviewOrder = "newest",
+        include_fields: ReviewEventFields = (),
+        sync_before: SyncMedia = False,
+    ) -> dict[str, Any]:
+        """List compact review events, optionally including requested detail fields."""
+        return await execute(
+            service.coordinated_read(
+                lambda adapter: adapter.list_reviews(
+                    card_id,
+                    deck_id,
+                    query,
+                    include_children,
+                    offset,
+                    limit,
+                    order,
+                    include_fields,
+                ),
+                sync_before,
+            )
+        )
+
+    @scoped_tool(name="anki_review_stats", scope="read")
+    async def review_stats(
+        card_id: StableId | None = None,
+        deck_id: StableId | None = None,
+        query: SearchQuery | None = None,
+        include_children: StrictBool = False,
+        days: ReviewDays = 30,
+        include_sections: ReviewStatsSections = (),
+        sync_before: SyncMedia = False,
+    ) -> dict[str, Any]:
+        """Return compact review analytics with optional detailed graph sections."""
+        return await execute(
+            service.coordinated_read(
+                lambda adapter: adapter.review_stats(
+                    card_id, deck_id, query, include_children, days, include_sections
+                ),
+                sync_before,
+            )
         )
 
     @scoped_tool(name="anki_cards_create", scope="write")

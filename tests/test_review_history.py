@@ -1,0 +1,302 @@
+from __future__ import annotations
+
+import time
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from anki.collection import Collection
+from anki.decks import DeckManager
+
+from anki_mcp.collection import AnkiCollectionService
+
+
+@pytest.fixture
+def reviewed_collection(tmp_path: Path) -> Iterator[tuple[str, int, int, int]]:
+    path = str(tmp_path / "collection.anki2")
+    collection = Collection(path)
+    try:
+        parent_id = int(collection.decks.id("History"))
+        child_id = int(collection.decks.id("History::Child"))
+        model = collection.models.current()
+
+        parent_note = collection.new_note(model)
+        parent_note["Front"] = "parent review"
+        parent_note["Back"] = "answer"
+        collection.add_note(parent_note, parent_id)
+        parent_card_id = int(collection.find_cards(f"nid:{int(parent_note.id)}")[0])
+
+        child_note = collection.new_note(model)
+        child_note["Front"] = "child review"
+        child_note["Back"] = "answer"
+        collection.add_note(child_note, child_id)
+        child_card_id = int(collection.find_cards(f"nid:{int(child_note.id)}")[0])
+
+        now_ms = int(time.time() * 1000)
+        collection.db.executemany(
+            """
+            insert into revlog(id, cid, usn, ease, ivl, lastIvl, factor, time, type)
+            values (?, ?, -1, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (now_ms - 2_000, parent_card_id, 1, 60, 0, 2500, 1_250, 0),
+                (now_ms - 1_000, parent_card_id, 3, 1, 1, 2450, 2_500, 1),
+                (now_ms, child_card_id, 4, 86_400, 600, 2400, 3_750, 2),
+            ],
+        )
+        parent_card = collection.get_card(parent_card_id)
+        parent_card.reps = 2
+        collection.update_card(parent_card)
+    finally:
+        collection.close()
+    yield path, parent_id, parent_card_id, child_card_id
+
+
+@pytest.mark.anyio
+async def test_card_get_keeps_history_compact_and_supports_opt_in_sections(
+    reviewed_collection: tuple[str, int, int, int],
+) -> None:
+    path, _, card_id, _ = reviewed_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        compact = await service.get_card(card_id)
+        card = await service.get_card(card_id, ["review_summary", "fsrs"])
+
+    assert "review_summary" not in compact
+    assert "fsrs" not in compact
+    assert card["review_summary"]["added_at"] > 0
+    assert card["review_summary"]["first_review_at"] > 0
+    assert card["review_summary"]["latest_review_at"] >= card["review_summary"]["first_review_at"]
+    assert card["review_summary"]["reviews"] == 2
+    assert card["review_summary"]["total_answer_seconds"] == pytest.approx(3.75)
+    assert card["review_summary"]["average_answer_seconds"] == pytest.approx(1.875)
+    assert card["review_summary"]["preset"] == "Default"
+    assert "original_deck" in card["review_summary"]
+    assert "memory_state" in card["fsrs"]
+    assert "retrievability" in card["fsrs"]
+    assert "desired_retention" in card["fsrs"]
+
+
+@pytest.mark.anyio
+async def test_reviews_list_supports_card_scope_and_stable_pagination(
+    reviewed_collection: tuple[str, int, int, int],
+) -> None:
+    path, _, card_id, _ = reviewed_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        newest = await service.list_reviews(
+            card_id=card_id,
+            deck_id=None,
+            query=None,
+            include_children=False,
+            offset=0,
+            limit=1,
+            order="newest",
+            include_fields=[
+                "review_kind",
+                "rating_label",
+                "intervals",
+                "answer_time",
+                "ease",
+                "memory_state",
+            ],
+        )
+        oldest = await service.list_reviews(
+            card_id=card_id,
+            deck_id=None,
+            query=None,
+            include_children=False,
+            offset=0,
+            limit=1,
+            order="oldest",
+        )
+
+    assert newest["scope"] == {"kind": "card", "card_id": card_id}
+    assert newest["attribution"] == "exact_card"
+    assert newest["total"] == 2
+    assert newest["has_more"] is True
+    assert newest["items"][0]["rating"] == 3
+    assert newest["items"][0]["rating_label"] == "Good"
+    assert newest["items"][0]["review_kind"] == "review"
+    assert newest["items"][0]["answer_seconds"] == pytest.approx(2.5)
+    assert newest["items"][0]["interval_seconds"] == 86_400
+    assert newest["items"][0]["previous_interval_seconds"] == 86_400
+    assert newest["items"][0]["card_id"] == card_id
+    assert oldest["items"][0]["rating"] == 1
+    assert set(oldest["items"][0]) == {"card_id", "reviewed_at", "rating"}
+
+
+@pytest.mark.anyio
+async def test_reviews_list_supports_deck_children_and_query_scopes(
+    reviewed_collection: tuple[str, int, int, int],
+) -> None:
+    path, deck_id, parent_card_id, child_card_id = reviewed_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        exact_deck = await service.list_reviews(
+            card_id=None,
+            deck_id=deck_id,
+            query=None,
+            include_children=False,
+            offset=0,
+            limit=10,
+            order="newest",
+        )
+        deck_tree = await service.list_reviews(
+            card_id=None,
+            deck_id=deck_id,
+            query=None,
+            include_children=True,
+            offset=0,
+            limit=10,
+            order="newest",
+        )
+        query = await service.list_reviews(
+            card_id=None,
+            deck_id=None,
+            query='"child review"',
+            include_children=False,
+            offset=0,
+            limit=10,
+            order="newest",
+        )
+
+    assert {item["card_id"] for item in exact_deck["items"]} == {parent_card_id}
+    assert {item["card_id"] for item in deck_tree["items"]} == {
+        parent_card_id,
+        child_card_id,
+    }
+    assert deck_tree["attribution"] == "current_card_membership"
+    assert query["scope"] == {"kind": "query", "query": '"child review"'}
+    assert [item["card_id"] for item in query["items"]] == [child_card_id]
+
+
+@pytest.mark.anyio
+async def test_review_scope_and_scan_bounds_are_enforced(
+    reviewed_collection: tuple[str, int, int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, deck_id, card_id, _ = reviewed_collection
+
+    async with AnkiCollectionService(path, max_page_size=100, max_search_scan=2) as service:
+        with pytest.raises(ValueError, match="exactly one"):
+            await service.list_reviews(None, None, None, False, 0, 10, "newest")
+        with pytest.raises(ValueError, match="exactly one"):
+            await service.list_reviews(card_id, deck_id, None, False, 0, 10, "newest")
+        with pytest.raises(ValueError, match="include_children"):
+            await service.list_reviews(card_id, None, None, True, 0, 10, "newest")
+        with pytest.raises(ValueError, match="MCP_MAX_SEARCH_SCAN"):
+            await service.list_reviews(None, deck_id, None, True, 0, 10, "newest")
+
+    monkeypatch.setattr(
+        Collection,
+        "card_stats_data",
+        lambda self, card_id: pytest.fail("review listing must not load unbounded card stats"),
+    )
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        listed = await service.list_reviews(card_id, None, None, False, 0, 10, "newest")
+    assert listed["total"] == 2
+
+
+@pytest.mark.anyio
+async def test_review_stats_supports_card_deck_and_query_scopes(
+    reviewed_collection: tuple[str, int, int, int],
+) -> None:
+    path, deck_id, card_id, _ = reviewed_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        card_stats = await service.review_stats(card_id, None, None, False, 30)
+        deck_stats = await service.review_stats(
+            None,
+            deck_id,
+            None,
+            True,
+            30,
+            ["future_due", "hours", "intervals", "difficulty", "stability", "retrievability"],
+        )
+        query_stats = await service.review_stats(None, None, '"child review"', False, 30)
+
+    assert card_stats["scope"] == {"kind": "card", "card_id": card_id}
+    assert card_stats["attribution"] == "exact_card"
+    assert card_stats["days"] == 30
+    assert "graphs" not in card_stats
+    assert "sections" not in card_stats
+    assert card_stats["summary"] == {
+        "reviews": 2,
+        "answer_seconds": 3.75,
+        "average_answer_seconds": 1.875,
+        "retention": 1.0,
+        "ratings": {"again": 1, "hard": 0, "good": 1, "easy": 0},
+        "daily": [{"day": 0, "reviews": 2, "answer_seconds": 3.75}],
+    }
+    assert deck_stats["scope"] == {
+        "kind": "deck",
+        "deck_id": deck_id,
+        "include_children": True,
+    }
+    assert deck_stats["attribution"] == "current_card_membership"
+    assert set(deck_stats["sections"]) == {
+        "future_due",
+        "hours",
+        "intervals",
+        "difficulty",
+        "stability",
+        "retrievability",
+    }
+    assert "card_counts" not in deck_stats["sections"]
+    assert query_stats["scope"] == {"kind": "query", "query": '"child review"'}
+
+
+@pytest.mark.anyio
+async def test_review_stats_rejects_invalid_scope_and_days(
+    reviewed_collection: tuple[str, int, int, int],
+) -> None:
+    path, _, card_id, _ = reviewed_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        with pytest.raises(ValueError, match="exactly one"):
+            await service.review_stats(None, None, None, False, 30)
+        with pytest.raises(ValueError, match="days"):
+            await service.review_stats(card_id, None, None, False, 7)
+        with pytest.raises(ValueError, match="include_children"):
+            await service.review_stats(card_id, None, None, True, 30)
+
+
+@pytest.mark.anyio
+async def test_review_scope_rejects_large_collection_before_materializing_search(
+    reviewed_collection: tuple[str, int, int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, deck_id, _, _ = reviewed_collection
+
+    monkeypatch.setattr(
+        Collection,
+        "find_cards",
+        lambda self, query: pytest.fail("oversized collection search must not be materialized"),
+    )
+    async with AnkiCollectionService(path, max_page_size=100, max_search_scan=1) as service:
+        with pytest.raises(ValueError, match="MCP_MAX_SEARCH_SCAN"):
+            await service.list_reviews(None, None, "", False, 0, 10, "newest")
+
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        DeckManager,
+        "all_names_and_ids",
+        lambda self: pytest.fail("oversized deck hierarchy must not be materialized"),
+    )
+    async with AnkiCollectionService(path, max_page_size=100, max_search_scan=1) as service:
+        with pytest.raises(ValueError, match="MCP_MAX_SEARCH_SCAN"):
+            await service.list_reviews(None, deck_id, None, True, 0, 10, "newest")
+
+
+@pytest.mark.anyio
+async def test_review_stats_rejects_large_event_set_before_graph_generation(
+    reviewed_collection: tuple[str, int, int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _, card_id, _ = reviewed_collection
+
+    monkeypatch.setattr(
+        "anki._backend.RustBackend.graphs",
+        lambda self, search, days: pytest.fail("oversized graph input must be rejected first"),
+    )
+    async with AnkiCollectionService(path, max_page_size=100, max_search_scan=1) as service:
+        with pytest.raises(ValueError, match="MCP_MAX_SEARCH_SCAN"):
+            await service.review_stats(card_id, None, None, False, 30)

@@ -224,6 +224,8 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_tags_delete",
         "anki_cards_search",
         "anki_cards_get",
+        "anki_reviews_list",
+        "anki_review_stats",
         "anki_cards_create",
         "anki_cards_update",
         "anki_cards_change_deck",
@@ -254,6 +256,42 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     assert all(tool["inputSchema"]["properties"]["limit"]["minimum"] == 1 for tool in paginated)
     assert all(tool["inputSchema"]["properties"]["limit"]["maximum"] == 100 for tool in paginated)
     by_name = {tool["name"]: tool for tool in tools}
+    review_list = by_name["anki_reviews_list"]["inputSchema"]["properties"]
+    assert review_list["order"]["enum"] == ["newest", "oldest"]
+    assert review_list["include_fields"]["items"]["enum"] == [
+        "review_kind",
+        "rating_label",
+        "intervals",
+        "answer_time",
+        "ease",
+        "memory_state",
+    ]
+    card_get = by_name["anki_cards_get"]["inputSchema"]["properties"]
+    assert card_get["include_sections"]["items"]["enum"] == ["review_summary", "fsrs"]
+    review_stats = by_name["anki_review_stats"]["inputSchema"]["properties"]
+    assert review_stats["days"]["enum"] == [
+        0,
+        30,
+        90,
+        365,
+    ]
+    assert review_stats["include_sections"]["items"]["enum"] == [
+        "buttons",
+        "card_counts",
+        "hours",
+        "today",
+        "eases",
+        "intervals",
+        "future_due",
+        "added",
+        "reviews",
+        "rollover_hour",
+        "difficulty",
+        "retrievability",
+        "stability",
+        "true_retention",
+        "fsrs",
+    ]
     assert by_name["anki_sync"]["inputSchema"]["properties"]["sync_media"]["type"] == "boolean"
     for name in (
         "anki_sync_full_download",
@@ -269,6 +307,71 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_media_delete",
     ):
         assert by_name[name]["inputSchema"]["properties"]["confirmation_token"]["type"] == "string"
+
+
+def test_review_tools_and_enriched_card_work_through_json_rpc(client: TestClient) -> None:
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    initialized = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1"},
+            },
+        },
+    )
+    headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+
+    def call(request_id: int, name: str, arguments: dict[str, object]) -> dict[str, Any]:
+        response = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+        )
+        result = response.json()["result"]
+        assert result.get("isError") is not True, result
+        return json.loads(result["content"][0]["text"])
+
+    cards = call(2, "anki_cards_search", {"query": "hola"})
+    card_id = cards["items"][0]["id"]
+    compact_card = call(3, "anki_cards_get", {"card_id": card_id})
+    reviews = call(4, "anki_reviews_list", {"card_id": card_id})
+    stats = call(5, "anki_review_stats", {"card_id": card_id, "days": 30})
+    card = call(
+        6,
+        "anki_cards_get",
+        {"card_id": card_id, "include_sections": ["review_summary", "fsrs"]},
+    )
+    extended_stats = call(
+        7,
+        "anki_review_stats",
+        {"card_id": card_id, "days": 30, "include_sections": ["card_counts"]},
+    )
+
+    assert "review_summary" not in compact_card
+    assert "fsrs" not in compact_card
+    assert card["review_summary"]["reviews"] == 0
+    assert "memory_state" in card["fsrs"]
+    assert reviews["scope"] == {"kind": "card", "card_id": card_id}
+    assert reviews["items"] == []
+    assert stats["scope"] == {"kind": "card", "card_id": card_id}
+    assert "graphs" not in stats
+    assert "sections" not in stats
+    assert "summary" in stats
+    assert set(extended_stats["sections"]) == {"card_counts"}
 
 
 def test_phase2_administration_tools_work_through_json_rpc(client: TestClient) -> None:
