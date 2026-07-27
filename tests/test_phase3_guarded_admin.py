@@ -203,6 +203,94 @@ def test_schema_tools_require_full_sync_maintenance_and_preview(
         assert Path(receipt["result"]["backup"]["path"]).is_file()
 
 
+def test_schema_apply_reports_backup_gate_failure_and_logs_correlation(
+    phase3_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    backup_folder = phase3_settings.collection_path.parent / "backups"
+    backup_folder.mkdir()
+    (backup_folder / "existing.colpkg").write_bytes(b"existing backup")
+    monkeypatch.setattr(Collection, "create_backup", lambda *args, **kwargs: False)
+
+    with TestClient(create_app(phase3_settings)) as client:
+        _, call = _session(client)
+        failed, note_types = call("anki_note_types_list", {})
+        assert failed is False
+        note_type_id = note_types["items"][0]["id"]
+        failed, before = call("anki_note_types_get", {"note_type_id": note_type_id})
+        assert failed is False
+        mappings = [
+            {
+                "source_ordinal": template["ordinal"],
+                "name": template["name"],
+                "question_format": template["question_format"] + " changed",
+                "answer_format": template["answer_format"],
+            }
+            for template in before["templates"]
+        ]
+        failed, preview = call(
+            "anki_note_types_change_preview",
+            {
+                "operation": "templates_update",
+                "note_type_id": note_type_id,
+                "template_mappings": mappings,
+            },
+        )
+        assert failed is False
+
+        with caplog.at_level("ERROR", logger="anki_mcp.app"):
+            failed, error = call(
+                "anki_templates_update",
+                {
+                    "note_type_id": note_type_id,
+                    "mappings": mappings,
+                    "confirmation_token": preview["confirmation_token"],
+                    "idempotency_key": "schema-backup-gate",
+                },
+            )
+
+        assert failed is True
+        assert error["code"] == "BACKUP_FAILED"
+        assert error["message"] == "required collection backup could not be created"
+        assert error["correlation_id"] in caplog.text
+        assert "BackupFailedError" in caplog.text
+
+        failed, operation_error = call(
+            "anki_operations_get", {"idempotency_key": "schema-backup-gate"}
+        )
+        assert failed is True
+        assert operation_error["code"] == "NOT_FOUND"
+        failed, after = call("anki_note_types_get", {"note_type_id": note_type_id})
+        assert failed is False
+        assert after["templates"] == before["templates"]
+
+
+def test_native_backup_failure_is_redacted_from_client(
+    phase3_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sensitive_detail = f"failed to write {phase3_settings.collection_path}"
+
+    def fail_backup(*args: object, **kwargs: object) -> bool:
+        raise RuntimeError(sensitive_detail)
+
+    monkeypatch.setattr(Collection, "create_backup", fail_backup)
+
+    with TestClient(create_app(phase3_settings)) as client:
+        _, call = _session(client)
+        with caplog.at_level("ERROR", logger="anki_mcp.app"):
+            failed, error = call("anki_backup_create", {})
+
+    assert failed is True
+    assert error["code"] == "BACKUP_FAILED"
+    assert error["message"] == "required collection backup could not be created"
+    assert sensitive_detail not in error["message"]
+    assert error["correlation_id"] in caplog.text
+    assert sensitive_detail in caplog.text
+
+
 def test_confirmation_rejects_stale_deck_impact(phase3_settings: Settings) -> None:
     with TestClient(create_app(phase3_settings)) as client:
         _, call = _session(client)
