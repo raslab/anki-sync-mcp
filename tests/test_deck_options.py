@@ -194,6 +194,7 @@ async def test_scoped_limits_can_be_set_and_cleared_without_changing_the_preset(
         scheduler_settings = await service.update_deck_scheduler_settings(
             apply_all_parent_limits=True,
             new_cards_ignore_review_limit=True,
+            fsrs_enabled=None,
         )
         this_deck = await service.update_deck_limits(
             child_id,
@@ -235,6 +236,7 @@ async def test_scoped_limits_can_be_set_and_cleared_without_changing_the_preset(
         "updated": True,
         "apply_all_parent_limits": True,
         "new_cards_ignore_review_limit": True,
+        "fsrs_enabled": False,
     }
     assert this_deck == {"deck_id": child_id, "scope": "this_deck", "updated": True}
     assert today == {"deck_id": child_id, "scope": "today", "updated": True}
@@ -317,6 +319,7 @@ async def test_effective_limits_include_enabled_parent_constraints(
         await service.update_deck_scheduler_settings(
             apply_all_parent_limits=True,
             new_cards_ignore_review_limit=None,
+            fsrs_enabled=None,
         )
         options = await service.get_deck_options(child_id, include_sections=("parents",))
 
