@@ -91,6 +91,70 @@ ReviewStatsSection = Literal[
     "fsrs",
 ]
 ReviewStatsSections = Annotated[tuple[ReviewStatsSection, ...], Field(max_length=15)]
+DeckOptionSection = Literal["counts", "parents", "global_settings"]
+DeckOptionSections = Annotated[tuple[DeckOptionSection, ...], Field(max_length=3)]
+DeckPresetSection = Literal[
+    "learning",
+    "new_cards",
+    "reviews",
+    "lapses",
+    "burying",
+    "display_audio",
+    "fsrs",
+    "easy_days",
+]
+DeckPresetSections = Annotated[tuple[DeckPresetSection, ...], Field(max_length=8)]
+DeckLimitScope = Literal["this_deck", "today"]
+DeckLimitField = Literal["new_cards_per_day", "reviews_per_day", "desired_retention"]
+DeckLimitFields = Annotated[tuple[DeckLimitField, ...], Field(max_length=3)]
+NonNegativeFloat = Annotated[StrictFloat, Field(ge=0)]
+PositiveFloat = Annotated[StrictFloat, Field(gt=0)]
+Steps = Annotated[list[NonNegativeFloat], Field(max_length=100)]
+FsrsParameters = Annotated[list[StrictFloat], Field(max_length=30)]
+EasyDaysPercentages = Annotated[list[NonNegativeFloat], Field(min_length=7, max_length=7)]
+NewCardInsertOrder = Literal["NEW_CARD_INSERT_ORDER_DUE", "NEW_CARD_INSERT_ORDER_RANDOM"]
+NewCardGatherPriority = Literal[
+    "NEW_CARD_GATHER_PRIORITY_DECK",
+    "NEW_CARD_GATHER_PRIORITY_DECK_THEN_RANDOM_NOTES",
+    "NEW_CARD_GATHER_PRIORITY_LOWEST_POSITION",
+    "NEW_CARD_GATHER_PRIORITY_HIGHEST_POSITION",
+    "NEW_CARD_GATHER_PRIORITY_RANDOM_NOTES",
+    "NEW_CARD_GATHER_PRIORITY_RANDOM_CARDS",
+]
+NewCardSortOrder = Literal[
+    "NEW_CARD_SORT_ORDER_TEMPLATE",
+    "NEW_CARD_SORT_ORDER_NO_SORT",
+    "NEW_CARD_SORT_ORDER_TEMPLATE_THEN_RANDOM",
+    "NEW_CARD_SORT_ORDER_RANDOM_NOTE_THEN_TEMPLATE",
+    "NEW_CARD_SORT_ORDER_RANDOM_CARD",
+]
+ReviewMix = Literal[
+    "REVIEW_MIX_MIX_WITH_REVIEWS", "REVIEW_MIX_AFTER_REVIEWS", "REVIEW_MIX_BEFORE_REVIEWS"
+]
+ReviewCardOrder = Literal[
+    "REVIEW_CARD_ORDER_DAY",
+    "REVIEW_CARD_ORDER_DAY_THEN_DECK",
+    "REVIEW_CARD_ORDER_DECK_THEN_DAY",
+    "REVIEW_CARD_ORDER_INTERVALS_ASCENDING",
+    "REVIEW_CARD_ORDER_INTERVALS_DESCENDING",
+    "REVIEW_CARD_ORDER_EASE_ASCENDING",
+    "REVIEW_CARD_ORDER_EASE_DESCENDING",
+    "REVIEW_CARD_ORDER_RETRIEVABILITY_ASCENDING",
+    "REVIEW_CARD_ORDER_RETRIEVABILITY_DESCENDING",
+    "REVIEW_CARD_ORDER_RELATIVE_OVERDUENESS",
+    "REVIEW_CARD_ORDER_RANDOM",
+    "REVIEW_CARD_ORDER_ADDED",
+    "REVIEW_CARD_ORDER_REVERSE_ADDED",
+]
+LeechAction = Literal["LEECH_ACTION_SUSPEND", "LEECH_ACTION_TAG_ONLY"]
+QuestionAction = Literal["QUESTION_ACTION_SHOW_ANSWER", "QUESTION_ACTION_SHOW_REMINDER"]
+AnswerAction = Literal[
+    "ANSWER_ACTION_BURY_CARD",
+    "ANSWER_ACTION_ANSWER_AGAIN",
+    "ANSWER_ACTION_ANSWER_GOOD",
+    "ANSWER_ACTION_ANSWER_HARD",
+    "ANSWER_ACTION_SHOW_REMINDER",
+]
 
 
 class NoteCreateInput(BaseModel):
@@ -119,6 +183,64 @@ class NoteTypeFieldMappingInput(BaseModel):
 
 class NoteTypeTemplateMappingInput(NoteTypeTemplateInput):
     source_ordinal: NonNegativeInt | None = None
+
+
+class DeckLimitPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    new_cards_per_day: DailyLimit | None = None
+    reviews_per_day: DailyLimit | None = None
+    desired_retention: Retention | None = None
+
+
+class DeckPresetPatch(BaseModel):
+    """Typed patch over every user-facing field in Anki's deck preset config."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    learn_steps: Steps | None = None
+    relearn_steps: Steps | None = None
+    fsrs_params_4: FsrsParameters | None = None
+    fsrs_params_5: FsrsParameters | None = None
+    fsrs_params_6: FsrsParameters | None = None
+    new_per_day: DailyLimit | None = None
+    reviews_per_day: DailyLimit | None = None
+    new_per_day_minimum: DailyLimit | None = None
+    initial_ease: PositiveFloat | None = None
+    easy_multiplier: PositiveFloat | None = None
+    hard_multiplier: PositiveFloat | None = None
+    lapse_multiplier: NonNegativeFloat | None = None
+    interval_multiplier: PositiveFloat | None = None
+    maximum_review_interval: PositiveInt | None = None
+    minimum_lapse_interval: PositiveInt | None = None
+    graduating_interval_good: PositiveInt | None = None
+    graduating_interval_easy: PositiveInt | None = None
+    new_card_insert_order: NewCardInsertOrder | None = None
+    new_card_gather_priority: NewCardGatherPriority | None = None
+    new_card_sort_order: NewCardSortOrder | None = None
+    new_mix: ReviewMix | None = None
+    review_order: ReviewCardOrder | None = None
+    interday_learning_mix: ReviewMix | None = None
+    leech_action: LeechAction | None = None
+    leech_threshold: PositiveInt | None = None
+    disable_autoplay: StrictBool | None = None
+    cap_answer_time_to_secs: NonNegativeInt | None = None
+    show_timer: StrictBool | None = None
+    stop_timer_on_answer: StrictBool | None = None
+    seconds_to_show_question: NonNegativeFloat | None = None
+    seconds_to_show_answer: NonNegativeFloat | None = None
+    question_action: QuestionAction | None = None
+    answer_action: AnswerAction | None = None
+    wait_for_audio: StrictBool | None = None
+    skip_question_when_replaying_answer: StrictBool | None = None
+    bury_new: StrictBool | None = None
+    bury_reviews: StrictBool | None = None
+    bury_interday_learning: StrictBool | None = None
+    desired_retention: Retention | None = None
+    ignore_revlogs_before_date: Annotated[StrictStr, Field(max_length=32)] | None = None
+    easy_days_percentages: EasyDaysPercentages | None = None
+    historical_retention: Retention | None = None
+    param_search: SearchQuery | None = None
 
 
 FieldMappings = Annotated[list[NoteTypeFieldMappingInput], Field(min_length=1, max_length=1000)]
@@ -367,6 +489,45 @@ def create_app(settings: Settings) -> ASGIApp:
             service.coordinated_read(lambda adapter: adapter.get_deck(deck_id), sync_before)
         )
 
+    @scoped_tool(name="anki_deck_options_get", scope="read")
+    async def deck_options_get(
+        deck_id: StableId,
+        include_sections: DeckOptionSections = (),
+        sync_before: SyncMedia = False,
+    ) -> dict[str, Any]:
+        """Get compact layered deck options, with optional counts, parents, and globals."""
+        return await execute(
+            service.coordinated_read(
+                lambda adapter: adapter.get_deck_options(deck_id, include_sections), sync_before
+            )
+        )
+
+    @scoped_tool(name="anki_deck_presets_list", scope="read")
+    async def deck_presets_list(
+        offset: Offset = 0,
+        limit: PageLimit = settings.max_page_size,
+        sync_before: SyncMedia = False,
+    ) -> dict[str, Any]:
+        """List compact deck preset summaries and shared-use counts."""
+        return await execute(
+            service.coordinated_read(
+                lambda adapter: adapter.list_deck_presets(offset, limit), sync_before
+            )
+        )
+
+    @scoped_tool(name="anki_deck_presets_get", scope="read")
+    async def deck_presets_get(
+        config_id: StableId,
+        include_sections: DeckPresetSections = (),
+        sync_before: SyncMedia = False,
+    ) -> dict[str, Any]:
+        """Get compact preset defaults, optionally projecting detailed option groups."""
+        return await execute(
+            service.coordinated_read(
+                lambda adapter: adapter.get_deck_preset(config_id, include_sections), sync_before
+            )
+        )
+
     @scoped_tool(name="anki_decks_create", scope="write")
     async def decks_create(
         name: DeckName, idempotency_key: IdempotencyKey | None = None
@@ -421,6 +582,84 @@ def create_app(settings: Settings) -> ASGIApp:
                 max_answer_seconds,
                 desired_retention,
             ),
+        )
+
+    @scoped_tool(name="anki_deck_limits_update", scope="admin")
+    async def deck_limits_update(
+        deck_id: StableId,
+        scope: DeckLimitScope,
+        values: DeckLimitPatch | None = None,
+        clear_fields: DeckLimitFields = (),
+        apply_all_parent_limits: StrictBool | None = None,
+        new_cards_ignore_review_limit: StrictBool | None = None,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Patch or clear this-deck/today limits and optionally update limit aggregation."""
+        value_dict = values.model_dump(exclude_none=True) if values is not None else {}
+        request = {
+            "deck_id": deck_id,
+            "scope": scope,
+            "values": value_dict,
+            "clear_fields": list(clear_fields),
+            "apply_all_parent_limits": apply_all_parent_limits,
+            "new_cards_ignore_review_limit": new_cards_ignore_review_limit,
+        }
+        return await mutate(
+            "anki_deck_limits_update",
+            idempotency_key,
+            request,
+            lambda adapter: adapter.update_deck_limits(
+                deck_id,
+                scope,
+                value_dict,
+                clear_fields,
+                apply_all_parent_limits,
+                new_cards_ignore_review_limit,
+            ),
+        )
+
+    @scoped_tool(name="anki_deck_presets_create", scope="admin")
+    async def deck_presets_create(
+        name: ResourceName,
+        clone_from_config_id: StableId | None = None,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Create a deck preset from Anki defaults or clone an existing preset."""
+        return await mutate(
+            "anki_deck_presets_create",
+            idempotency_key,
+            {"name": name, "clone_from_config_id": clone_from_config_id},
+            lambda adapter: adapter.create_deck_preset(name, clone_from_config_id),
+        )
+
+    @scoped_tool(name="anki_deck_presets_update", scope="admin")
+    async def deck_presets_update(
+        config_id: StableId,
+        name: ResourceName | None = None,
+        options: DeckPresetPatch | None = None,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Patch only supplied fields on a shared preset; omitted options remain unchanged."""
+        option_dict = options.model_dump(exclude_none=True) if options is not None else {}
+        return await mutate(
+            "anki_deck_presets_update",
+            idempotency_key,
+            {"config_id": config_id, "name": name, "options": option_dict},
+            lambda adapter: adapter.update_deck_preset(config_id, name, option_dict),
+        )
+
+    @scoped_tool(name="anki_deck_presets_assign", scope="admin")
+    async def deck_presets_assign(
+        deck_id: StableId,
+        config_id: StableId,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Assign an existing shared preset to one normal deck."""
+        return await mutate(
+            "anki_deck_presets_assign",
+            idempotency_key,
+            {"deck_id": deck_id, "config_id": config_id},
+            lambda adapter: adapter.assign_deck_preset(deck_id, config_id),
         )
 
     @scoped_tool(
