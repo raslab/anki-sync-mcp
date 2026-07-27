@@ -604,15 +604,20 @@ def create_app(settings: Settings) -> ASGIApp:
     ) -> dict[str, Any]:
         def guarded(adapter: CollectionAdapter) -> dict[str, Any]:
             current_impact = preview_function(adapter)
+            confirmation_request = {"request": guard_request, "impact": current_impact}
             try:
-                confirmations.consume(
-                    confirmation_token,
-                    operation,
-                    {"request": guard_request, "impact": current_impact},
-                )
+                confirmations.validate(confirmation_token, operation, confirmation_request)
             except ValueError as exc:
                 raise ConfirmationRequiredError(f"{exc}; run preview again") from exc
-            return adapter.backup_before(lambda: function(adapter))
+
+            def confirmed_mutation() -> dict[str, Any]:
+                try:
+                    confirmations.consume(confirmation_token, operation, confirmation_request)
+                except ValueError as exc:
+                    raise ConfirmationRequiredError(f"{exc}; run preview again") from exc
+                return function(adapter)
+
+            return adapter.backup_before(confirmed_mutation)
 
         return await mutate(
             operation,

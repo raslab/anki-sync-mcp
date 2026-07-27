@@ -4,6 +4,7 @@ import math
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 from anki import buildinfo, scheduler_pb2
@@ -753,7 +754,7 @@ async def test_backup_before_rejects_native_false_with_old_backup(
 
     monkeypatch.setattr(Collection, "create_backup", create_backup)
     async with AnkiCollectionService(path, max_page_size=100) as service:
-        with pytest.raises(RuntimeError, match="newly created"):
+        with pytest.raises(RuntimeError, match="current pre-operation"):
             await service.executor.run(lambda adapter: adapter.backup_before(mutation))
 
     assert mutation_called is False
@@ -779,7 +780,7 @@ async def test_backup_before_rejects_native_success_without_new_file(
 
     monkeypatch.setattr(Collection, "create_backup", create_backup)
     async with AnkiCollectionService(path, max_page_size=100) as service:
-        with pytest.raises(RuntimeError, match="newly created"):
+        with pytest.raises(RuntimeError, match="current pre-operation"):
             await service.executor.run(lambda adapter: adapter.backup_before(mutation))
 
     assert mutation_called is False
@@ -819,7 +820,10 @@ async def test_backup_before_returns_new_nonempty_backup_receipt(
     ) -> bool:  # type: ignore[no-untyped-def]
         assert force is True
         assert wait_for_completion is True
-        (Path(backup_folder) / "fresh.colpkg").write_bytes(b"fresh backup")
+        with ZipFile(Path(backup_folder) / "fresh.colpkg", "w") as archive:
+            archive.writestr("meta", b"meta")
+            archive.writestr("collection.anki21b", b"collection")
+            archive.writestr("media", b"{}")
         return True
 
     monkeypatch.setattr(Collection, "create_backup", create_backup)
@@ -847,7 +851,10 @@ async def test_backup_failure_keeps_idempotent_mutation_retryable(
         attempts += 1
         if attempts == 1:
             raise RuntimeError("native backup failed")
-        (Path(backup_folder) / "retry.colpkg").write_bytes(b"retry backup")
+        with ZipFile(Path(backup_folder) / "retry.colpkg", "w") as archive:
+            archive.writestr("meta", b"meta")
+            archive.writestr("collection.anki21b", b"collection")
+            archive.writestr("media", b"{}")
         return True
 
     monkeypatch.setattr(Collection, "create_backup", create_backup)

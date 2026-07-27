@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, cast
+from zipfile import BadZipFile, ZipFile
 
 import anki.lang
 from anki.collection import AddNoteRequest, Collection
@@ -120,7 +121,7 @@ class MediaSyncFailedError(TimeoutError):
 
 
 class BackupFailedError(RuntimeError):
-    """Raised when a guarded mutation cannot obtain a verified fresh backup."""
+    """Raised when a guarded mutation cannot obtain a verified current backup."""
 
 
 class CollectionAdapter:
@@ -308,7 +309,7 @@ class CollectionAdapter:
                 path.stat().st_mtime_ns,
             )
         }
-        selected = fresh if fresh else candidates
+        selected = fresh if native_created else candidates
         path = max(selected, key=lambda item: item.stat().st_mtime_ns) if selected else None
         return {
             "requested": True,
@@ -316,21 +317,25 @@ class CollectionAdapter:
             "path": str(path) if path is not None else None,
         }
 
+    @staticmethod
+    def _is_valid_backup(path: Path) -> bool:
+        if not path.is_file() or path.is_symlink() or path.stat().st_size <= 0:
+            return False
+        try:
+            with ZipFile(path) as archive:
+                members = set(archive.namelist())
+                required = {"meta", "collection.anki21b", "media"}
+                return required <= members and archive.testzip() is None
+        except (BadZipFile, OSError, RuntimeError):
+            return False
+
     def backup_before(self, mutation: Callable[[], dict[str, Any]]) -> dict[str, Any]:
-        """Create a verified backup immediately before a guarded mutation."""
+        """Obtain a verified current backup immediately before a guarded mutation."""
         backup = self.create_backup()
         path = backup.get("path")
         backup_path = Path(path) if isinstance(path, str) else None
-        if (
-            backup.get("created") is not True
-            or backup_path is None
-            or not backup_path.is_file()
-            or backup_path.is_symlink()
-            or backup_path.stat().st_size <= 0
-        ):
-            raise BackupFailedError(
-                "required newly created pre-operation backup is unavailable"
-            )
+        if backup_path is None or not self._is_valid_backup(backup_path):
+            raise BackupFailedError("required current pre-operation backup is unavailable")
         return {**mutation(), "backup": backup}
 
     def bootstrap(
