@@ -653,7 +653,7 @@ def create_app(settings: Settings) -> ASGIApp:
         fsrs_enabled: StrictBool | None = None,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Patch explicit collection-wide scheduler limit aggregation settings."""
+        """Patch collection-wide scheduler and FSRS enablement settings."""
         request = {
             "apply_all_parent_limits": apply_all_parent_limits,
             "new_cards_ignore_review_limit": new_cards_ignore_review_limit,
