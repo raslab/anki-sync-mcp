@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from anki.collection import Collection
+from anki.decks import DeckManager
 
 from anki_mcp.collection import AnkiCollectionService
 
@@ -222,3 +223,44 @@ async def test_review_stats_rejects_invalid_scope_and_days(
             await service.review_stats(card_id, None, None, False, 7)
         with pytest.raises(ValueError, match="include_children"):
             await service.review_stats(card_id, None, None, True, 30)
+
+
+@pytest.mark.anyio
+async def test_review_scope_rejects_large_collection_before_materializing_search(
+    reviewed_collection: tuple[str, int, int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, deck_id, _, _ = reviewed_collection
+
+    monkeypatch.setattr(
+        Collection,
+        "find_cards",
+        lambda self, query: pytest.fail("oversized collection search must not be materialized"),
+    )
+    async with AnkiCollectionService(path, max_page_size=100, max_search_scan=1) as service:
+        with pytest.raises(ValueError, match="MCP_MAX_SEARCH_SCAN"):
+            await service.list_reviews(None, None, "", False, 0, 10, "newest")
+
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        DeckManager,
+        "all_names_and_ids",
+        lambda self: pytest.fail("oversized deck hierarchy must not be materialized"),
+    )
+    async with AnkiCollectionService(path, max_page_size=100, max_search_scan=1) as service:
+        with pytest.raises(ValueError, match="MCP_MAX_SEARCH_SCAN"):
+            await service.list_reviews(None, deck_id, None, True, 0, 10, "newest")
+
+
+@pytest.mark.anyio
+async def test_review_stats_rejects_large_event_set_before_graph_generation(
+    reviewed_collection: tuple[str, int, int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _, card_id, _ = reviewed_collection
+
+    monkeypatch.setattr(
+        "anki._backend.RustBackend.graphs",
+        lambda self, search, days: pytest.fail("oversized graph input must be rejected first"),
+    )
+    async with AnkiCollectionService(path, max_page_size=100, max_search_scan=1) as service:
+        with pytest.raises(ValueError, match="MCP_MAX_SEARCH_SCAN"):
+            await service.review_stats(card_id, None, None, False, 30)

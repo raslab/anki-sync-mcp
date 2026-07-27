@@ -1412,10 +1412,19 @@ class CollectionAdapter:
             search = f"cid:{card_id}"
             scope = {"kind": "card", "card_id": card_id}
             attribution = "exact_card"
+            return [card_id], search, scope, attribution
         elif deck_id is not None:
             deck = self.get_deck(deck_id)
             deck_ids = [deck_id]
             if include_children:
+                database = self.collection.db
+                if database is None:  # pragma: no cover - reads require an open collection
+                    raise RuntimeError("collection database is unavailable")
+                deck_count = int(database.scalar("select count() from decks") or 0)
+                if deck_count > self.max_search_scan:
+                    raise ValueError(
+                        "deck hierarchy exceeds MCP_MAX_SEARCH_SCAN; raise the configured bound"
+                    )
                 deck_name = str(deck["name"])
                 deck_ids.extend(
                     int(item.id)
@@ -1434,6 +1443,10 @@ class CollectionAdapter:
             scope = {"kind": "query", "query": search}
             attribution = "current_card_membership"
 
+        if int(self.collection.card_count()) > self.max_search_scan:
+            raise ValueError(
+                "collection exceeds MCP_MAX_SEARCH_SCAN; narrow card scope is required"
+            )
         card_ids = [int(value) for value in self.collection.find_cards(search)]
         if len(card_ids) > self.max_search_scan:
             raise ValueError(
@@ -1532,9 +1545,13 @@ class CollectionAdapter:
     ) -> dict[str, Any]:
         if days not in {0, 30, 90, 365}:
             raise ValueError("days must be one of 0, 30, 90, or 365")
-        _, search, scope, attribution = self._review_scope(
+        card_ids, search, scope, attribution = self._review_scope(
             card_id, deck_id, query, include_children
         )
+        if self._review_log_count(card_ids) > self.max_search_scan:
+            raise ValueError(
+                "review history exceeds MCP_MAX_SEARCH_SCAN; narrow the scope or raise the bound"
+            )
         graphs = self.collection._backend.graphs(  # pyright: ignore[reportPrivateUsage]
             search=search, days=days
         )
